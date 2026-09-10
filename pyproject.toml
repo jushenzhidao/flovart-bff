@@ -1,0 +1,20 @@
+[project]
+name = "flovart-bff"
+version = "0.1.0"
+description = "Flovart 在线创作站 BFF（FastAPI）—— 用户登录 / 数据持久化 / new-api 用户·渠道·模型代理"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "dist", "__pycache__", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = [
+    "E501",    # 行长交给 formatter；中文注释按 100 列硬折更难读
+    "B008",    # Depends() 作为默认值是 FastAPI 官方惯用法
+    "B904",    # raise-from 缺失：现有 except 都把上游 message 转成用户可读文案
+    "UP007",   # Optional[X] 与 X | None 并存，风格统一问题
+    "S105",    # SECRET_KEY 弱值哨兵：/readyz 负责拦，见 config.py 注释
+]

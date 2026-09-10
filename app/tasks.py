@@ -1,0 +1,571 @@
+"""图片任务：BFF 同时兼容「同步 / 异步」，并在每次提交时落一条请求日志。
+
+设计（契约见 IMAGE-ASYNC-TASKS-CONTRACT.md §1、§4）：
+- 各 task type 由 TASK_TYPES 指定 mode 与网关端点：
+    * async：真正执行方是网关侧（new-api 兼容）。BFF 透传「提交→轮询→取消」，
+             任务状态由网关持有；BFF 不跑 worker、不存任务表。
+    * sync ：网关部分模型更适合同步直出（转异步成本高）。BFF 阻塞调用网关同步
+             接口、拿到结果后立即把产物落 BFF 云盘，并把 result 回写请求日志。
+- 请求日志（按用户 request_id 落 PG/本地兜底）：记录「用户调用模型时的请求结构+参数」
+  （payload_json）、task_id、网关 request_id（对齐网关 /api/log 全站日志）、状态、结果。
+  供后续「拉日志对齐」——前端可经 GET /api/me/requests 拉取，BFF 与网关日志用
+  gateway_request_id 串联。
+
+## 产物统一归 BFF 盘（2026-09-07 拍板）
+任务成功（async 轮询到 succeeded / sync 直出）时，BFF 把 result 内的图片产物
+（url 下载 / base64 解码）落进 cloud_media（与画布 projects / 上传素材 / 生成历史
+共用同一套 BFF 存储），并把 result 改写为指向 BFF media 地址（附 _bffMediaKey）。
+换设备恢复画布时，图不再依赖网关有效期，全部自 BFF 盘取回。
+- 视频产物现已接入 BFF 代理（video-gen，与 image-gen 同构走 new-api 平台透传）；
+  仅「非 new-api 平台的第三方视频网关 BYOK 直连」仍由前端拿 blob 后 POST /api/me/media 回存 BFF。
+- 落盘为异步 `await cloudstore.media_put`（BFF→OSS put_object + PG 索引 upsert）。
+- 进程内 _PERSISTED 做幂等：同进程重复 GET 不重复落盘；重启重落无害（多一份相同字节）。
+"""
+import base64
+import json
+import logging
+import re
+import uuid
+from typing import Any
+
+import httpx
+
+from . import config, cloudstore, image_model_modes, newapi_client as na
+from .newapi_client import NewApiError
+
+logger = logging.getLogger("bff.tasks")
+
+# 任务类型 → 执行模式 + 网关端点 / 第三方 Provider。
+# provider:
+#   "gateway"     → 走 new-api 网关（image-gen/upscale/remove-background/split-layers/video-gen）
+#   "thirdparty"  → 直连第三方 API（multi-angle 等网关未接入的能力），tp 指定服务商
+# mode=async 走异步（网关 tasks / 第三方 prediction 轮询）；mode=sync 走同步直出。
+# image-gen 的 mode 由 GATEWAY_IMAGE_GEN_MODE 决定（默认 async），可 env 切 sync。
+TASK_TYPES: "dict[str, dict]" = {
+    "image-gen": {
+        "provider": "gateway",
+        "mode": config.GATEWAY_IMAGE_GEN_MODE,  # "async" | "sync"
+        "async_path": config.GATEWAY_IMAGE_TASKS_PATH,
+        "sync_path": config.GATEWAY_SYNC_IMAGE_PATH,
+    },
+    "upscale": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_UPSCALE_PATH},
+    "remove-background": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_REMOVE_BG_PATH},
+    # 图片编辑类（原纯 BYOK 直连，现走 BFF→网关，用户免 Key）：
+    # 扩展画面 / 编辑蒙版 / 标注涂鸦 / 打光面板 / 通用编辑（换装等）。
+    # 均为 gateway sync 直出；参数（image/prompt/mask/variant）原样透传网关同步端点。
+    "outpaint": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_OUTPAINT_PATH},
+    "mask": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_MASK_PATH},
+    "annotate": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_ANNOTATE_PATH},
+    "relight": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_RELIGHT_PATH},
+    "edit": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_EDIT_PATH},
+    "split-layers": {"provider": "thirdparty", "tp": "wavespeed", "mode": "async"},
+    # 直连第三方：多角度（wave speed，FLUX Kontext Max Multi 保主体一致性）
+    "multi-angle": {"provider": "thirdparty", "tp": "wavespeed", "mode": "async"},
+    # 视频生成：与 image-gen 同构，走 new-api 平台透传（异步）。new-api 用「统一 tasks 端点」
+    # 按 type 分流（视频/图片同端点，BFF 不感知具体端点）。默认 async；产物为 mp4，落 BFF 盘
+    # 时 kind="video"。端点路径用 GATEWAY_VIDEO_TASKS_PATH（默认与图片 tasks 端点一致）。
+    "video-gen": {"provider": "gateway", "mode": "async", "async_path": config.GATEWAY_VIDEO_TASKS_PATH},
+}
+
+# 代理只需快速转发（提交/查询/取消都应立即返回），用较长但非无限的超时。
+_PROXY_CLIENT: "httpx.AsyncClient | None" = None
+# 同步调用网关（可能较长）的独立 client，超时更长。
+_SYNC_CLIENT: "httpx.AsyncClient | None" = None
+# 下载网关产物（绝对 url）用的独立 client，无 base_url。
+# 超时给足余量：图片通常秒级，但视频产物（mp4）可能数 MB~数十 MB，下载需更久。
+_DL_CLIENT: "httpx.AsyncClient | None" = None
+# 进程内幂等：task_id -> 已改写的 result（避免重复落盘）。
+_PERSISTED: "dict[str, dict]" = {}
+
+
+def _proxy_client() -> httpx.AsyncClient:
+    global _PROXY_CLIENT
+    if _PROXY_CLIENT is None:
+        _PROXY_CLIENT = httpx.AsyncClient(
+            base_url=config.NEWAPI_BASE_URL,
+            timeout=httpx.Timeout(config.GATEWAY_PROXY_TIMEOUT, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+            trust_env=False,  # 不走本机代理
+        )
+    return _PROXY_CLIENT
+
+
+def _sync_client() -> httpx.AsyncClient:
+    global _SYNC_CLIENT
+    if _SYNC_CLIENT is None:
+        _SYNC_CLIENT = httpx.AsyncClient(
+            base_url=config.NEWAPI_BASE_URL,
+            timeout=httpx.Timeout(config.GATEWAY_SYNC_TIMEOUT, connect=10.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+            trust_env=False,
+        )
+    return _SYNC_CLIENT
+
+
+def _dl_client() -> httpx.AsyncClient:
+    global _DL_CLIENT
+    if _DL_CLIENT is None:
+        _DL_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(180.0, connect=10.0),
+            follow_redirects=True,
+            trust_env=False,
+        )
+    return _DL_CLIENT
+
+
+async def close() -> None:
+    """lifespan 关闭时归还连接池。"""
+    global _PROXY_CLIENT, _SYNC_CLIENT, _DL_CLIENT
+    for c in (_PROXY_CLIENT, _SYNC_CLIENT, _DL_CLIENT):
+        if c is not None:
+            await c.aclose()
+    _PROXY_CLIENT = _SYNC_CLIENT = _DL_CLIENT = None
+
+
+def _unwrap(body: Any) -> Any:
+    """容忍网关 new-api 风格 {success,data} 与裸 Task 两种返回，恒返回内层对象。"""
+    if isinstance(body, dict) and "data" in body and isinstance(body["data"], (dict, list)):
+        return body["data"]
+    return body
+
+
+def _normalize_task(task: Any) -> Any:
+    """轻量对齐：确保 task_id 字段存在（网关若返 id 也认）。"""
+    if isinstance(task, dict) and "task_id" not in task and "id" in task:
+        task = {**task, "task_id": task["id"]}
+    return task
+
+
+def _normalize_sync_result(raw: Any) -> "dict | None":
+    """把网关同步直出响应归一化成 _iter_outputs 可识别的 result 形状。
+
+    兼容常见网关返回：
+      - OpenAI 图片风 {data:[{url|b64_json}, ...]}
+      - {image:{...}} / {url|...} 单图
+      - 分层 {layers:[{...}, ...], image:{...}}
+    返回 result dict（含 data/image/layers/url 之一），或 None。
+    """
+    raw = _unwrap(raw)
+    if isinstance(raw, list):
+        return {"images": raw}
+    if not isinstance(raw, dict):
+        return None
+    if "data" in raw and isinstance(raw["data"], list):
+        # OpenAI 风格 {data:[...]} → 统一成 {images:[...]}
+        # 前端 extractImageOutputs 只扫描 image/images/layers，不认 data，
+        # 不转换会导致「任务未返回媒体」、画面无图（chatfire 等网关实测返回 data）。
+        return {"images": raw["data"], **({k: v for k, v in raw.items() if k != "data"})}
+    if "layers" in raw:
+        return {"layers": raw["layers"], **({"image": raw["image"]} if "image" in raw else {})}
+    if "image" in raw:
+        return {"image": raw["image"]}
+    if "url" in raw or "b64_json" in raw or "base64" in raw:
+        return raw
+    # 兜底：原样当作 result（_iter_outputs 顶层 take 仍可能命中）
+    return raw
+
+
+def _extract_gw_request_id(raw: Any) -> "str | None":
+    """从网关响应里取 request_id（对齐网关全站日志 /api/log 的 request_id 字段）。"""
+    if isinstance(raw, dict):
+        for k in ("request_id", "requestId", "requestID", "id"):
+            v = raw.get(k)
+            if isinstance(v, str) and v:
+                return v
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 产物落盘：把 result 内的图片落 BFF cloud_media，改写 result 指向 BFF media
+# ---------------------------------------------------------------------------
+def _iter_outputs(result: dict) -> "list[dict]":
+    """收集 result 内所有可作为产物的对象（原地引用，便于改写 url）。"""
+    outs: "list[dict]" = []
+
+    def take(o: Any) -> None:
+        if isinstance(o, dict) and (
+            o.get("url") or o.get("b64_json") or o.get("base64")
+            or o.get("dataUrl") or o.get("data_url")
+        ):
+            outs.append(o)
+
+    take(result)  # 顶层可能直接带 url / b64
+    for k in ("data", "image", "images", "layers", "video", "videos"):
+        v = result.get(k)
+        if isinstance(v, list):
+            for it in v:
+                take(it)
+        elif isinstance(v, dict):
+            take(v)
+    if isinstance(result.get("outputs"), list):  # string[] url 列表
+        for u in result["outputs"]:
+            if isinstance(u, str):
+                outs.append({"url": u})
+    return outs
+
+
+def _decode_b64(s: str) -> "tuple[bytes | None, str | None]":
+    s = (s or "").strip()
+    mime: "str | None" = None
+    if s.startswith("data:"):
+        m = re.match(r"data:([^;]+);base64,(.*)", s, re.S)
+        if m:
+            mime, s = m.group(1), m.group(2)
+    try:
+        return base64.b64decode(s, validate=False), mime
+    except Exception:
+        return None, None
+
+
+async def _resolve_blob(obj: dict, uid: int) -> "tuple[bytes | None, str | None]":
+    """从产物对象解析出二进制 blob + mime；无法解析返回 (None, None)。"""
+    url = obj.get("url") or obj.get("href") or obj.get("image_url") or obj.get("imageUrl")
+    if url and isinstance(url, str):
+        try:
+            async with _dl_client().stream(
+                "GET", url, headers={"New-Api-User": str(uid)}
+            ) as r:
+                if r.status_code != 200:
+                    logger.warning("下载网关产物失败(http=%s)，跳过落盘: %s", r.status_code, url)
+                    return None, None
+                data = await r.aread()
+                mime = (r.headers.get("content-type") or "").split(";")[0] or None
+                return data, mime
+        except Exception as e:
+            logger.warning("下载网关产物异常，跳过落盘: %s (%s)", url, e)
+            return None, None
+    for key in ("b64_json", "base64", "dataUrl", "data_url"):
+        val = obj.get(key)
+        if isinstance(val, str) and val:
+            blob, mime = _decode_b64(val)
+            if blob:
+                return blob, mime
+    return None, None
+
+
+async def _persist_outputs(task: dict, task_id: str, uid: int, kind: str = "image") -> dict:
+    """任务成功：把 result 内图片/视频落 BFF cloud_media，改写 result 指向 BFF media。
+
+    幂等：同进程已落过直接复用缓存的改写 result，不重复落盘。
+    kind 用于决定落盘媒体类型：video-gen → "video"，其余（含分层透明 png）→ "image"。
+    """
+    if task_id in _PERSISTED:
+        task["result"] = _PERSISTED[task_id]
+        return task
+    result = task.get("result")
+    if not isinstance(result, dict):
+        return task
+    outs = _iter_outputs(result)
+    if not outs:
+        return task
+
+    media_kind = "video" if kind == "video-gen" else "image"
+    bff: "list[dict]" = []
+    changed = False
+    for obj in outs:
+        blob, mime = await _resolve_blob(obj, uid)
+        if not blob:
+            continue
+        if not mime:
+            mime = obj.get("mime") or obj.get("mimeType") or (
+                "video/mp4" if media_kind == "video" else "image/png")
+        try:
+            info = await cloudstore.media_put(uid, media_kind, mime, blob)
+        except ValueError as e:
+            logger.warning("落盘产物失败(配额/大小)，跳过: %s", e)
+            continue
+        obj["url"] = info["url"]
+        obj["_bffMediaKey"] = info["media_key"]
+        bff.append({"mediaKey": info["media_key"], "mime": info["mime"], "url": info["url"]})
+        changed = True
+
+    if changed:
+        result["bffMedia"] = bff
+        _PERSISTED[task_id] = result
+    return task
+
+
+# ---------------------------------------------------------------------------
+# 视图 + 日志
+# ---------------------------------------------------------------------------
+def _task_view(request_id: str, task_id: "str | None", kind: str, mode: str,
+               status: str, gw: Any) -> dict:
+    gw = gw if isinstance(gw, dict) else {}
+    return {
+        "id": request_id,
+        "taskId": task_id,
+        "kind": kind,
+        "mode": mode,
+        "status": status,
+        "result": gw.get("result"),
+        "gatewayTask": gw,  # 透传网关原始对象（含 progress 等字段）
+    }
+
+
+async def _log_submitted(uid: int, request_id: str, kind: str, mode: str,
+                         params: dict, task_id: "str | None" = None) -> None:
+    provider = params.get("provider")
+    model = params.get("model") or params.get("model_name")
+    await cloudstore.request_log_put(
+        uid, request_id, kind, provider, model, params, status="submitted", mode=mode)
+    if task_id:
+        await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
+
+
+# ---------------------------------------------------------------------------
+# 对外 API 辅助（被 routers/tasks.py 调用）
+# ---------------------------------------------------------------------------
+async def submit(uid: int, kind: str, params: dict) -> dict:
+    """提交任务：按 TASK_TYPES[kind] 分流。
+
+    - provider="gateway"：async 透传网关 tasks / sync 阻塞直出。
+    - provider="thirdparty"：直连第三方 API（提交→轮询→落 BFF 盘）。
+
+    返回统一视图 {id, taskId, kind, mode, status, result?, gatewayTask}；
+    前端用 id 轮询 GET /api/tasks/{id}。
+    """
+    spec = TASK_TYPES.get(kind)
+    if spec is None:
+        raise ValueError(f"unsupported task type: {kind}")
+    request_id = uuid.uuid4().hex
+    provider = spec.get("provider", "gateway")
+
+    if provider == "thirdparty":
+        return await _submit_thirdparty(uid, request_id, kind, spec, params)
+
+    mode = spec["mode"]
+    # 所有网关 task 均支持按请求参数覆盖模式（与 image-gen 一致）：
+    # 1) 前端 AI 服务弹窗显式指定了 params.mode（最优先）—— 用户在每个 AI 服务里配置的
+    #    同步/异步随 params.mode 带来，调用该模型时完全按此配置来。
+    # 2) 否则按模型名查 BFF 全局 image_model_modes（管理台兜底，兼容旧配置）
+    # 3) 否则回退 TASK_TYPES 里的全局默认。
+    if params.get("mode") in ("sync", "async"):
+        mode = params["mode"]
+    else:
+        model = params.get("model") or params.get("model_name")
+        if model:
+            override = image_model_modes.get_mode(model)
+            if override in ("sync", "async"):
+                mode = override
+    # 诊断日志：先看清 mode 到底是怎么定的
+    logger.info("tasks.submit kind=%s model=%s params.mode=%s resolved_mode=%s", kind, params.get("model"), params.get("mode"), mode)
+    # 外部 OpenAI 兼容网关（按服务路由）：前端带 _gateway，BFF 直连该服务、用其自有 key。
+    if params.get("_gateway"):
+        return await _run_external(uid, request_id, kind, spec, params)
+    if mode == "async":
+        try:
+            # 网关异步分支此前缺 request_log_put，导致外部/异步请求无留痕；此处补上（无 _gateway，无需掩码）。
+            await cloudstore.request_log_put(
+                uid, request_id, kind, "gateway",
+                params.get("model") or params.get("model_name") or "",
+                {**params}, status="submitted", mode="async")
+            body = {"type": kind, "params": params}
+            raw = await na.request_as_user(
+                "POST", spec["async_path"], uid, json=body, client=_proxy_client())
+        except NewApiError:
+            await cloudstore.request_log_update(request_id, status="failed")
+            raise
+        task = _normalize_task(_unwrap(raw))
+        task_id = task.get("task_id") or task.get("id")
+        await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
+        return _task_view(request_id, task_id, kind, "async",
+                          task.get("status", "processing"), task)
+
+    # sync：阻塞调用网关同步接口，落盘后回写请求日志。
+    return await _run_sync(uid, request_id, kind, spec["sync_path"], params)
+
+
+async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dict) -> dict:
+    try:
+        raw = await na.request_as_user("POST", path, uid, json=params, client=_sync_client())
+    except NewApiError:
+        await cloudstore.request_log_update(request_id, status="failed")
+        raise
+    gw_req_id = _extract_gw_request_id(raw)
+    result = _normalize_sync_result(raw)
+    task = {"result": result} if isinstance(result, dict) else {}
+    if result is not None:
+        task = await _persist_outputs(task, request_id, uid, kind)
+    await cloudstore.request_log_update(
+        request_id, status="succeeded", task_id=request_id,
+        gateway_request_id=gw_req_id, result=task.get("result"))
+    return _task_view(request_id, request_id, kind, "sync", "succeeded", task)
+
+
+async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
+    """外部 OpenAI 兼容网关直连（如 chatfire）：用服务自带 sk- key，按 baseUrl 拼端点。
+
+    前端在 params._gateway 里带 {base_url, api_key}；BFF 直连该服务端点、同步直出，
+    完全按用户在该 AI 服务里配置的网关与同异步来（不走 new-api admin PAT）。
+    外部网关多为即时返回（OpenAI 兼容），故无论用户配 sync/async 都直接返回 succeeded。
+    """
+    gw = params.get("_gateway") or {}
+    base_url = (gw.get("base_url") or "").strip().rstrip("/")
+    api_key = gw.get("api_key") or ""
+    if not base_url or not api_key:
+        raise ValueError("external gateway 需要 base_url 与 api_key")
+    path = spec.get("sync_path") or "images/generations"
+    url = f"{base_url}/{path}"
+    # 诊断日志：外部网关请求也要留痕（掩码 key），便于排查「无图返回」类问题。
+    # 注意：params 仍含 _gateway（明文 api_key），落库前必须掩码。
+    _log_params = {**params}
+    _gw_log = _log_params.get("_gateway")
+    if isinstance(_gw_log, dict):
+        _log_params["_gateway"] = {**_gw_log, "api_key": "***"}
+    await cloudstore.request_log_put(
+        uid, request_id, kind, "external",
+        params.get("model") or params.get("model_name") or "",
+        _log_params, status="submitted", mode="sync")
+    # 网关不关心 _gateway 字段，发前剥离；也避免明文 key 误入任何日志。
+    payload = {k: v for k, v in params.items() if k != "_gateway"}
+    try:
+        raw = await na.request_external("POST", url, api_key=api_key, json=payload)
+    except NewApiError:
+        await cloudstore.request_log_update(request_id, status="failed")
+        raise
+    gw_req_id = _extract_gw_request_id(raw)
+    result = _normalize_sync_result(raw)
+    task = {"result": result} if isinstance(result, dict) else {}
+    if result is not None:
+        task = await _persist_outputs(task, request_id, uid, kind)
+    await cloudstore.request_log_update(
+        request_id, status="succeeded", task_id=request_id,
+        gateway_request_id=gw_req_id, result=task.get("result"))
+    return _task_view(request_id, request_id, kind, "sync", "succeeded", task)
+
+
+# ---------------------------------------------------------------------------
+# 第三方直连 Provider 分支（multi-angle 等网关未接入的能力）
+# ---------------------------------------------------------------------------
+async def _submit_thirdparty(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
+    """直连第三方提交：调对应 tp 适配器拿第三方任务 id，落请求日志后返回 processing 视图。"""
+    tp = spec.get("tp")
+    if tp == "wavespeed":
+        from .thirdparty import wavespeed as ws
+
+        if not config.WAVESPEED_ENABLED:
+            raise RuntimeError("WAVESPEED_API_KEY 未配置，第三方能力不可用")
+        source = params.get("source_media_key")
+        if not source:
+            raise ValueError(f"{kind} 需要 source_media_key（源图 BFF media key）")
+        try:
+            if kind == "multi-angle":
+                model = params.get("model") or config.WAVESPEED_MULTIANGLE_MODEL
+                tp_task_id = await ws.submit_multi_angle(
+                    uid, source,
+                    rotate=params.get("rotate", 0), tilt=params.get("tilt", 0),
+                    scale=params.get("scale", "medium"),
+                    extra_prompt=params.get("prompt", ""), model=model,
+                    num_images=int(params.get("num_images", 1)),
+                )
+            elif kind == "split-layers":
+                model = params.get("model") or config.WAVESPEED_SPLIT_MODEL
+                tp_task_id = await ws.submit_split_layers(
+                    uid, source,
+                    num_layers=int(params.get("num_layers", 4)),
+                    prompt=params.get("prompt", ""), model=model,
+                )
+            else:
+                raise ValueError(f"unsupported thirdparty kind: {kind}")
+        except Exception:
+            await cloudstore.request_log_update(request_id, status="failed")
+            raise
+        log_params = {**params, "provider": "thirdparty", "model": model}
+        await cloudstore.request_log_put(
+            uid, request_id, kind, "thirdparty", model, log_params,
+            status="submitted", mode="async")
+        await cloudstore.request_log_update(request_id, status="processing", task_id=tp_task_id)
+        return _task_view(request_id, tp_task_id, kind, "async", "processing",
+                          {"status": "processing", "provider": "thirdparty"})
+    raise ValueError(f"unsupported thirdparty provider: {tp}")
+
+
+async def _poll_thirdparty(kind: str, tp_task_id: str) -> "tuple[str, list[str]]":
+    """调第三方适配器轮询，返回 (status, image_urls)。"""
+    tp = TASK_TYPES.get(kind, {}).get("tp")
+    if tp == "wavespeed":
+        from .thirdparty import wavespeed as ws
+
+        return await ws.get_status(tp_task_id)
+    raise ValueError(f"unsupported thirdparty provider: {tp}")
+
+
+async def get_task(request_id: str, uid: int) -> dict:
+    """查询任务（轮询）。
+
+    - sync 任务：结果已落请求日志，直接返回存储的 result（status=succeeded/failed）。
+    - async 任务：转发网关查询；succeeded 时把图片产物落 BFF cloud_media 并改写 result。
+      网关按 New-Api-User 隔离，越权/不存在返回 404（NewApiError）→ router 原样透传前端。
+    """
+    log = await cloudstore.request_log_get(request_id)
+    if not log or log["uid"] != uid:
+        raise NewApiError("任务不存在", 404)
+    kind, mode, status = log["kind"], log["mode"], log["status"]
+
+    if mode == "sync":
+        result = log.get("result")
+        return _task_view(request_id, request_id, kind, "sync", status,
+                          {"result": result} if result is not None else {})
+
+    # async：可能是网关或第三方，按 provider 分流。
+    task_id = log["task_id"]
+    if not task_id:
+        return _task_view(request_id, None, kind, "async", status, {})
+
+    if (log.get("provider") or "gateway") == "thirdparty":
+        tp_status, urls = await _poll_thirdparty(kind, task_id)
+        if tp_status in ("completed", "succeeded"):
+            # 分层任务：每层一个节点，label 带图层序号；其他任务 label 留空。
+            images = [
+                {"url": u, "label": f"图层 {i + 1}" if kind == "split-layers" else ""}
+                for i, u in enumerate(urls)
+            ]
+            result = {"images": images}
+            task = {"result": result}
+            if urls:
+                task = await _persist_outputs(task, task_id, uid, kind)
+            await cloudstore.request_log_update(
+                request_id, status="succeeded", result=task.get("result"))
+            return _task_view(request_id, task_id, kind, "async", "succeeded", task)
+        if tp_status in ("failed", "error", "cancelled", "timeout", "deleted"):
+            await cloudstore.request_log_update(request_id, status="failed")
+            return _task_view(request_id, task_id, kind, "async", "failed", {})
+        return _task_view(request_id, task_id, kind, "async", tp_status or "processing", {})
+
+    # gateway async：拉网关最新状态。
+    raw = await na.request_as_user(
+        "GET", f"{TASK_TYPES[kind]['async_path']}/{task_id}", uid, client=_proxy_client())
+    task = _normalize_task(_unwrap(raw))
+    gstatus = task.get("status")
+    if gstatus == "succeeded":
+        task = await _persist_outputs(task, task_id, uid, kind)
+        await cloudstore.request_log_update(request_id, status="succeeded", result=task.get("result"))
+    elif gstatus in ("failed", "error"):
+        await cloudstore.request_log_update(request_id, status="failed")
+    return _task_view(request_id, task_id, kind, "async", gstatus or status, task)
+
+
+async def cancel_task(request_id: str, uid: int) -> dict:
+    """取消任务：async 转网关 DELETE / 第三方尽力取消；sync 已即时完成，无需取消。"""
+    log = await cloudstore.request_log_get(request_id)
+    if not log or log["uid"] != uid:
+        raise NewApiError("任务不存在", 404)
+    if log["mode"] == "sync":
+        raise NewApiError("同步任务已即时完成，无需取消", 400)
+    task_id = log["task_id"]
+    if task_id and (log.get("provider") or "gateway") == "thirdparty":
+        # 第三方尽力取消（不支持则仅标记 cancelled）。
+        from .thirdparty import wavespeed as ws
+
+        try:
+            await ws.cancel(task_id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("第三方取消失败(忽略): %s", e)
+        await cloudstore.request_log_update(request_id, status="cancelled")
+        return {"cancelled": True}
+    if task_id:
+        await na.request_as_user(
+            "DELETE", f"{TASK_TYPES[log['kind']]['async_path']}/{task_id}", uid,
+            client=_proxy_client())
+    await cloudstore.request_log_update(request_id, status="cancelled")
+    return {"cancelled": True}

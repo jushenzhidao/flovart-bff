@@ -1,0 +1,18 @@
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn[standard]==0.30.*
+httpx==0.27.*
+cryptography==50.0.1
+python-dotenv==1.2.3
+# FastAPI multipart/form-data 解析依赖（PSD 上传场景）
+python-multipart>=0.0.9
+# 服务端图像转 PSD（下载格式选）。
+# - Pillow 仅做 raster 解码 / 转 RGB。
+# - Pillow 不支持 PSD 写出；psd-tools 提供 PSDImage.create_pixel_layer() 直接写出。
+# Windows x64 / Linux x64 / macOS 全平台预编译 wheel，无需 ImageMagick 等外部依赖。
+Pillow>=10.4
+psd-tools>=1.10
+# 外部对象存储（OSS/COS/S3 兼容，boto3 S3 协议）—— 媒体字节层
+boto3>=1.34
+# 元数据层 PostgreSQL 异步驱动（替代本地 SQLite，多副本可共享）
+asyncpg>=0.29

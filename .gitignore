@@ -1,0 +1,21 @@
+# 会话与状态
+.env
+!.env.example
+
+# 运行期状态（目录本身入库，内容不入库）
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.log
+.DS_Store
+Thumbs.db
