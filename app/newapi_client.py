@@ -256,6 +256,13 @@ async def request(method: str, path: str, *, headers: dict, json: Any = None,
 def _parse_response(resp: "httpx.Response", method: str, target: str) -> Any:
     """统一解析网关响应：网络/业务失败抛 NewApiError，data 原样返回。target 用于日志（path 或完整 URL）。"""
     if resp.status_code == 401:
+        # 401 的语义要分场景，否则会给出**误导性**提示：
+        # - 打 new-api（target 是相对 path 或指向 NEWAPI_BASE_URL）→ 会话 PAT 失效，提示重新登录是对的。
+        # - 打外部网关（target 是完整 http(s) URL，如 https://api.chatfire.cn/v1/...）→ 是【该服务的
+        #   API Key 无效】，跟 BFF 登录态毫无关系。此前一律回「凭证已失效，请重新登录」，
+        #   用户被误导去找登录问题（飞哥 2026-09-11 反馈普通用户生图失败即此情形）。
+        if target.startswith(("http://", "https://")):
+            raise NewApiError("AI 服务的 API Key 无效或无权限，请在「AI 服务设置」中检查该服务的 Key", 401)
         raise NewApiError("凭证已失效，请重新登录", 401)
     if resp.status_code == 409:
         try:
@@ -525,6 +532,14 @@ async def admin_enabled_models() -> list:
 
     契约（已实测）：GET /api/channel/models_enabled → data 为启用渠道的
     模型名数组（含 doubao-seedance-* 等视频模型）。一次拿全，无需翻页聚合。
+
+    ⚠️ 这是【全站】启用模型，**不按用户分组过滤**。若某模型只绑在用户所在分组
+    之外的渠道上，它会出现在这个列表里但实际调不通（报
+    `No available channel for model X under group <用户分组>`）。
+    因此**不要直接把本函数的返回值当「用户可用模型」下发** ——
+    请用 user_available_models(sk)，它按该 Key 所属分组返回真实可调用的模型。
+
+    保留本函数用于：需要全站清单的场景（如管理端总览）。
     """
     body = await admin_request("GET", "/api/channel/models_enabled")
     outer = body if isinstance(body, dict) else {}
@@ -532,6 +547,35 @@ async def admin_enabled_models() -> list:
     if not isinstance(data, list):
         return []
     return [str(m).strip() for m in data if str(m).strip()]
+
+
+async def user_available_models(sk: str) -> list:
+    """用【用户自己的 sk-】查网关 /v1/models —— 返回该用户【按其分组】真正可调用的模型。
+
+    契约（已实测）：GET {base}/v1/models，Authorization: Bearer <sk->
+    → data 为 [{"id": "<model>", ...}]，**已按该 Key 所属分组过滤**。
+    例：default 分组返回 31 个（无图片模型）；keypool 分组才有 doubao-seedream-*。
+
+    这是「模型目录要诚实」的关键：BFF 若下发 admin_enabled_models()（全站 52 个），
+    用户会看到一堆自己分组调不通的模型（症状：列表里有、点下去 model_not_found）。
+
+    注意：/v1 只认 sk-（不认 PAT、也不需要 New-Api-User —— key 自归属该用户）。
+    """
+    body = await request("GET", "/v1/models", headers={"Authorization": f"Bearer {sk}"})
+    outer = body if isinstance(body, dict) else {}
+    data = outer.get("data")
+    if not isinstance(data, list):
+        return []
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            mid = str(item.get("id") or "").strip()
+        else:
+            mid = str(item).strip()
+        if mid:
+            out.append(mid)
+    return out
+
 
 
 # ---------- 用户态 ----------

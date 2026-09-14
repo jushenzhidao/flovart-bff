@@ -21,6 +21,7 @@
 - 落盘为异步 `await cloudstore.media_put`（BFF→OSS put_object + PG 索引 upsert）。
 - 进程内 _PERSISTED 做幂等：同进程重复 GET 不重复落盘；重启重落无害（多一份相同字节）。
 """
+import asyncio
 import base64
 import json
 import logging
@@ -76,6 +77,8 @@ _SYNC_CLIENT: "httpx.AsyncClient | None" = None
 _DL_CLIENT: "httpx.AsyncClient | None" = None
 # 进程内幂等：task_id -> 已改写的 result（避免重复落盘）。
 _PERSISTED: "dict[str, dict]" = {}
+# 后台外部网关调用的强引用（asyncio 只持弱引用，不留引用会被 GC 掉，任务静默消失）。
+_BACKGROUND_TASKS: "set[asyncio.Task]" = set()
 
 
 def _proxy_client() -> httpx.AsyncClient:
@@ -376,28 +379,75 @@ async def submit(uid: int, kind: str, params: dict) -> dict:
 
 
 async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dict) -> dict:
+    # 同 _run_external：失败必须留痕（catch 所有异常 + 写 result），否则 status=failed 却查不到原因。
     try:
         raw = await na.request_as_user("POST", path, uid, json=params, client=_sync_client())
-    except NewApiError:
-        await cloudstore.request_log_update(request_id, status="failed")
+    except Exception as e:  # noqa: BLE001
+        err = _error_record(e, "gateway_sync_error", "request", path=path, uid=uid)
+        logger.warning("网关同步调用失败 uid=%s req=%s path=%s err=%s",
+                       uid, request_id, path, err["error"]["message"])
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
         raise
     gw_req_id = _extract_gw_request_id(raw)
-    result = _normalize_sync_result(raw)
-    task = {"result": result} if isinstance(result, dict) else {}
-    if result is not None:
-        task = await _persist_outputs(task, request_id, uid, kind)
+    try:
+        result = _normalize_sync_result(raw)
+        task = {"result": result} if isinstance(result, dict) else {}
+        if result is not None:
+            task = await _persist_outputs(task, request_id, uid, kind)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("网关同步结果处理失败 uid=%s req=%s path=%s", uid, request_id, path)
+        err = _error_record(e, "gateway_result_error", "normalize/persist", path=path)
+        await cloudstore.request_log_update(
+            request_id, status="failed", gateway_request_id=gw_req_id, result=err)
+        raise
     await cloudstore.request_log_update(
         request_id, status="succeeded", task_id=request_id,
         gateway_request_id=gw_req_id, result=task.get("result"))
     return _task_view(request_id, request_id, kind, "sync", "succeeded", task)
 
 
+def _error_record(exc: BaseException, err_type: str, stage: str,
+                  *, url: "str | None" = None, path: "str | None" = None,
+                  uid: "int | None" = None) -> dict:
+    """把异常转成可落库的错误详情（供 request_log.result 与前端展示）。
+
+    ⚠️ 属性名要兼容：NewApiError 用 `.message` / `.status_code`，
+    httpx 异常用 `.status`，其它异常只有 `str(e)`。此前手写 getattr 链条时
+    误用了 `.detail`（NewApiError 并无该属性），导致 status 丢失 —— 统一收敛到此处。
+    """
+    msg = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    err = {
+        "error": {
+            "message": str(msg),
+            "type": err_type,
+            "status": status_code,
+            "stage": stage,
+        }
+    }
+    if url:
+        err["error"]["url"] = url
+    if path:
+        err["error"]["path"] = path
+    if uid is not None:
+        err["error"]["uid"] = uid
+    return err
+
+
 async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
     """外部 OpenAI 兼容网关直连（如 chatfire）：用服务自带 sk- key，按 baseUrl 拼端点。
 
-    前端在 params._gateway 里带 {base_url, api_key}；BFF 直连该服务端点、同步直出，
-    完全按用户在该 AI 服务里配置的网关与同异步来（不走 new-api admin PAT）。
-    外部网关多为即时返回（OpenAI 兼容），故无论用户配 sync/async 都直接返回 succeeded。
+    前端在 params._gateway 里带 {base_url, api_key}；BFF 直连该服务、不走 new-api admin PAT。
+
+    ⚠️ 非阻塞提交（飞哥 2026-09-11 拍板，务必保持）：
+    外部网关（chatfire gpt-image 系列）**出图耗时常在 60s+**，若在此 await 到底，
+    nginx `proxy_read_timeout`（默认 60s）会先掐断连接 → 前端收到
+    `TypeError: Network Error`（不是「网关报错」），而**上游其实已经出图成功**，
+    用户白扣费还看不到图。
+    故此处只做「落请求日志 + 建后台任务」后立即返回 `processing`，
+    真正的网关调用交给 `asyncio.create_task` 在后台跑完并回写请求日志；
+    前端拿 request_id 走既有 GET /api/tasks/{id} 轮询（mode=sync 分支直接读日志结果）。
+    这样 POST 恒为毫秒级返回，与生图耗时彻底解耦。
     """
     gw = params.get("_gateway") or {}
     base_url = (gw.get("base_url") or "").strip().rstrip("/")
@@ -412,26 +462,64 @@ async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params
     _gw_log = _log_params.get("_gateway")
     if isinstance(_gw_log, dict):
         _log_params["_gateway"] = {**_gw_log, "api_key": "***"}
+    # mode 仍记 sync：语义是「网关同步直出」，只是 BFF 侧改为后台等待，
+    # 前端轮询行为不变（get_task 的 mode=='sync' 分支直接回读存储结果）。
     await cloudstore.request_log_put(
         uid, request_id, kind, "external",
         params.get("model") or params.get("model_name") or "",
         _log_params, status="submitted", mode="sync")
     # 网关不关心 _gateway 字段，发前剥离；也避免明文 key 误入任何日志。
     payload = {k: v for k, v in params.items() if k != "_gateway"}
+    logger.info("外部网关后台提交 uid=%s req=%s url=%s kind=%s", uid, request_id, url, kind)
+    _spawn_external_call(uid, request_id, kind, url, api_key, payload)
+    return _task_view(request_id, request_id, kind, "sync", "processing", {})
+
+
+def _spawn_external_call(uid: int, request_id: str, kind: str,
+                         url: str, api_key: str, payload: dict) -> None:
+    """把外部网关调用丢到后台跑，跑完/失败都回写请求日志（进程内，不依赖 worker）。
+
+    单 worker + asyncio 事件循环下，create_task 即「非阻塞后台执行」：
+    POST 立刻返回，后台协程继续 await 网关（长超时也不影响其它请求）。
+    ⚠️ 进程重启会丢在途后台任务（极端场景）；此时请求日志停在 processing，
+    前端轮询到超时后重试即可 —— 与「网关侧任务丢失」的处理一致，不会产生脏数据。
+    """
+    task = asyncio.create_task(_external_call_and_record(uid, request_id, kind, url, api_key, payload))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _external_call_and_record(uid: int, request_id: str, kind: str,
+                                    url: str, api_key: str, payload: dict) -> None:
+    """后台：直连外部网关 → 归一化 → 落 BFF 盘 → 回写请求日志（成功/失败都留痕）。"""
+    # 失败必须留痕：此前只 catch NewApiError 且不写 result，导致「status=failed 但 result 为空」
+    # 完全无法定位（飞哥 2026-09-11 反馈普通用户文生图失败，DB 里查不到任何原因）。
+    # 现在统一捕获【所有】异常（含超时 / 解析 / 落盘失败等非 NewApiError），
+    # 把错误信息写进 result（前端 GET /api/me/requests 直接可见）并记日志。
     try:
         raw = await na.request_external("POST", url, api_key=api_key, json=payload)
-    except NewApiError:
-        await cloudstore.request_log_update(request_id, status="failed")
-        raise
+    except Exception as e:  # noqa: BLE001 —— 必须吞掉一切并留痕，否则失败原因丢失
+        err = _error_record(e, "external_gateway_error", "request", url=url, uid=uid)
+        logger.warning("外部网关调用失败 uid=%s req=%s url=%s err=%s",
+                       uid, request_id, url, err["error"]["message"])
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return
     gw_req_id = _extract_gw_request_id(raw)
-    result = _normalize_sync_result(raw)
-    task = {"result": result} if isinstance(result, dict) else {}
-    if result is not None:
-        task = await _persist_outputs(task, request_id, uid, kind)
+    try:
+        result = _normalize_sync_result(raw)
+        task = {"result": result} if isinstance(result, dict) else {}
+        if result is not None:
+            task = await _persist_outputs(task, request_id, uid, kind)
+    except Exception as e:  # noqa: BLE001 —— 归一化/落盘失败同样要留痕
+        logger.exception("外部网关结果处理失败 uid=%s req=%s url=%s", uid, request_id, url)
+        err = _error_record(e, "external_result_error", "normalize/persist", url=url)
+        await cloudstore.request_log_update(
+            request_id, status="failed", gateway_request_id=gw_req_id, result=err)
+        return
     await cloudstore.request_log_update(
         request_id, status="succeeded", task_id=request_id,
         gateway_request_id=gw_req_id, result=task.get("result"))
-    return _task_view(request_id, request_id, kind, "sync", "succeeded", task)
+    logger.info("外部网关调用成功 uid=%s req=%s url=%s", uid, request_id, url)
 
 
 # ---------------------------------------------------------------------------

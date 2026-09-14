@@ -113,10 +113,28 @@ async def ensure_platform_key(session: dict = Depends(require_session)):
 
 @router.get("/api/models")
 async def user_model_catalog(session: dict = Depends(require_session)):
-    """登录用户可读的「平台模型目录」（启用渠道的模型名数组）。
+    """登录用户可读的「平台模型目录」——**该用户按其分组真正可调用的模型**。
 
-    new-api 的 models_enabled 是管理端点；普通用户无权直接调，由 BFF 用
-    管理员凭证代取再下发。创作站 default Key 的模型列表由此驱动。
+    为什么要用用户自己的 sk- 去查（而不是管理员全站列表）：
+    new-api 的渠道按【分组】绑定，用户属于某个分组，只能调用该分组渠道上的模型。
+    而 `admin_enabled_models()`（GET /api/channel/models_enabled）返回的是**全站**
+    启用模型、**不按分组过滤** —— 直接下发会让用户看到一堆自己调不通的模型
+    （症状：模型列表里有、点下去报 `No available channel for model X under group ...`）。
+    实测：default 分组 /v1/models 返回 31 个（图片类 0 个），而全站列表有 52 个。
+
+    故这里改用【用户自己的 sk-】查网关 /v1/models（该方法按 Key 所属分组过滤），
+    与聊天/图片调用的可见范围严格一致 —— 目录里有的，就是真能调的。
+
+    降级：取不到 sk- 或查 /v1/models 失败时，回落管理员全站列表（保证目录非空，
+    前端不至于空白；宁可多显示也不要让平台服务整体消失）。
     """
+    try:
+        info = await _ensure_token_plain(session)
+        models = await na.user_available_models(info["key"])
+        if models:
+            return ok({"items": models, "total": len(models), "scoped": True})
+        logger.warning("用户态 /v1/models 返回空，回落全站列表 uid=%s", session.get("uid"))
+    except Exception as e:  # noqa: BLE001 — 任何失败都不应让模型目录整体 500
+        logger.warning("用户态模型目录获取失败，回落全站列表 uid=%s: %s", session.get("uid"), e)
     models = await na.admin_enabled_models()
-    return ok({"items": models, "total": len(models)})
+    return ok({"items": models, "total": len(models), "scoped": False})

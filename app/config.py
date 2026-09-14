@@ -82,6 +82,10 @@ SECRET_KEY: str = os.getenv("BFF_SECRET_KEY", SECRET_KEY_DEFAULT)
 COOKIE_NAME = "bff_session"
 COOKIE_MAX_AGE = 7 * 24 * 3600  # 7 天；PAT 长期有效，不受 15min access_token 限制
 
+# 明文 uid 镜像 Cookie：前端首屏同步读取，用于给本地存储挑命名空间（多账号隔离）。
+# 非凭据 —— 服务端一律以会话 Cookie 内的 uid 为准，不读这个值。
+UID_COOKIE_NAME = "bff_uid"
+
 # Secure 默认 True：Cookie 载荷含用户 PAT，明文 HTTP 下会被泄露。
 # 唯一该置 0 的场景是本地开发 http://127.0.0.1。
 COOKIE_SECURE: bool = _bool("BFF_COOKIE_SECURE", True)

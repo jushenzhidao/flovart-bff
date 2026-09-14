@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from . import config, newapi_client as na, observability, store, tasks, oss, db
 from .newapi_client import NewApiError
 from .resp import ok
-from .routers import auth, billing, cloud, console, convert, keys, tasks as tasks_router, usage, chat, shares
+from .routers import (auth, billing, cloud, console, convert, keys, platform_services,
+                      tasks as tasks_router, usage, chat, shares)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("bff")
@@ -50,7 +51,7 @@ observability.setup(app)
 
 # 统一响应壳 {success, message, data}（同 hewapi）。注意：FastAPI 自动 422 校验
 # 失败返回的是 pydantic 默认形状，前端需兼容两种（参考 hewapi 前端处理）。
-for r in (auth.router, keys.router, usage.router, console.router, convert.router, cloud.router, tasks_router.router, billing.router, chat.router, shares.router):
+for r in (auth.router, keys.router, usage.router, console.router, convert.router, cloud.router, tasks_router.router, billing.router, chat.router, shares.router, platform_services.router):
     app.include_router(r)
 
 

@@ -106,6 +106,27 @@ def set_session(response: Response, payload: dict) -> None:
         secure=config.COOKIE_SECURE,
         path="/",
     )
+    # 明文 uid「镜像 Cookie」：仅供前端在【首屏同步】得知当前账号，用于给本地
+    # 存储（IndexedDB/localforage）挑正确的命名空间。
+    #
+    # 为什么需要：加密会话 Cookie 是 httponly 的，JS 读不到；而前端所有存储实例都在
+    # 模块顶层按 uid 建好，若等到 /user/self 返回才知道 uid，首屏已经用错命名空间读过
+    # 一遍数据了（表现为切账号后仍看到上一个账号的工作流）。所以在登录时额外种一个
+    # 可读的 uid，让前端在 import 阶段就能同步取到。
+    #
+    # 安全性：uid 不是凭据 —— 它只是本地库名的后缀。真正的鉴权仍由 httponly 会话
+    # Cookie 决定（服务端一律以会话里的 uid 为准，绝不信任这个值）。即便被篡改，
+    # 也只是让攻击者自己看到自己本地的另一份缓存，无法越权读写他人云端数据。
+    if payload.get("uid") is not None:
+        response.set_cookie(
+            key=config.UID_COOKIE_NAME,
+            value=str(payload["uid"]),
+            max_age=config.COOKIE_MAX_AGE,
+            httponly=False,
+            samesite=config.COOKIE_SAMESITE,
+            secure=config.COOKIE_SECURE,
+            path="/",
+        )
 
 
 def clear_session(response: Response) -> None:
@@ -115,6 +136,14 @@ def clear_session(response: Response) -> None:
         config.COOKIE_NAME,
         path="/",
         httponly=True,
+        samesite=config.COOKIE_SAMESITE,
+        secure=config.COOKIE_SECURE,
+    )
+    # uid 镜像 Cookie 一并清掉，避免登出后前端仍按旧 uid 命名空间读本地库。
+    response.delete_cookie(
+        config.UID_COOKIE_NAME,
+        path="/",
+        httponly=False,
         samesite=config.COOKIE_SAMESITE,
         secure=config.COOKIE_SECURE,
     )

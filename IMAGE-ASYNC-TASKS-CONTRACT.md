@@ -103,6 +103,25 @@
 ```json
 { "type": "image-gen | upscale | remove-background | split-layers", "params": { "...": "原样透传网关" } }
 ```
+
+**⚠️ 图片入参格式（前端已统一，网关请按此解析）**
+
+BFF 不校验 `params` 内部结构，故入参形状由前端与网关约定。前端所有图片工具调用点统一为：
+
+```jsonc
+// 单图（图生图 / upscale / remove-bg / split-layers）
+{ "image": { "data": "<纯 base64，不含 data: 前缀>", "mimeType": "image/png" } }
+
+// 多图引用（图生图引用多张素材时额外附带）
+{ "image": { "data": "...", "mimeType": "image/png" },
+  "images": [ { "data": "...", "mimeType": "image/png" }, { "data": "...", "mimeType": "image/jpeg" } ] }
+```
+
+- `data` 为**纯 base64**（不含 `data:image/png;base64,` 前缀），`mimeType` 为 MIME。
+- 单图时只发 `image`；多图时 `image` 为首图、`images` 为完整列表（网关只支持单图时可忽略 `images`）。
+- 历史坑：`generateImageWithProvider` 曾传 `image: ["data:image/png;base64,..."]`（data:URL 字符串数组），
+  与 upscale/remove-bg 的 `{data, mimeType}` 不一致，导致图生图引用素材丢失。已统一，**网关请勿再兼容旧数组格式**。
+
 响应（建议 HTTP 202）：
 ```json
 { "task_id": "gw_xxx", "status": "queued" }
