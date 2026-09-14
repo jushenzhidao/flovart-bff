@@ -49,16 +49,28 @@ Flovart「在线创作站」FastAPI BFF：登录/持久化/new-api 代理。前�
 - ⛔ **运行时动态实例方案已回退，勿再引入**（曾致素材读不到/节点丢失/历史消失/竞态）
 - **回归测试** `tests/storageNamespaceIsolation.test.ts`（17 例，改存储隔离前必跑）：含**顺序保证静态断言**、`apiKeysLoaded` 健壮性契约
 
+## ⭐⭐⭐ 分支策略（2026-09-14 起，务必先读）
+
+**`main` = 以「公共平台服务」为主的线上版本**；**`dev` = 接入网关模型新需求的开发区**。
+- `main` 上「平台共享服务」= **旧语义（共享 Key）**：条目含 `key`+`baseUrl`，用户侧持管理员 key
+  直连管理员配的端点，**不经 new-api 计费**（平台自担成本）。`_gateway` **必须带**。
+- `dev` 上「平台共享服务」= **新语义（模型清单）**：条目**仅含模型清单**（无 key/baseUrl），
+  用户用**自己的默认 Key** + BFF 下发的 `gatewayBaseUrl` 走 new-api，**计费落用户自己配额**。
+  `_gateway` **绝不能带**；BFF `_FORBIDDEN_FIELDS=("key","baseUrl")` 强制剔除。
+- ⚠️ **动手改造前先打真·基线 tag**：本仓 init commit（web `5ad25eb`/bff `6538bc7`）
+  **已包含** dev 改造，tag `dev-baseline-20260914` **不是**改造前快照。回退只能手工反向改写。
+- 相关提交：main 回退 = web `f08ff71` / bff `8acc81d`。
+
 ## ⭐⭐ 平台共享 AI 服务（管理员发布 → 服务端存储 → 全员拉取）
 
-### 🔑 两个标记、两条链路 —— 本仓最容易踩的坑
-| | 平台 Key 池（旧） | 平台共享服务（新） |
-|---|---|---|
-| 标记 | `extraConfig.flovart_platform='1'` | `extraConfig.platformSource='1'` |
-| 来源 | `/api/me/ensure-key` 按用户签发 | `/api/platform/services` 管理员发布 |
-| 密钥 | 每用户一把自己的 new-api token | 管理员那把 key **下发给所有人** |
-| 链路 | BFF 网关代发 → new-api **计费落各自配额** | 用户侧 `params._gateway` 交 BFF `_run_external` 直连外部网关 |
-| 计费 | new-api | **不经 new-api**（平台自担成本） |
+### 🔑 两个标记、三条链路 —— 本仓最容易踩的坑
+| | 平台 Key 池 | 平台共享服务（**main=旧语义**） | 平台共享服务（**dev=新语义**） |
+|---|---|---|---|
+| 标记 | `extraConfig.flovart_platform='1'` | `extraConfig.platformSource='1'` | 同左（标记不变，语义变） |
+| 来源 | `/api/me/ensure-key` 按用户签发 | `/api/platform/services` 管理员发布 | 同左 |
+| 密钥 | 每用户一把自己的 new-api token | 管理员那把 key **下发给所有人** | **不含密钥**，用用户自己的 sk- |
+| 链路 | BFF 网关代发 → new-api **计费落各自配额** | 用户侧 `params._gateway` 交 BFF `_run_external` 直连外部网关 | 用户自己的 sk- 打 BFF `gatewayBaseUrl` → new-api |
+| 计费 | new-api | **不经 new-api**（平台自担成本） | new-api，**落用户自己配额** |
 
 两者**并存不互斥**。**严禁复用同一标记**：共享服务若带上 `flovart_platform`，前端 `isHostedPlatform()` 会误判 → 绕开计费。BFF `_sanitize()` **强制剔除**该字段并有单测守护。
 **两者都必须被 `isHostedPlatform()` 认作平台模式**（否则掉 BYOK 直连 → 拿本地 key 直连上游），区别只在「要不要带 `_gateway`」：共享服务带、Key 池不带。注入函数 `platformSharedGatewayParams()`。
