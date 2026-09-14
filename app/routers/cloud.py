@@ -30,7 +30,10 @@ router = APIRouter()
 # scope 白名单：只允许已知业务域，防止把任意路径当 scope（防御性约束）。
 ALLOWED_SCOPES = {"projects", "history", "assets", "kv", "settings"}
 
-_SCOPE_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+# doc_key / scope 允许字符：字母数字 + `_ . : - @`
+# `@` 是「正式版」doc_key 的分隔符（`<项目id>@v<N>`，见 DESIGN-draft-vs-saved.md），
+# 必须放行，否则正式版的 PUT 会被 400 拒掉。
+_SCOPE_KEY_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
 
 
 def _uid(session: dict) -> int:
