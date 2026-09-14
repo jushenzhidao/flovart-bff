@@ -130,12 +130,11 @@ def test_user_available_models_hits_v1_models():
 
 
 # ---------------------------------------------------------------------------
-# 平台 AI 服务（2026-09-14 语义重塑：模型清单，不含密钥）
+# 平台共享 AI 服务（2026-09-11 飞哥拍板选 B）
 #
-# 诉求：「管理员在设置页配好模型 → 用户能选到 → 用【自己的默认 Key】调用」。
-# 契约：GET 所有登录用户可读（返回模型清单 + 网关基址）；PUT 仅管理员可写；
-#       两者都走同一份 cloud_docs(uid=0, scope='platform') 全局文档。
-#       **不再下发 key/baseUrl** —— 用户 Key 与网关基址由 BFF 侧统一。
+# 诉求：「管理员配置的 AI 服务 → 上传存储 → 所有用户拉取使用」。
+# 契约：GET 所有登录用户可读；PUT 仅管理员可写；两者都走同一份
+#       cloud_docs(uid=0, scope='platform') 全局文档。
 # ---------------------------------------------------------------------------
 def test_platform_services_endpoints_registered():
     from app.main import app
@@ -157,7 +156,7 @@ def test_platform_services_read_vs_write_permission():
     text = src.read_text(encoding="utf-8")
 
     read_at = text.index("async def list_platform_services")
-    read_body = text[read_at:read_at + 900]
+    read_body = text[read_at:read_at + 600]
     assert "require_session" in read_body, "读取必须全员可用（require_session）"
 
     write_at = text.index("async def put_platform_services")
@@ -174,27 +173,11 @@ def test_platform_services_global_scope_is_uid_zero():
     assert ps.PLATFORM_DOC_KEY == "services"
 
 
-def test_platform_services_list_returns_gateway_base_url():
-    """GET 必须下发网关基址 —— 前端靠它把「用户自己的 sk-」打到正确网关。
+def test_platform_services_sanitize_strips_platform_marker():
+    """关键回归：共享服务的 extraConfig 不能带 flovart_platform。
 
-    若不发，前端只能猜 baseUrl，一旦与用户 sk- 不同源就必然 401。
-    """
-    import pathlib
-
-    src = pathlib.Path(__file__).resolve().parents[1] / "app" / "routers" / "platform_services.py"
-    text = src.read_text(encoding="utf-8")
-    read_at = text.index("async def list_platform_services")
-    read_body = text[read_at:read_at + 900]
-    assert "gatewayBaseUrl" in read_body, "必须下发 gatewayBaseUrl（与用户 sk- 同源）"
-    assert "config.API_BASE_URL" in read_body
-
-
-def test_platform_services_sanitize_strips_key_and_base_url():
-    """⭐ 关键回归（2026-09-14）：平台服务**不得**落库/下发密钥与 Base URL。
-
-    旧语义曾把管理员 key 明文下发给所有账号（泄漏面 = 任何登录用户），
-    且直连外部网关**绕开 new-api 计费**（平台白付成本）。
-    新语义下调用一律用用户自己的 Key + BFF 网关基址。
+    该标记语义是「平台 Key 池走 BFF 代发计费」；若被带到共享服务上，
+    前端 aiGateway.isHostedPlatform() 会误判 → 不用这把 key、绕开 new-api 计费。
     """
     from app.routers.platform_services import _sanitize
 
@@ -205,33 +188,13 @@ def test_platform_services_sanitize_strips_key_and_base_url():
         "baseUrl": "https://api.chatfire.cn/v1",
         "key": "sk-test",
         "capabilities": ["image"],
-        "models": ["gpt-image-2"],
         "extraConfig": {"flovart_platform": "1", "requestFormat": "openai"},
+        "id_should_be_kept": "yes",
         "someLocalField": 123,
     }, "admin")
 
-    assert "key" not in out, "密钥绝不允许落库/下发"
-    assert "baseUrl" not in out, "Base URL 由 BFF 统一（用户 Key 必须与网关同源）"
     assert out["extraConfig"].get("flovart_platform") is None, "必须剔除平台 Key 池标记"
-    assert out["extraConfig"].get("_gateway") is None, "不得带 _gateway（会绕开计费）"
     assert out["extraConfig"].get("requestFormat") == "openai", "保留合法 extraConfig"
-    assert out["models"] == ["gpt-image-2"], "模型清单必须保留（这是平台服务的核心）"
-    assert out["customModels"] == ["gpt-image-2"], "customModels 与 models 双向同步"
     assert out["updatedBy"] == "admin"
     assert "someLocalField" not in out, "白名单外字段不得下发"
-
-
-def test_platform_services_redact_never_leaks_key():
-    """下发（_redact）同样必须剔除 key/baseUrl —— 兼容库里残留的旧数据。"""
-    from app.routers.platform_services import _redact
-
-    out = _redact({
-        "id": "svc-1",
-        "name": "平台模型",
-        "key": "sk-legacy-leftover",
-        "baseUrl": "https://api.chatfire.cn/v1",
-        "customModels": ["gpt-image-2"],
-    })
-    assert "key" not in out, "旧数据里的 key 也不能下发"
-    assert "baseUrl" not in out
-    assert out["models"] == ["gpt-image-2"], "从 customModels 回填 models（兼容旧数据）"
+    assert out["key"] == "sk-test", "选 B：密钥随配置下发"
