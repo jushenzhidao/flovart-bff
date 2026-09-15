@@ -31,10 +31,54 @@ from typing import Any
 
 import httpx
 
-from . import config, cloudstore, image_model_modes, newapi_client as na
+from . import config, cloudstore, image_model_modes, newapi_client as na, user_keys
 from .newapi_client import NewApiError
 
 logger = logging.getLogger("bff.tasks")
+
+
+# ---------------------------------------------------------------------------
+# 用户 sk- 取用（2026-09-15 关键修复）
+# ---------------------------------------------------------------------------
+# 🔴 为什么不能用 request_as_user（管理员 PAT）打任务端点：
+#   new-api 的 **`/v1/*` 只认 API Key(`sk-`)，不认 PAT**（PAT 仅适用于管理类 `/api/*`）。
+#   用 PAT 打 `v1/video/generations` / `v1/images/generations` 一律 **401 Invalid token**，
+#   前端表现为「生成失败（凭证已失效）」——即使登录态完全正常。
+#   ⚠️ 这是架构层约束，与登录状态无关；chat.py 早已用同一机制规避（按需发放用户 sk-）。
+#
+# 取用顺序：① 复用 user_keys 已存的 sk-；② 管理员凭证代建（无需用户 PAT）并持久化。
+# 轮换：请求遇 401 时删除旧 key、重新代建并重试一次（与 chat.py 同款自愈）。
+async def _user_api_key(uid: int, *, rotate: bool = False) -> str:
+    """拿到该用户用于 `/v1` 的 sk-（复用已存 / 管理员代建），加密持久化。"""
+    if rotate:
+        user_keys.delete_key(uid)
+    key = user_keys.get_key(uid)
+    if key:
+        return key
+    key = await na.admin_mint_user_api_key(uid)  # 失败抛 NewApiError，由上层转 502
+    user_keys.set_key(uid, key)
+    return key
+
+
+async def _gw_call(method: str, path: str, uid: int, *,
+                   json: Any = None, params: dict | None = None,
+                   client: "httpx.AsyncClient | None" = None) -> Any:
+    """以该用户自己的 sk- 调网关 `/v1` 端点（计费/隔离落到该 uid）。
+
+    401 时自动轮换 sk- 重试一次（key 被用户在网关撤销 / 换账号等场景自愈）。
+    """
+    key = await _user_api_key(uid)
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        return await na.request(method, path, headers=headers, json=json,
+                                params=params, client=client)
+    except NewApiError as e:
+        if e.status_code != 401:
+            raise
+        logger.warning("用户 sk- 被拒(401)，轮换后重试 uid=%s path=%s", uid, path)
+        key = await _user_api_key(uid, rotate=True)
+        return await na.request(method, path, headers={"Authorization": f"Bearer {key}"},
+                                json=json, params=params, client=client)
 
 # 任务类型 → 执行模式 + 网关端点 / 第三方 Provider。
 # provider:
@@ -363,7 +407,8 @@ async def submit(uid: int, kind: str, params: dict) -> dict:
                 params.get("model") or params.get("model_name") or "",
                 {**params}, status="submitted", mode="async")
             body = {"type": kind, "params": params}
-            raw = await na.request_as_user(
+            # ⚠️ 必须用用户 sk- 打 /v1（PAT 不被 /v1 接受，会 401）—— 见 _gw_call 注释。
+            raw = await _gw_call(
                 "POST", spec["async_path"], uid, json=body, client=_proxy_client())
         except NewApiError:
             await cloudstore.request_log_update(request_id, status="failed")
@@ -374,14 +419,49 @@ async def submit(uid: int, kind: str, params: dict) -> dict:
         return _task_view(request_id, task_id, kind, "async",
                           task.get("status", "processing"), task)
 
-    # sync：阻塞调用网关同步接口，落盘后回写请求日志。
-    return await _run_sync(uid, request_id, kind, spec["sync_path"], params)
+    # sync：调用网关同步接口。
+    # ⚠️ 2026-09-15 两处修复：
+    #  ① 必须**先 request_log_put 落一条 submitted 记录**，否则 _run_sync 内部的
+    #     request_log_update（UPDATE）打在不存在的行上 → 静默 0 行 → 表现为
+    #     「提交返回 succeeded，但轮询 GET /api/tasks/{id} 恒 404 / status=None」。
+    #     （async 分支一直有这次 put，sync 分支此前漏了。）
+    #  ② 改为**非阻塞**（与 _run_external 同款）：网关同步出图常 60s+，
+    #     若在此 await 到底，nginx `proxy_read_timeout`（默认 60s）会先掐断连接，
+    #     前端收到裸 Network Error 而**上游其实已出图**（用户白扣费看不到图）。
+    #     故此处只落日志 + 起后台任务后立即返回 `processing`，
+    #     前端拿 request_id 走既有 GET /api/tasks/{id} 轮询（mode=sync 分支直接读结果）。
+    await cloudstore.request_log_put(
+        uid, request_id, kind, "gateway",
+        params.get("model") or params.get("model_name") or "",
+        {**params}, status="submitted", mode="sync")
+    _spawn_sync_call(uid, request_id, kind, spec["sync_path"], params)
+    return _task_view(request_id, request_id, kind, "sync", "processing", {})
+
+
+def _spawn_sync_call(uid: int, request_id: str, kind: str, path: str, params: dict) -> None:
+    """把网关同步调用丢到后台跑，跑完/失败都回写请求日志（进程内，不依赖 worker）。
+
+    与 `_spawn_external_call` 同款：POST 立即返回，后台协程继续 await 网关长耗时。
+    ⚠️ 进程重启会丢在途后台任务；此时日志停在 processing，前端轮询超时后重试即可。
+    """
+    task = asyncio.create_task(_run_sync_safe(uid, request_id, kind, path, params))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+async def _run_sync_safe(uid: int, request_id: str, kind: str, path: str, params: dict) -> None:
+    """后台包装：吞掉一切异常（_run_sync 内部已留痕），避免 create_task 抛未捕获异常。"""
+    try:
+        await _run_sync(uid, request_id, kind, path, params)
+    except Exception:  # noqa: BLE001 —— 内部已写 failed 状态与原因，此处仅防未捕获告警
+        logger.exception("同步任务后台执行异常 uid=%s req=%s path=%s", uid, request_id, path)
 
 
 async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dict) -> dict:
     # 同 _run_external：失败必须留痕（catch 所有异常 + 写 result），否则 status=failed 却查不到原因。
     try:
-        raw = await na.request_as_user("POST", path, uid, json=params, client=_sync_client())
+        # ⚠️ 同异步分支：/v1 只认用户 sk-，不能用管理员 PAT（否则 401）。
+        raw = await _gw_call("POST", path, uid, json=params, client=_sync_client())
     except Exception as e:  # noqa: BLE001
         err = _error_record(e, "gateway_sync_error", "request", path=path, uid=uid)
         logger.warning("网关同步调用失败 uid=%s req=%s path=%s err=%s",
@@ -454,7 +534,10 @@ async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params
     api_key = gw.get("api_key") or ""
     if not base_url or not api_key:
         raise ValueError("external gateway 需要 base_url 与 api_key")
-    path = spec.get("sync_path") or "images/generations"
+    # ⚠️ 兜底值必须带 `v1/` 前缀（2026-09-15 修复）：external 网关同样是
+    #    new-api 兼容层，OpenAI 端点全挂在 `/v1/*`；漏掉前缀会打到不存在的
+    #    `{base}/images/generations` → nginx 兜底返回前端 SPA 的 HTML → 502。
+    path = spec.get("sync_path") or "v1/images/generations"
     url = f"{base_url}/{path}"
     # 诊断日志：外部网关请求也要留痕（掩码 key），便于排查「无图返回」类问题。
     # 注意：params 仍含 _gateway（明文 api_key），落库前必须掩码。
@@ -621,7 +704,8 @@ async def get_task(request_id: str, uid: int) -> dict:
         return _task_view(request_id, task_id, kind, "async", tp_status or "processing", {})
 
     # gateway async：拉网关最新状态。
-    raw = await na.request_as_user(
+    # ⚠️ 轮询同样走 /v1，必须用用户 sk-（PAT 会 401）。
+    raw = await _gw_call(
         "GET", f"{TASK_TYPES[kind]['async_path']}/{task_id}", uid, client=_proxy_client())
     task = _normalize_task(_unwrap(raw))
     gstatus = task.get("status")
@@ -652,8 +736,17 @@ async def cancel_task(request_id: str, uid: int) -> dict:
         await cloudstore.request_log_update(request_id, status="cancelled")
         return {"cancelled": True}
     if task_id:
-        await na.request_as_user(
-            "DELETE", f"{TASK_TYPES[log['kind']]['async_path']}/{task_id}", uid,
-            client=_proxy_client())
+        # ⚠️ 2026-09-15 实测：new-api 的 video-router **未注册 DELETE 路由**
+        #   （只有 POST /v1/video/generations 与 GET /v1/video/generations/:task_id；
+        #     /v1/videos/:id 亦只有 GET/remix）→ DELETE 打过去是 404。
+        #   取消语义在网关侧本就不支持，故此处**容忍失败**：
+        #   仅记 warning，不回抛，随后照常把 BFF 侧日志标记 cancelled
+        #   （前端体验为「已取消」，不会再看到 404 报错）。
+        try:
+            await _gw_call(
+                "DELETE", f"{TASK_TYPES[log['kind']]['async_path']}/{task_id}", uid,
+                client=_proxy_client())
+        except Exception as e:  # noqa: BLE001 —— 网关不支持取消，尽力而为
+            logger.warning("网关取消任务失败(忽略，网关可能不支持 DELETE): %s", e)
     await cloudstore.request_log_update(request_id, status="cancelled")
     return {"cancelled": True}

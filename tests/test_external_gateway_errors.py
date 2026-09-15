@@ -79,7 +79,13 @@ def _install_fake_log(monkeypatch):
 
 
 def test_external_gateway_failure_records_reason(monkeypatch):
-    """外部网关失败时 result 必须写入错误详情（message/status/url/stage）。"""
+    """外部网关失败时 result 必须写入错误详情（message/status/url/stage）。
+
+    注意（2026-09-15 修正）：`_run_external` 已重构为「非阻塞提交」——
+    它只落 submitted 日志 + 起后台任务后**立即返回**，不再向上抛异常；
+    真正调用与失败留痕在 `_external_call_and_record` 里完成。
+    故此处直接驱动后台协程，断言其留痕行为（原断言 `pytest.raises` 已失效）。
+    """
     logs = _install_fake_log(monkeypatch)
 
     async def boom(method, url, *, api_key, json=None, client=None):
@@ -87,15 +93,9 @@ def test_external_gateway_failure_records_reason(monkeypatch):
 
     monkeypatch.setattr(tasks.na, "request_external", boom)
 
-    params = {
-        "model": "gpt-image-2",
-        "prompt": "一只猫",
-        "_gateway": {"base_url": "https://api.chatfire.cn/v1", "api_key": "sk-bad"},
-    }
-    spec = {"sync_path": "images/generations"}
-
-    with pytest.raises(NewApiError):
-        asyncio.run(tasks._run_external(7, "req-ext-1", "image-gen", spec, params))
+    asyncio.run(tasks._external_call_and_record(
+        7, "req-ext-1", "image-gen",
+        "https://api.chatfire.cn/v1/images/generations", "sk-bad", {"model": "gpt-image-2"}))
 
     entry = logs["req-ext-1"]
     assert entry["status"] == "failed"
@@ -109,7 +109,11 @@ def test_external_gateway_failure_records_reason(monkeypatch):
 
 
 def test_external_gateway_non_newapierror_also_recorded(monkeypatch):
-    """非 NewApiError（如超时/连接错误）同样必须留痕 —— 这是此前彻底丢失原因的场景。"""
+    """非 NewApiError（如超时/连接错误）同样必须留痕 —— 这是此前彻底丢失原因的场景。
+
+    同 test_external_gateway_failure_records_reason：改驱动后台协程
+    （`_run_external` 不再抛异常，吞掉一切并留痕的职责已移入 `_external_call_and_record`）。
+    """
     logs = _install_fake_log(monkeypatch)
 
     async def timeout_boom(method, url, *, api_key, json=None, client=None):
@@ -117,12 +121,9 @@ def test_external_gateway_non_newapierror_also_recorded(monkeypatch):
 
     monkeypatch.setattr(tasks.na, "request_external", timeout_boom)
 
-    params = {
-        "model": "gpt-image-2", "prompt": "一只猫",
-        "_gateway": {"base_url": "https://api.chatfire.cn/v1", "api_key": "sk-x"},
-    }
-    with pytest.raises(TimeoutError):
-        asyncio.run(tasks._run_external(8, "req-ext-2", "image-gen", {"sync_path": "images/generations"}, params))
+    asyncio.run(tasks._external_call_and_record(
+        8, "req-ext-2", "image-gen",
+        "https://api.chatfire.cn/v1/images/generations", "sk-x", {"model": "gpt-image-2"}))
 
     entry = logs["req-ext-2"]
     assert entry["status"] == "failed"

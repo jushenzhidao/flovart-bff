@@ -1,0 +1,8 @@
+HTTP/1.1 200 OK
+date: Tue, 15 Sep 2026 10:31:59 GMT
+server: uvicorn
+content-length: 130
+content-type: application/json
+set-cookie: bff_session=v2.KmhRplqSb1qJQ5Y2.eQAmJQ4tz4HtoWcAxoyRUK-78m6y8ftAFTXHbZggbZo9RF8dH6McH97DKSPSoaSE1sLWUnTVwUXXcvakVo319AiyNAWYDbn0TDoyFFH1u4UUHikJcb3HetG3QK6Hpq3ZpL08C9vYDUsGyFZjjh2Lhi37oGaO; HttpOnly; Max-Age=604800; Path=/; SameSite=lax
+set-cookie: bff_uid=169; Max-Age=604800; Path=/; SameSite=lax
+

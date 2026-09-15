@@ -205,30 +205,72 @@ LOGFIRE_ENABLED: bool = bool(LOGFIRE_TOKEN)
 # 异步：真正执行方是网关侧（new-api 兼容）。BFF 透传「提交→轮询→取消」，不存任务状态。
 # 同步：网关部分模型更适合同步直出（转异步成本高），BFF 阻塞调用网关同步接口、
 #       拿到结果后立即把产物落 BFF 云盘并回写请求日志。前端走同一套「提交→轮询」。
-# 各 task type 的 mode（sync/async）+ 网关端点见 app/tasks.py:TASK_TYPES（默认值，可 env 覆盖）。
+#
+# ⭐⭐ 2026-09-15 关键修复：**所有 GATEWAY_*_PATH 必须带 `v1/` 前缀**。
+#   网关（new-api）的 OpenAI 兼容端点全部挂在 **`/v1/*`** 下，`base_url` 是
+#   `NEWAPI_BASE_URL`（不带 /v1），故相对路径必须自带 `v1/`。
+#   ⛔ 漏掉 `/v1` 的后果（飞哥 2026-09-15 实报）：请求打到 `{base}/images/generations`
+#   —— 该路径在 nginx 上**不存在** → 被兜底给 new-api 的**前端 SPA** →
+#   返回 `200 text/html`（`<title>New API</title>`）而非 JSON →
+#   BFF 解析失败 → 前端看到 **502 Bad Gateway** + 「网关未实现该图片端点」。
+#   📌 免责提醒：报错文案里的「网关未实现该端点」是**误判**，实际是路径缺 /v1。
+#   实测对照（2026-09-15）：
+#     POST /v1/images/generations  → 401 application/json  ✅ 端点存在
+#     POST /images/generations     → 200 text/html         ❌ 前端页面兜底
+#   同族正确用法参考：newapi_client 里 "/v1/models"、chat.py 里 "/v1/chat/completions"
+#   都显式带 `v1/` —— 各 env 仍可覆盖（填值时**也别忘了 v1/**）。
+# ⭐⭐ 2026-09-15 二次修复：**异步任务端点是 `v1/video/generations`，不是
+#   `v1/contents/generations/tasks`**。原默认值系早期按契约文档（未实测）填写，
+#   实测 `POST /v1/contents/generations/tasks` → **404 application/json**（路径不存在）。
+#   依据 new-api 源码 `router/video-router.go`（SetVideoRouter）：
+#     POST   /v1/video/generations             ← 提交异步任务（controller.RelayTask）
+#     GET    /v1/video/generations/:task_id    ← 轮询任务（controller.RelayTaskFetch）
+#     POST   /v1/videos                        ← OpenAI 兼容别名（同样走 RelayTask）
+#     GET    /v1/videos/:video_id              ← OpenAI 兼容别名轮询
+#   四个端点 2026-09-15 实测均返回 `401 application/json`（= 端点存在，仅缺有效 token）✅
+#   note：new-api 的「图片/视频异步任务」**共用同一个 video 路由组**，靠请求体里的
+#   模型/type 分流，BFF 无需为图片另开端点 —— 故 image / video 两个 env 默认同值。
 GATEWAY_IMAGE_TASKS_PATH: str = os.getenv(
-    "GATEWAY_IMAGE_TASKS_PATH", "contents/generations/tasks"
-).strip().strip("/")  # 异步 tasks 端点（相对 NEWAPI_BASE_URL）
-# 视频异步：new-api 用「统一 tasks 端点」按 type 分流（图片/视频同端点，BFF 不感知具体端点）。
-# 若网关后续把视频拆到独立端点，用此 env 覆盖（默认与图片 tasks 端点一致）。
+    "GATEWAY_IMAGE_TASKS_PATH", "v1/video/generations"
+).strip().strip("/")  # 异步 tasks 端点（相对 NEWAPI_BASE_URL，含 v1 前缀）
+# 视频异步：与图片共用 new-api 的统一 video 任务端点（BFF 不感知具体分流）。
+# 若网关后续把视频拆到独立端点，用此 env 覆盖。
 GATEWAY_VIDEO_TASKS_PATH: str = os.getenv(
-    "GATEWAY_VIDEO_TASKS_PATH", "contents/generations/tasks"
+    "GATEWAY_VIDEO_TASKS_PATH", "v1/video/generations"
 ).strip().strip("/")
-# 同步端点（相对 NEWAPI_BASE_URL）。默认值待网关团队确认，可用同名 env 覆盖。
-GATEWAY_SYNC_IMAGE_PATH: str = os.getenv("GATEWAY_SYNC_IMAGE_PATH", "images/generations").strip().strip("/")
-GATEWAY_SYNC_UPSCALE_PATH: str = os.getenv("GATEWAY_SYNC_UPSCALE_PATH", "images/upscale").strip().strip("/")
-GATEWAY_SYNC_REMOVE_BG_PATH: str = os.getenv("GATEWAY_SYNC_REMOVE_BG_PATH", "images/remove-bg").strip().strip("/")
-GATEWAY_SYNC_SPLIT_PATH: str = os.getenv("GATEWAY_SYNC_SPLIT_PATH", "images/split-layers").strip().strip("/")
+# 同步端点（相对 NEWAPI_BASE_URL，含 v1 前缀）。
+#
+# ⭐ 2026-09-14 收敛（飞哥拍板）：**所有图片能力统一走 `v1/images/generations`**。
+#   理由：上游网关（如 api.chatfire.cn）**只实现 `/images/generations`，
+#   不实现 `/images/edits` 等语义化端点**（打过去必 404）。文生图 / 图生图 / 编辑
+#   在上游本就是同一个端点，靠入参（`image` 数组 / `mask` / `variant` / `task`）区分。
+#   因此这里不再为每个能力分配独立路径 —— 具体能力由请求体里的字段表达，
+#   网关侧按字段翻译到上游。各 env 仍保留（便于个别能力后续若真拆出独立端点时覆盖）。
+GATEWAY_SYNC_IMAGE_PATH: str = os.getenv("GATEWAY_SYNC_IMAGE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_UPSCALE_PATH: str = os.getenv("GATEWAY_SYNC_UPSCALE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_REMOVE_BG_PATH: str = os.getenv("GATEWAY_SYNC_REMOVE_BG_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_SPLIT_PATH: str = os.getenv("GATEWAY_SYNC_SPLIT_PATH", "v1/images/generations").strip().strip("/")
 # 图片编辑类（原纯 BYOK 直连，现走 BFF→网关，用户免 Key）：
 # 扩展画面 / 编辑蒙版 / 标注涂鸦 / 打光面板 / 通用编辑（换装预处理等）。
-# 端点路径为约定占位，待网关侧接入对应能力后端点对点联调。
-GATEWAY_SYNC_OUTPAINT_PATH: str = os.getenv("GATEWAY_SYNC_OUTPAINT_PATH", "images/outpaint").strip().strip("/")
-GATEWAY_SYNC_MASK_PATH: str = os.getenv("GATEWAY_SYNC_MASK_PATH", "images/mask").strip().strip("/")
-GATEWAY_SYNC_ANNOTATE_PATH: str = os.getenv("GATEWAY_SYNC_ANNOTATE_PATH", "images/annotate").strip().strip("/")
-GATEWAY_SYNC_RELIGHT_PATH: str = os.getenv("GATEWAY_SYNC_RELIGHT_PATH", "images/relight").strip().strip("/")
-GATEWAY_SYNC_EDIT_PATH: str = os.getenv("GATEWAY_SYNC_EDIT_PATH", "images/edits").strip().strip("/")
-# image-gen 默认走异步；若网关该模型同步更好用，置 GATEWAY_IMAGE_GEN_MODE=sync 切换为同步直出。
-GATEWAY_IMAGE_GEN_MODE: str = _choice("GATEWAY_IMAGE_GEN_MODE", "async", ("async", "sync"))
+# 同上：统一打 v1/images/generations，靠 body 里的 variant 字段区分具体编辑能力。
+GATEWAY_SYNC_OUTPAINT_PATH: str = os.getenv("GATEWAY_SYNC_OUTPAINT_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_MASK_PATH: str = os.getenv("GATEWAY_SYNC_MASK_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_ANNOTATE_PATH: str = os.getenv("GATEWAY_SYNC_ANNOTATE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_RELIGHT_PATH: str = os.getenv("GATEWAY_SYNC_RELIGHT_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_EDIT_PATH: str = os.getenv("GATEWAY_SYNC_EDIT_PATH", "v1/images/generations").strip().strip("/")
+# image-gen 的提交模式。
+#
+# ⭐⭐ 2026-09-15 实测改为默认 **sync**（此前默认 async，导致用户生图必失败）：
+#   本网关（new-api 兼容层）的**图片模型只支持同步端点 `v1/images/generations`**。
+#   而异步端点 `v1/video/generations` 是**视频任务语义**，网关会按 video 方式拼上游
+#   URL → 图片模型打过去必然 `404 fail_to_fetch_task`（上游 Not Found）。
+#   实测（用户 sk-，同一模型 gpt-image-2.5-flare）：
+#     POST /v1/images/generations  → **200**，63.5s 真实出图（返回 b64_json）✅
+#     POST /v1/video/generations   → 404 fail_to_fetch_task（上游 Not Found）❌
+#   ⚠️ 除非网关为图片实现真正的异步任务端点，否则**不要改回 async**。
+#   sync 模式下前端体验不变（仍是「提交 → 轮询 /api/tasks/{id}」），
+#   只是 BFF 在后台阻塞等待网关出图（`_run_sync` + 后台任务，不占用前端连接）。
+GATEWAY_IMAGE_GEN_MODE: str = _choice("GATEWAY_IMAGE_GEN_MODE", "sync", ("async", "sync"))
 # 同步调用网关的阻塞超时（秒）：同步生成可能较长，给足余量（前端仍走轮询，BFF 内部 await）。
 # 单 worker 下用异步 httpx 长超时不会阻塞事件循环，其他请求仍可并发处理。
 GATEWAY_SYNC_TIMEOUT: int = _int("GATEWAY_SYNC_TIMEOUT", 300)
