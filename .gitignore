@@ -13,6 +13,18 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# 本地 e2e 调试产物
+# cookies.txt / hdr.txt 里是真实会话凭证。载荷虽是 AES-GCM 密文，但密文本身
+# 仍是可重放的登录凭证，何况这些文件里还带着 uid 与响应头，一律不入库。
+.e2e/
+
+# 打包输出目录（scripts/pack_runtime.py 与前端 pack_dist.py 的落地位置）
+# zip 是二进制交付物，应由发布流程产出，不进版本库。
+dist/
+
+# 记忆文件的人工备份
+.workbuddy/memory/*.bak*
+
 # 编辑器 / 系统
 .idea/
 .vscode/

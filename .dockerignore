@@ -1,0 +1,47 @@
+# 构建上下文排除清单。
+#
+# ⚠️ 这里的第一要务是**别让凭证进构建上下文**：构建上下文会被整体打包发给
+#    docker daemon，即便 Dockerfile 里没有 COPY 某个文件，它也已经离开本机了。
+#    本项目 .env 里装着 BFF_SECRET_KEY、new-api 管理员账密、OSS AK/SK；
+#    data/ 里还有管理员 PAT 明文缓存与用户密钥密文。
+
+# ---- 真实配置（绝不能进上下文）----
+.env
+.env.*
+# 模板可以留：它只有占位符，是部署时的对照依据
+!.env.example
+
+# ---- 运行期数据：PAT / 用户密钥 / SQLite / 媒体 ----
+data/
+
+# ---- Python 缓存与本机虚拟环境 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ---- 版本控制与编辑器 ----
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# ---- 本地产物 ----
+dist/
+_bff.log
+*.db
+*.db-shm
+*.db-wal
+
+# ---- 设计文档与演示素材（运行时不读，见 Dockerfile 的 COPY 说明）----
+docs/
+*.md
+demo_*
+
+# ---- 测试与运维脚本（不进生产镜像，少一个文件少一处攻击面）----
+tests/
+scripts/
+.e2e/

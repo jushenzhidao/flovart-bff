@@ -72,7 +72,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 @app.get("/healthz")
 async def healthz():
     """存活探针：进程能响应即可，不做语义判断。"""
-    return ok({"service": "flovart-bff", "version": config.APP_VERSION})
+    # 服务名与 Logfire 上报用的是同一个来源（config.SERVICE_NAME）：两处各写
+    # 一份的话，将来改名只改一处，探针与可观测性会报出不同的名字。
+    return ok({"service": config.SERVICE_NAME, "version": config.APP_VERSION})
 
 
 _WEAK_SECRETS = {config.SECRET_KEY_DEFAULT, "changeme", "secret", "test", ""}

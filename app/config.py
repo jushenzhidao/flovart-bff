@@ -201,6 +201,17 @@ LOGFIRE_TOKEN: str = os.getenv("LOGFIRE_TOKEN", "").strip()
 LOGFIRE_ENVIRONMENT: str = os.getenv("LOGFIRE_ENVIRONMENT", "local").strip()
 LOGFIRE_ENABLED: bool = bool(LOGFIRE_TOKEN)
 
+# Logfire 里的服务名（决定控制台按 service 过滤时归到哪一堆）。
+# ⚠️ 2026-09-16 血案：本项目与 hewapi-bff **都部署在同一台机器上**，且两边的
+#    .env 一度用的是**同一个 LOGFIRE_TOKEN + 同一个 environment=local**；而
+#    hewapi 的 observability.py 把 service_name 写死成 "newapi-bff"。若这边照抄，
+#    两套服务的 trace / 日志会在 Logfire 控制台里混成一坨 —— 按服务名过滤不出
+#    任何一条边界，排查线上问题时无法判断某条报错到底出自哪套 BFF。
+#    故此处**必须从环境变量读，绝不在代码里写死**。
+# 更彻底的做法是给本项目**单开一个 Logfire 项目、换独立 token**：只改 service_name
+#    仍与对端共用同一个额度池与数据留存策略，隔离不完整。
+SERVICE_NAME: str = os.getenv("BFF_SERVICE_NAME", "flovart-bff").strip() or "flovart-bff"
+
 # ---------- 图片任务（BFF 同时兼容同步 / 异步，见 IMAGE-ASYNC-TASKS-CONTRACT.md）----------
 # 异步：真正执行方是网关侧（new-api 兼容）。BFF 透传「提交→轮询→取消」，不存任务状态。
 # 同步：网关部分模型更适合同步直出（转异步成本高），BFF 阻塞调用网关同步接口、

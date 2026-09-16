@@ -1,0 +1,254 @@
+# flovart-bff 生产编排。
+#
+# ⚠️ 与 hewapi-bff 的隔离契约（2026-09-16 锁定）
+# ────────────────────────────────────────────────────────────────────────────
+# 两套 BFF **部署在同一台机器**上，且同源（hewapi-bff 是本项目的参考实现）。
+# 凡是带固定名的资源这里全部改名，逐项对照如下 —— 改动时不要退回同名：
+#
+#   资源            hewapi 线上            本项目
+#   ────────────────────────────────────────────────────────────────────────
+#   project name    （目录名推导）          name: flovart-bff
+#   container_name  newapi-bff              flovart-bff      ← 同名的后果是
+#                                                             第二个容器直接起不来
+#   image           newapi-bff:${VER}       flovart-bff:${VER}
+#   volume          bff-data                flovart-bff-data
+#   宿主端口         ${BFF_PORT:-8000}       ${FLOVART_BFF_PORT:-8300}
+#   Logfire         newapi-bff / local      独立项目 + flovart-prod
+#
+# 另：hewapi **不用 PG / OSS**（纯 JSON 文件 + /data 卷），所以数据面天然不撞；
+# 本项目用 PG / OSS 时注意复用同一个实例要换 database 名与 OSS_PREFIX。
+#
+# 本编排刻意**不用 env_file**：容器只能看到下面显式列出的变量。
+# 好处是「容器里到底有什么」在 docker inspect 里一眼可见；代价是新增配置项时
+# 必须同步加到这里，否则表现为「宿主机 .env 配了、应用里却是默认值」。
+# 排查手法：docker compose exec bff env | grep BFF_
+
+name: flovart-bff
+
+services:
+  bff:
+    build:
+      context: .
+      args:
+        # 版本标签不给默认值：镜像里跑的是哪个 commit 必须可回溯，
+        # 让它悄悄变成 dev/unknown 等于放弃线上问题的追溯能力。
+        APP_VERSION: ${APP_VERSION:?APP_VERSION 必须设置，如 1.2.0 或 git describe 的输出}
+        VCS_REF: ${VCS_REF:?VCS_REF 必须设置，用 git rev-parse --short HEAD}
+        # 基础镜像默认 3.13，但**保留可覆盖**：这是构建期基础设施，不是运行期
+        # 安全行为。实测 Docker Hub 会返回 Bad Gateway 拉不到 3.13，此时写死
+        # 只会让部署整个卡住，没有任何安全收益。
+        # 代码 requires-python = ">=3.12"，降到 3.12 是官方支持的：
+        #   PYTHON_IMAGE=python:3.12-slim docker compose build
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.13-slim}
+        # pip 源。国内服务器直连 pypi.org 拉几十个依赖（含 boto3 / Pillow /
+        # psd-tools）极易 Read timed out，整次构建白跑。改这里即可换源：
+        #   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
+        # 也可写进 .env 长期生效。留空则用 Dockerfile 的默认（官方源）。
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    image: flovart-bff:${APP_VERSION}
+    container_name: flovart-bff
+    restart: unless-stopped
+
+    # 只发布到回环地址：生产由宿主机的 Nginx/Caddy 负责 TLS 终止与转发。
+    #
+    # 注意这里防的不是「反代那条链路被窃听」—— 用域名反代时浏览器到反代是密文，
+    # 反代到容器走回环不出网卡。真正要封的是**绕过反代的旁路**：只要监听
+    # 0.0.0.0:8300，任何人都能 curl http://<公网IP>:8300 全程明文，域名反代
+    # 对这条并行入口毫无约束。会话 Cookie 即便载荷已加密，密文本身仍是可重放
+    # 的登录凭证。
+    #
+    # 另一个必须绑回环的理由：Docker 发布端口时直接往 iptables 的 DOCKER 链插
+    # DNAT 规则，位置在 INPUT 之前 —— 你在 UFW/firewalld 里配的 deny 8300 拦不住它。
+    #
+    # 端口刻意不叫 BFF_PORT：那是 hewapi 的变量名。同机两套编排若共用一个
+    # 变量名，改一处会连带影响另一套。
+    ports:
+      - "127.0.0.1:${FLOVART_BFF_PORT:-8300}:8000"
+
+    environment:
+      # ---- 必填：会话 Cookie 加密密钥 ----
+      # 经 HKDF 派生出 AES-256-GCM 密钥，加密会话载荷里的用户绑定凭证并防伪造。
+      # 缺省值会让 /readyz 直接返回 503，容器起不来是刻意设计（弱密钥 = 任何人
+      # 可伪造会话冒充用户）。改这个值会让所有在线会话立即失效，轮换请安排在低峰期。
+      BFF_SECRET_KEY: ${BFF_SECRET_KEY:?BFF_SECRET_KEY 必须设置，用 openssl rand -hex 32 生成}
+
+      # ---- 必填：new-api 网关 ----
+      NEWAPI_BASE_URL: ${NEWAPI_BASE_URL:?NEWAPI_BASE_URL 必须设置，如 https://newapi.example.com}
+
+      # ⚠️ 每业务必须用**独立**的 new-api 管理员账号(uid)：PAT 是账号级的，
+      #    每次重签都会作废旧值。与 hewapi 共用同一个管理员账号会互相把对方的
+      #    PAT 踢失效，表现为两边轮流 401。
+      NEWAPI_ADMIN_UID: ${NEWAPI_ADMIN_UID:?NEWAPI_ADMIN_UID 必须设置，本业务专属管理员账号的 uid}
+
+      # 账密是自愈通道，**必须配**：官方前端点一次「系统访问令牌」就会让下面
+      # 那个 PAT 失效，此时靠账密自动重新换取（newapi_client.py 的 401 分支）。
+      # 没有账密就只能人工改配置 + 重启容器。
+      NEWAPI_ADMIN_USERNAME: ${NEWAPI_ADMIN_USERNAME:?NEWAPI_ADMIN_USERNAME 必须设置（PAT 失效后的唯一自愈通道）}
+      NEWAPI_ADMIN_PASSWORD: ${NEWAPI_ADMIN_PASSWORD:?NEWAPI_ADMIN_PASSWORD 必须设置（PAT 失效后的唯一自愈通道）}
+
+      # PAT 是易失效的一次性快照，故**不必填**（留空则每次冷启走账密登录）。
+      # 配了它只是省掉一次登录握手。
+      NEWAPI_ADMIN_PAT: ${NEWAPI_ADMIN_PAT:-}
+
+      # ---- 会话 Cookie ----
+      # 写死 1：生产必须 HTTPS。Secure Cookie 在 http:// 下浏览器不会发送，
+      # 本地调试若复用本编排会表现为「接口全 401 未登录」—— 本地请直接裸跑
+      # uvicorn 并把 BFF_COOKIE_SECURE 置 0，不要改这里。
+      BFF_COOKIE_SECURE: "1"
+
+      # SameSite 默认 lax，**不要改成 strict**（除非本站不做在线支付）：
+      # 用户从支付网关点「返回商户」是跨站顶层导航，strict 下浏览器不带 Cookie，
+      # 落地后显示未登录、看不到充值结果 —— 而钱已经到账（走 notify_url），
+      # 极易被当成「付了钱没到账」引发客诉。
+      BFF_COOKIE_SAMESITE: ${BFF_COOKIE_SAMESITE:-lax}
+
+      # ---- 积分与活动 ----
+      # 这几项是运营策略而非安全项。但注意它们直接决定真金白银的赠送额度：
+      # PROMO_* 默认是开启的，不想做活动必须显式设 0，别指望默认关闭。
+      # ⚠️ 赠送积分的默认值取 2000（=¥0.2，与现网一致）：config.py 的代码默认是
+      #    20000，两者不一致时**以本行为准**。这是刻意的保守取值 —— 万一 .env
+      #    丢失导致回落默认值，宁可少送也不要凭空多送 10 倍。
+      BFF_POINTS_PER_CNY: ${BFF_POINTS_PER_CNY:-1000}
+      BFF_PROMO_SIGNUP_ENABLED: ${BFF_PROMO_SIGNUP_ENABLED:-1}
+      BFF_PROMO_SIGNUP_POINTS: ${BFF_PROMO_SIGNUP_POINTS:-2000}
+      BFF_PROMO_FIRST_TOPUP_ENABLED: ${BFF_PROMO_FIRST_TOPUP_ENABLED:-1}
+      BFF_PROMO_FIRST_TOPUP_RATE: ${BFF_PROMO_FIRST_TOPUP_RATE:-1.0}
+
+      # ---- 品牌 ----
+      # 留空不影响功能，只是页面上少显示对应信息。
+      # 国内公网运营需要 ICP 备案号，按合规要求填写。
+      BFF_BRAND_NAME: ${BFF_BRAND_NAME:-oneArt}
+      BFF_BRAND_ICP: ${BFF_BRAND_ICP:-}
+      BFF_BRAND_CONTACT: ${BFF_BRAND_CONTACT:-}
+      # 留空则自动取 NEWAPI_BASE_URL + /v1
+      BFF_API_BASE_URL: ${BFF_API_BASE_URL:-}
+
+      # ---- 聊天补全（用户免 Key）----
+      # 前端未传 model 时由 BFF 兜底使用的默认文本模型，必须是网关已启用的模型名。
+      BFF_CHAT_DEFAULT_MODEL: ${BFF_CHAT_DEFAULT_MODEL:-}
+      # 请求含图片时自动切换的视觉模型（需网关已接入多模态）。
+      BFF_CHAT_VISION_MODEL: ${BFF_CHAT_VISION_MODEL:-}
+
+      # ---- 第三方直连：WaveSpeed（多角度）----
+      # Key 只在容器里注入，绝不进代码、绝不暴露前端。留空则功能整体关闭（不崩）。
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api}
+      WAVESPEED_MULTIANGLE_MODEL: ${WAVESPEED_MULTIANGLE_MODEL:-wavespeed-ai/flux-kontext-dev-ultra-fast}
+      WAVESPEED_TIMEOUT: ${WAVESPEED_TIMEOUT:-300}
+      WAVESPEED_POLL_INTERVAL: ${WAVESPEED_POLL_INTERVAL:-2}
+      WAVESPEED_POLL_MAX: ${WAVESPEED_POLL_MAX:-120}
+
+      # ---- 元数据层：PostgreSQL（留空则回落本地 SQLite）----
+      # 留空时用 /data/flovart_cloud.db，单副本可用；多副本必须配 PG。
+      POSTGRES_DSN: ${POSTGRES_DSN:-}
+      # 与 hewapi 无关（它不用 PG）。但若同机复用同一个 PG 实例，
+      # database 名不要与其它业务相同，否则表结构会互相覆盖。
+      POSTGRES_DB: ${POSTGRES_DB:-flovart}
+
+      # ---- 媒体字节层：OSS / COS / S3（留空则回落容器内 /data/media）----
+      OSS_ENABLED: ${OSS_ENABLED:-0}
+      OSS_PROVIDER: ${OSS_PROVIDER:-cos}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-}
+      OSS_REGION: ${OSS_REGION:-ap-guangzhou}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+      OSS_ACCESS_KEY: ${OSS_ACCESS_KEY:-}
+      OSS_SECRET_KEY: ${OSS_SECRET_KEY:-}
+      # 对象键前缀：同桶多环境隔离的最后一道防线。
+      # 与 hewapi 不同桶时随意，同桶时务必保持 flovart 与其他业务不同。
+      OSS_PREFIX: ${OSS_PREFIX:-flovart}
+      OSS_ADDRESSING_STYLE: ${OSS_ADDRESSING_STYLE:-auto}
+      OSS_PRESIGN_TTL: ${OSS_PRESIGN_TTL:-3600}
+      OSS_ENFORCE_QUOTA: ${OSS_ENFORCE_QUOTA:-1}
+      OSS_QUOTA_BYTES: ${OSS_QUOTA_BYTES:-2147483648}
+
+      # ---- 反代信任来源 ----
+      # 默认 127.0.0.1 对应「反代与容器共享 network namespace」的少数情况。
+      # 更常见的是反代在宿主机、请求经 docker 网桥进来，此时源 IP 是网桥网段
+      # （如 172.17.0.1），必须按实际网段放行，否则 uvicorn 丢弃 XFF、
+      # 限流会把所有用户当成同一个 IP 误伤。
+      # 用 docker network inspect bridge 查实际网段。绝不能填 *（等于允许任意
+      # 客户端自带伪造 XFF 绕过按 IP 限流）。
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+
+      # ---- 可观测性（Logfire）----
+      # ⚠️ 本项目与 hewapi-bff **共用过一个 Logfire 项目**（同一个 token、
+      #    同一个 environment=local），而 hewapi 把 service_name 写死成
+      #    "newapi-bff"，两套 trace 在控制台里混成一坨、按服务过滤不出边界。
+      #    正确做法：**为 flovart-bff 单开一个 Logfire 项目、换它自己的 token**。
+      #    只改 environment 而共用 token 是不够的 —— 数据仍落在同一个项目的
+      #    额度池与留存策略里。
+      # 留空即完全关闭上报，不影响任何业务功能。
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+      # 区分本地/预发/生产。不给默认值是刻意的：所有环境的数据混在同一标签下，
+      # 等于放弃「线上告警不被本地调试流量淹没」的能力。生产请填 flovart-prod。
+      LOGFIRE_ENVIRONMENT: ${LOGFIRE_ENVIRONMENT:-}
+      # 服务名固定为 flovart-bff，与 hewapi 的 newapi-bff 区分开。
+      # ⚠️ 不要删这一行：它决定控制台按 service 过滤时本服务归到哪一堆。
+      # 代码侧同样不写死（app/config.py 的 SERVICE_NAME 读的就是这个变量）。
+      BFF_SERVICE_NAME: flovart-bff
+
+      # ---- 可写数据目录 ----
+      # 必须显式指到 /data 卷。代码里 DATA_DIR 的默认值是源码同级的 ./data，
+      # 在容器里就是 /app/data —— 而根文件系统 read_only，任何写入都会抛
+      # OSError: [Errno 30] Read-only file system。
+      BFF_DATA_DIR: /data
+      # ⚠️ 这两项也必须覆盖：config.py 里它们的默认值是「仓库根/data/」（即
+      #    /app/data），**不跟随 BFF_DATA_DIR** —— 容器里 read_only 不可写，
+      #    写管理员 PAT 缓存或首次注册赠送时会直接崩。
+      BFF_ADMIN_CRED_FILE: /data/admin_cred.json
+      BFF_SIGNUP_STATE_FILE: /data/signup_bonus.json
+
+    # 卷内容：admin_cred.json（管理员 PAT 缓存）、user_keys.json（用户密钥的
+    # AES-GCM 密文）、signup_bonus.json（注册赠送幂等账本）、
+    # flovart_cloud.db（回落 SQLite）、media/（回落本地媒体目录）。
+    # ⚠️ 丢了这个卷：所有用户的云端数据与媒体不可见、注册赠送资格被重置（可重复领）。
+    # 卷名与 hewapi 的 `bff-data` 显式区分，且用绝对 name 避免被 project 前缀影响。
+    volumes:
+      - flovart-bff-data:/data
+
+    healthcheck:
+      # 编排层探针查 /readyz（含配置校验），比镜像内置的 /healthz 更严格。
+      # 用 python 而非 curl：镜像刻意没装 curl（少一个依赖、构建不依赖 apt 源）。
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    # 容器内没有任何需要写盘的路径（状态都在 /data 卷），整个根文件系统只读
+    # 可以挡住「攻击者写 webshell 进静态目录」这类利用。
+    read_only: true
+    # FastAPI 的 UploadFile 在超过 1MB 时会 spool 到系统临时目录（/tmp），
+    # PSD / 多图层上传很容易越线，所以给 64m（hewapi 只给 16m，它的上传更小）。
+    # 注意 tmpfs 计入下面 memory 限额：大文件上传场景要同步调大 memory。
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # 日志一律走 stdout，由 json-file driver 落到宿主机
+    # /var/lib/docker/containers/<id>/<id>-json.log 并轮转。
+    # 应用内**刻意不写日志文件**：根文件系统只读，写容器内路径会抛 Errno 30。
+    # 查看：docker compose logs -f --tail=200 bff
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          # 1G 而非 hewapi 的 512M：本项目有 Pillow / psd-tools 的图像转码路径，
+          # 大图解码是内存峰值的主要来源，512M 下大 PSD 转换容易被 OOM Kill。
+          memory: 1G
+
+volumes:
+  flovart-bff-data:
+    # 显式绝对名，不带 project 前缀 —— 与 hewapi 的 bff-data 一眼可区分，
+    # 也不会因为将来改 project name 导致「数据卷凭空消失」。
+    name: flovart-bff-data
