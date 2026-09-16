@@ -99,7 +99,23 @@ def setup(app: Any) -> bool:
 
     # 逐项独立容错：instrument_* 在缺少对应 extras 时抛 RuntimeError，
     # 若与上面共用一个 try，一个埋点缺包会连带跳过日志接管。
-    fastapi_ok = _try_instrument("fastapi", logfire.instrument_fastapi, app, capture_headers=False)
+    # excluded_urls：把容器探针排除在 span 之外。
+    # compose 的 healthcheck 每 30s 打一次 /readyz、镜像内置的每 30s 打一次
+    # /healthz → 单副本一天约 5760 条探针 span。内容恒定、无排查价值，
+    # 却持续占用额度并把真实业务请求淹没。排除后这两条路径完全不产生 span。
+    #
+    # ⚠️ 匹配语义是 **re.search（子串匹配，任意位置）**，不是前缀匹配 —— 已实测：
+    #    OTEL 传进来的是**完整 URL**（`http://<host:port><path>`，见
+    #    opentelemetry/instrumentation/asgi 的 get_host_port_url_tuple），
+    #    而 ExcludeList.url_disabled 用的是 re.search 而非 re.match，
+    #    所以写 `/healthz` 照样命中 `http://127.0.0.1:8000/healthz`。
+    #    正因如此**绝不能**写成 `^/healthz`（锚定行首反而永远匹配不上完整 URL）。
+    # 附带效果：`/healthz/deep` 这类子路径会被一并排除 —— 对探针正是想要的。
+    fastapi_ok = _try_instrument(
+        "fastapi", logfire.instrument_fastapi, app,
+        capture_headers=False,
+        excluded_urls="/healthz,/readyz",
+    )
 
     # 如实汇报实际挂上的埋点，避免「日志说已启用、实际什么都没埋」——
     # 可观测性静默失效比没有可观测性更危险，因为它让人误以为有覆盖。

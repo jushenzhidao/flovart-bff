@@ -56,6 +56,45 @@ compose 里 `read_only: true`（根文件系统只读）。往容器内写日志
 - `service_name` **从 `config.SERVICE_NAME` 读，绝不写死**（hewapi 写死
   `"newapi-bff"` 就是这个坑的来源）
 
+### 探针 span 排除（`excluded_urls`，2026-09-16 加）
+`instrument_fastapi(..., excluded_urls="/healthz,/readyz")` —— 容器探针每 30s
+各打一次 `/healthz`（镜像 HEALTHCHECK）与 `/readyz`（compose healthcheck），
+单副本一天约 5760 条恒定噪音 span，排除后这两条路径完全不产生 span。
+
+#### ⚠️ 关于 `excluded_urls` 的两个反直觉点（差点写错）
+1. **匹配目标是「完整 URL」而不是 path**：OTEL 传进来的是
+   `get_host_port_url_tuple(scope)` 的第三项 = `scheme://host:port` + `scope["path"]`
+   （见 `opentelemetry/instrumentation/asgi/__init__.py:477`）。原文还有句
+   误导性注释 "using the scope path is enough"。
+2. **判定用 `re.search` 而非 `re.match`**：`ExcludeList.url_disabled()` 是
+   `bool(search(self._regex, url))`（见 `opentelemetry/util/http/__init__.py:82`）
+   → **子串匹配，任意位置**。
+   - 所以写 `/healthz` **能**命中 `http://127.0.0.1:8000/healthz` ✅
+   - 但**绝不能写 `^/healthz`** —— 锚定行首后永远匹配不上完整 URL ❌
+   - 副作用：`/healthz/deep` 这类子路径会一并被排除（对探针正是想要的）
+   两者的组合很容易推出相反结论，改动前先跑下面的验证。
+
+#### 验证手法（可复用，比读源码可靠）
+自定义 `SpanProcessor` 收集 span 名，真发请求看哪些被捕获：
+```python
+from opentelemetry.sdk.trace import SpanProcessor
+class Collector(SpanProcessor):
+    def __init__(self): self.names = []
+    def on_start(self, span, parent_context=None): self.names.append(span.name)
+    def on_end(self, span): pass
+    def shutdown(self): pass
+    def force_flush(self, timeout_millis=None): return True
+
+col = Collector()
+logfire.configure(send_to_logfire=False, additional_span_processors=[col], console=False)
+logfire.instrument_fastapi(app, capture_headers=False, excluded_urls="/healthz,/readyz")
+# TestClient 依次 GET /healthz /readyz /api/config
+# 期望结果（已实测）：只捕获到 "GET /api/config"
+```
+> 注意 `logfire.testing.TestExporter` **不能**直接塞进 `additional_span_processors`
+> （它不是 SpanProcessor，会报 `AttributeError: no attribute 'on_start'`），
+> 上面这个自定义收集器更省事。
+
 ## 三、容器化踩坑（`read_only: true` 相关）
 
 ### ⚠️ 最坑的一条：这两个路径**不跟随** `BFF_DATA_DIR`
@@ -177,10 +216,39 @@ Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机�
 注意 `.dockerignore` 里已有 `*.md`，所以 `DEPLOY-CUTOVER.md` 不会进镜像。
 
 ## 七、待办
-- **切换执行**：按仓库根 `DEPLOY-CUTOVER.md` 走（10:30 已交付）。顺序要点：
+- 🔴🔴 **【最高优先级，上线前必须解决】new-api 管理员账号与 hewapi 共用**（2026-09-16 实测）
+  - flovart 与 hewapi **完全同一个账号**：uid=1 / 用户名 `newapi-bff` / 密码逐字相同 /
+    **连 PAT 都是同一串**（sha256 比对确认，线上值 = `UqLFohUym+7JV+…`）
+  - 那把 PAT **已失效**：3 个端点 + 4 种请求头写法全 401，响应体
+    `{"code":"AUTH_UNAUTHORIZED","message":"Unauthorized, invalid access token"}`；
+    对照 `/api/status`=200（网关可达）、伪造 PAT=401（排除端点不吃 PAT）
+  - 推论：hewapi 线上跑在**运行时自愈出来的内存 PAT** 上（配了 PAT 就不落盘），
+    每次重启都重登轮换 → **「互踢」不是推测，是正在发生**
+  - 正解：给 flovart 单开管理员账号；`.env` 换新账号 UID/账密；`NEWAPI_ADMIN_PAT` 留空
+  - ⚠️ **绝不能照抄那串失效 PAT**：配了它，首个管理员请求就 login → 当场踢死 hewapi，
+    且新 PAT 只存内存 → 每次容器重启再踢一次。**比留空更危险**
+  - 影响面已核实（比想象中窄）：主路径 `/api/models` 走**用户自己的 PAT**
+    （`keys.py:69 _ensure_token_plain` → `_ensure_token_user`），管理员 PAT 只是 401
+    降级兜底（`admin_ensure_user_api_key`）→ 互踢主要打在**管理台 `/api/console/*`**
+    （`console.py` 三处直接调 `admin_enabled_models()`）与冷启/降级路径
+  - 查 hewapi 是否已在循环：
+    `docker compose logs bff | grep -c "admin PAT rejected, re-login to rotate"`
+- 🔴 **别直接把开发机 `.env` 拷到服务器**。除账号共用外还有 6 处：
+  `BFF_SECRET_KEY` 需与现网一致（否则全员登出 + **兑换码账号全部失联**，其用户名密码
+  由它 HMAC 派生）、`LOGFIRE_TOKEN` 是 hewapi 的、`LOGFIRE_ENVIRONMENT=local`、
+  `APP_VERSION`/`VCS_REF` 过时、缺 `PIP_INDEX_URL`、
+  **缺 `FORWARDED_ALLOW_IPS`（默认 127.0.0.1 容器化后是错的，静默劣化限流）**
+  已产出服务器底稿 `.env.server`（被忽略，需手动上传）
+  - `BFF_MOCK_MODE` 是**死配置**（全仓库无代码读取）；9 个 `GATEWAY_SYNC_*_PATH`
+    不传也没问题（config.py 默认就是 `v1/images/generations`）
+  - `BFF_COOKIE_SECURE=false` 看似危险实则无害：compose 硬编码 `"1"` 覆盖，
+    且不用 `env_file` 所以根本进不去容器
+- `.gitignore` 已补 `.env.*` —— 之前只有 `.env`，导致 `.env.server` 这种带真实密钥的
+  环境变体会被提交。`.dockerignore` 早就写对了
+- **切换执行**：按仓库根 `DEPLOY-CUTOVER.md` 走。顺序要点：
   ① 验 PAT（`/api/user/self` 判 200/401）② 起容器 8310 ③ `/readyz`（不碰 new-api）
   ④ 停宝塔旧项目**并关自启**（只点停止会被拉起抢 8300）⑤ 改反代指向 8310
-  ⚠️ 若 PAT 已 401，必须把「停宝塔」提到「起容器」之前，否则两套 BFF 同账号互踢
+  ⚠️ PAT 已 401 → 必须把「停宝塔」提到「起容器」之前，否则两套 BFF 同账号互踢
 - 飞哥：去 Logfire **新建项目**取新 token，并改 `.env`：
   `LOGFIRE_TOKEN=<新>`、`LOGFIRE_ENVIRONMENT=flovart-prod`（现为 `local`）。
   可后补 —— 配置全运行期注入，改完 `docker compose up -d --force-recreate` 即可，

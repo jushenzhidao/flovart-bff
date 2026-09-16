@@ -1,5 +1,10 @@
 # 会话与状态
+# `.env.*` 覆盖按环境拆分的配置文件（.env.server / .env.prod 等）。
+# 这些变体里装的是同一批真实密钥（BFF_SECRET_KEY / 管理员账密 / OSS AK-SK），
+# 漏掉这条就等于把密钥直接提交 —— 只写 `.env` 是不够的。
+# 例外：`.env.example` 是脱敏模板，必须入库。
 .env
+.env.*
 !.env.example
 
 # 运行期状态（目录本身入库，内容不入库）

@@ -30,9 +30,12 @@
 **最容易搞错的两项**，先说清楚：
 
 1. **`BFF_SECRET_KEY` 必须与现网完全一致。** 它经 HKDF 派生出会话 Cookie 的
-   AES-256-GCM 密钥。换了值 = 所有在线用户立刻被登出。切流时这条保证用户无感。
-2. **`NEWAPI_ADMIN_UID` / 账号密码必须与现网一致，且这套账号只能本业务用。**
-   见第 1.4 步的 PAT 校验。
+   AES-256-GCM 密钥。换了值 = 所有在线用户立刻被登出；更麻烦的是**兑换码账号的
+   用户名密码也由它 HMAC 派生，换了等于那批账号全部失联**。切流时这条保证用户无感。
+2. **`NEWAPI_ADMIN_UID` / 账号密码——现状是错的，见第 1.4 步。**
+   实测确认本项目与 hewapi **共用同一个 new-api 管理员账号**（uid=1 / `newapi-bff`），
+   而 PAT 是账号级的、每次重签作废旧值 → 两边会互踢。
+   **上线前应给 flovart 单开一个管理员账号**，而不是照抄现网这份。
 
 ---
 
@@ -68,6 +71,19 @@ docker compose config >/dev/null && echo "配置解析通过"
 
 报 `xxx 必须设置` 就是缺项，按第 2 步补。
 
+⚠️ **解析通过 ≠ 配置正确**。`BFF_SECRET_KEY` 最容易在这里翻车：它不报错，
+只会在切流那一刻把所有在线用户踢下线，而且**兑换码账号（用户名密码由它 HMAC
+派生）会全部失联**。上传 `.env` 之前先比指纹，别肉眼比字符串（容易漏掉尾部空格）：
+
+```bash
+# 服务器上，现网宝塔那份：
+grep '^BFF_SECRET_KEY=' <OLD_DIR>/.env | sha256sum
+# 你准备上传的那份：
+grep '^BFF_SECRET_KEY=' <REPO>/.env     | sha256sum
+```
+
+两个哈希一致才继续。不一致就以**现网那份**为准。
+
 ### 1.4 🔴 PAT 校验（**这一步决定后面能不能并行起容器**）
 
 `app/newapi_client.py` 的 `_admin_login()` 会 `POST /api/user/login` 后紧接着
@@ -94,10 +110,56 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 | `401` | PAT 已失效 | **不要并行**。必须先停旧的，再起新的（第 6 步提到第 5 步之前） |
 | 其它 | 网络/地址不对 | 先修 `NEWAPI_BASE_URL`，别往下走 |
 
-> ⚠️ 还有一种更隐蔽的状态：**`.env` 里配了一个失效的 PAT**。
+> **对照项**：假 token 也会返回 401，公开端点 `/api/status` 返回 200 ——
+> 用它排除「端点本来就不吃 PAT」的误判。三个端点建议都打一遍
+> （`/api/channel/models_enabled`、`/api/user/?p=0&page_size=1`、`/api/user/self`）。
+
+#### 🔴 实测结论（2026-09-16）：本编排与 hewapi **共用同一个管理员账号**
+
+逐项比对 flovart 与 `D:\code\hewapi-bff\newapi-bff\.env`：
+
+| 配置项 | hewapi 线上 | flovart | 判定 |
+|---|---|---|---|
+| `NEWAPI_ADMIN_UID` | `1` | `1` | **同一账号** |
+| `NEWAPI_ADMIN_USERNAME` | `newapi-bff` | `newapi-bff` | **完全相同** |
+| `NEWAPI_ADMIN_PASSWORD` | `newapi-bffne…` | `newapi-bffne…` | **完全相同** |
+| `NEWAPI_ADMIN_PAT` | `UqLFohUym+7JV+…` | `UqLFohUym+7JV+…` | **同一串**（sha256 比对确认） |
+
+**并且那把 PAT 已经失效**（2026-09-16 实测）：
+
+```
+GET /api/channel/models_enabled   → 401
+GET /api/user/?p=0&page_size=1    → 401
+GET /api/user/self                → 401
+响应体：{"code":"AUTH_UNAUTHORIZED","message":"Unauthorized, invalid access token"}
+HTTP 头四种写法均 401：Bearer+New-Api-User / 仅 Bearer / 裸 token / X-Api-Key
+对照：GET /api/status（公开）→ 200（网关可达）；伪造 PAT → 401
+```
+
+**这说明互踢已经发生了，不是推测。** hewapi 线上之所以还能跑，是因为它每次 401 后
+会走 `_admin_login()` 自动换一把新的（且因配了 PAT 而不落盘，只存内存）——
+**它现在跑在一把运行时自愈出来的 PAT 上**。而 flovart 一旦用同一个账号起容器，
+就会和它轮流踢。
+
+#### ✅ 上线前必须做：给 flovart 开独立管理员账号
+
+1. 用 root 登录 new-api 面板 → 用户管理 → 新建用户（建议 `flovart-bff`，角色管理员）
+2. 记下新账号 UID，`.env` 里 `NEWAPI_ADMIN_UID` / `USERNAME` / `PASSWORD` 换成它的
+3. `NEWAPI_ADMIN_PAT` **留空** —— 首次启动登录一次自动签发并落盘
+   `/data/admin_cred.json`，之后冷启复用，不再消耗会话
+
+换账号**不影响已有用户数据**：用户是各自独立的 new-api 用户，管理员账号只是 BFF
+建号/加额度的操作通道。但新账号得有对应权限。
+
+> ⚠️ 若暂时不换账号：PAT 必须填**服务器现网那把有效的**（不是仓库里这份），
+> 并接受「任何一边重登都会踢死另一边」。取现网那把的两种途径：
+> `cat <现网数据目录>/admin_cred.json`，或 `grep '^NEWAPI_ADMIN_PAT=' <现网>.env`。
+
+> ⚠️ 无论哪种方案，**都不要配一个已知失效的 PAT**。
 > `_save_admin_cred()` 开头是 `if config.NEWAPI_ADMIN_PAT: return` —— 配了 PAT
-> 就永不落盘自愈缓存。所以「配一个失效 PAT」比「留空」更危险。留空反而每次冷启
-> 走账密登录，是干净的。**测试环境的建议：`NEWAPI_ADMIN_PAT` 直接留空。**
+> 就永不落盘自愈缓存。于是「配失效 PAT」的后果是：首个业务请求触发登录 →
+> 踢死对方 → 新 PAT 只存内存 → **每次容器重启再踢一次**。
+> 这比留空（留空至少还会先读 `/data/admin_cred.json` 缓存）更危险。
 
 ### 1.5 确认 docker0 网段（切流后限流是否误伤，全靠这个）
 
@@ -128,6 +190,18 @@ ip -4 addr show docker0 | grep inet     # 例：inet 172.17.0.1/16
 `.env` 被 `.gitignore` 与 `.dockerignore` **双重忽略，不会随代码走**。
 服务器上必须手动放一份。
 
+> **现成底稿**：仓库根目录有一份 `.env.server`（同样被忽略，需手动上传），
+> 已按 `docker-compose.yml` 的实际读取口径整理好，并逐项标注了「必须改」的地方。
+> 比从 `.env.example` 起手快，也少漏项。**它里面含真实密钥，走 scp/面板上传，
+> 不要提交。**
+>
+> ```bash
+> scp .env.server root@<SERVER>:<REPO>/.env     # 上传后重命名为 .env
+> ```
+>
+> ⚠️ **别直接拿开发机那份 `.env` 去部署** —— 它至少有三处会出事：PAT 已失效、
+> Logfire token 是 hewapi 的、管理员账号与 hewapi 共用。
+
 ```bash
 cd <REPO>
 cp .env.example .env
@@ -144,10 +218,12 @@ VCS_REF=<git rev-parse --short HEAD 的输出>
 BFF_SECRET_KEY=<现网原值，逐字符照抄>
 
 NEWAPI_BASE_URL=<现网值>
-NEWAPI_ADMIN_UID=<现网值>
-NEWAPI_ADMIN_USERNAME=<现网值>
-NEWAPI_ADMIN_PASSWORD=<现网值>
-NEWAPI_ADMIN_PAT=              # 测试环境建议留空，见 1.4
+# ⚠️ 下面三项应换成 flovart 专属管理员账号（见 1.4），不是照抄现网
+NEWAPI_ADMIN_UID=<新账号 UID>
+NEWAPI_ADMIN_USERNAME=<新账号用户名>
+NEWAPI_ADMIN_PASSWORD=<新账号密码>
+# ⚠️ 留空 = 首次启动登录一次自动签发并落盘。绝不能填已知失效的 PAT（见 1.4）
+NEWAPI_ADMIN_PAT=
 
 # ---- 本机适配 ----
 FLOVART_BFF_PORT=8310          # 蓝绿用的临时端口，切流后才换成 8300
@@ -536,7 +612,7 @@ docker compose stop bff
 | `port is already allocated` | 8310 被占，或旧 BFF 没真停 | `ss -lntp \| grep 8310`；按 6.1 确认旧进程已停**且关了自启** |
 | 接口 401 但用户说自己已登录 | `BFF_COOKIE_SECURE=1` 要求 HTTPS | 确认访问的是 `https://`；`http://` 下浏览器不发 Secure Cookie |
 | 反代后接口全 404 | `proxy_pass` 末尾多写了 `/` | 按 7.1 去掉 |
-| 首次冷启后两边轮流 401 | PAT 互踢（见 1.4） | 确认 uid 独立；或让 `NEWAPI_ADMIN_PAT` 留空走账密 |
+| 首次冷启后两边轮流 401 | PAT 互踢（见 1.4） | 根治：给 flovart 换独立管理员账号。⚠️ 别用「把 PAT 留空」当解法——共用账号下留空 = 冷启必登录 = 当场踢死 hewapi |
 | 限流把所有用户当同一人 | `FORWARDED_ALLOW_IPS` 没改成 `<DOCKER0_IP>` | 见 1.5 与 2 |
 | 上传大 PSD 失败 | tmpfs `/tmp` 太小 | compose 里调大 `tmpfs: /tmp:size=` 与 `memory` |
 | 容器被 OOM Kill | 大图解码内存峰值 | compose 里调大 `deploy.resources.limits.memory`（现 1G） |
