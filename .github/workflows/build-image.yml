@@ -1,0 +1,138 @@
+# CI：跑测试 → 构建镜像 → 推到 GitHub Container Registry（GHCR）
+#
+# 为什么需要这个文件：GitHub Actions 不会「提交就自动做点什么」——
+# 它只是执行仓库里 .github/workflows/*.yml 定义的步骤。没有这个文件，
+# Actions 页面只会显示「从模板建一个」的引导页。
+#
+# 产物：ghcr.io/<owner>/<repo>:<tag>
+#   服务器拉取（详见 DEPLOY-CUTOVER.md 第 3 节 B 路线）：
+#     docker compose pull && docker compose up -d
+#
+# ⚠️ 与 Dockerfile 的一个关键差异：这里**刻意用官方 pip 源**（不设 PIP_INDEX_URL）。
+#    GitHub runner 在境外，直连 pypi.org 是最快的路径；换国内镜像源反而绕远、
+#    还会因为回源慢而变慢。国内服务器构建才需要镜像源，两者诉求相反。
+
+name: Build & Push Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # 手动触发：用来在不改代码的情况下重跑一次构建（例如排障、补推镜像）
+  workflow_dispatch:
+
+# 推 GHCR 需要 packages: write。
+# ⚠️ 这一行不能省：仓库默认的 GITHUB_TOKEN 权限是只读的，
+#    缺了它 build 能成功、push 会以 403 denied 失败，且报错信息很不直观。
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # ⚠️ 不用 ${{ github.repository }} 直接拼：GHCR 要求镜像路径**全小写**，
+  #    而 GitHub 仓库名是保留大小写的。仓库名一旦含大写字母，
+  #    直接拼出来的 tags 会在 push 阶段报 "invalid reference format"。
+  #    故在下面第一步统一转小写后再用。
+  PYTHON_IMAGE: python:3.13-slim
+
+jobs:
+  # ---------- 门禁：测试不过就不推镜像 ----------
+  # 放在 build 之前（needs: test），坏的提交不会污染 registry。
+  # ⚠️ 这里**刻意不跑 ruff**：仓库有 pyproject.toml 的 ruff 配置，但当前
+  #    `ruff check app/` 有 68 项、`tests/` 有 61 项（其中 60 项是 pytest 里
+  #    正常用法的 S101 assert，属误报，应配 per-file-ignores 豁免）。
+  #    现在加进来 CI 会一直红，反而让人不再看 CI 结果。
+  #    待独立清理一轮后再作为门禁加入。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          # 依赖装完后按 requires 内容缓存，requirements.txt 不变就不重装
+          cache: pip
+
+      - name: 安装依赖
+        # pytest 不在 requirements.txt（它是运行依赖清单），单独装。
+        # tests/ 只 import pytest + fastapi.testclient，后者靠 requirements 里
+        # 已有的 httpx 支撑，无需其它额外包。
+        run: pip install -r requirements.txt pytest
+
+      - name: 跑测试
+        # tests/conftest.py 自己设了 BFF_SKIP_DOTENV=1 并把状态文件指向临时目录，
+        # 所以 CI 里**不需要**、也不该有 .env —— 测试结论只由代码决定。
+        run: python -m pytest -q
+
+  # ---------- 构建并推送 ----------
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 计算镜像命名与版本号
+        id: vars
+        run: |
+          echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          # APP_VERSION 会经 Dockerfile 的 ARG 写进镜像的 BFF_VERSION 环境变量，
+          # 最终出现在 /healthz 的 version 字段里 —— 线上排查时用它回溯跑的是哪一版。
+          # tag 触发就用 tag 名，分支触发就用 sha 前缀（比 "dev"/"unknown" 可追溯得多）。
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "app_version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_version=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # 内置 token，无需在 Secrets 里额外配任何东西
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.vars.outputs.repo_lc }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            # latest 只在默认分支（main）上推，避免临时分支的构建覆盖它
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 与 docker-compose.yml 的 build.args 保持同一组语义，别只改一边：
+          # 否则「CI 打的镜像」和「服务器本地打的镜像」跑起来不是同一个东西。
+          build-args: |
+            APP_VERSION=${{ steps.vars.outputs.app_version }}
+            VCS_REF=${{ github.sha }}
+            PYTHON_IMAGE=${{ env.PYTHON_IMAGE }}
+          # gha 缓存：本项目依赖层最重（fastapi / asyncpg / boto3 / Pillow /
+          # psd-tools / logfire），冷构建要几分钟。缓存后改业务代码只需重建
+          # COPY app/ 那一层，通常十几秒。
+          # 注意 gha 缓存有 10GB 上限，超了会按 LRU 淘汰（不用手工清理）。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出镜像地址
+        run: |
+          echo "### 镜像已推送" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "服务器拉取：\`docker compose pull && docker compose up -d\`" >> "$GITHUB_STEP_SUMMARY"

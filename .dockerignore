@@ -26,6 +26,8 @@ venv/
 # ---- 版本控制与编辑器 ----
 .git/
 .gitignore
+# CI 配置由 GitHub 直接读取（不经过 dockerignore），无需进构建上下文
+.github/
 .idea/
 .vscode/
 

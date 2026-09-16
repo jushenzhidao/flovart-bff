@@ -94,6 +94,7 @@ BFF_SIGNUP_STATE_FILE=/data/signup_bonus.json
 - `Dockerfile`（多阶段、非 root、read_only 兼容、单 worker）
 - `docker-compose.yml`（全套改名隔离 + Logfire 独立项目说明）
 - `.dockerignore`（`.env` / `data/` / 缓存 / 文档 / 测试 / 脚本）
+- **`DEPLOY-CUTOVER.md`（宝塔裸跑 → Docker 的切换手册，10 节 + 隔离契约速查表）**
 
 改动：
 - `app/observability.py`：no-op 桩 → 真实现
@@ -114,10 +115,86 @@ BFF_SIGNUP_STATE_FILE=/data/signup_bonus.json
 - **模拟容器环境**（只拷 `app/` 到干净目录启动）→ `/healthz` 200、
   `/readyz` 三项全 ok（secret_key/admin_cred/state_dir_writable）、`/` 200
   → **证实只拷 `app/` 就够**
+- 服务名统一（10:30 补）：原先 4 处硬编码 `"flovart-bff"`，现只留
+  `app/config.py:213` 一处作为**默认值定义**，其余全部读 `config.SERVICE_NAME`：
+  `main.py` 的 `FastAPI(title=)`、`/`、`/healthz`，`routers/auth.py` 的 `/api/config`。
+  实起 8399 验证四处返回 `flovart-bff` 一致；`pytest` 44 passed 无回归。
+  > 安全性依据：前端 `services/hostedClient.ts:62 detectHosted()` 判定 hosted 模式
+  > 用的是 **「`/api/config` 通不通」**（`.then(()=>true).catch(()=>false)`），
+  > **不读返回里的 `service` 字段值** → 改取值来源对前端零影响（且默认值不变）。
 
-## 六、待办
+## 六、CI 打镜像（GitHub Actions → GHCR · 2026-09-16 新增）
+
+### 为什么之前 Actions 页面是空的
+仓库**从来没有 `.github/workflows/` 目录** → 一个 workflow 都没有。
+GH Actions 不是「提交就自动做事」，必须有个 YAML 定义步骤。飞哥看到的是
+GitHub 的「从模板建一个」引导页，与提交内容无关。
+
+### 新增 `.github/workflows/build-image.yml`
+- 触发：push `main` / push tag `v*` / `workflow_dispatch`
+- **job `test`**（先跑门禁）：`pip install -r requirements.txt pytest` → `pytest -q`
+  - `tests/conftest.py` 自带 `BFF_SKIP_DOTENV=1` + 临时目录 → CI 里不需要 .env
+  - pytest 不在 requirements.txt（那是运行依赖），单独装；httpx 已在其中
+- **job `build`**（`needs: test`，测试不过不推镜像）：setup-buildx → login GHCR →
+  metadata-action → build-push-action，`cache-from/to: type=gha`
+- ⚠️ **`permissions: packages: write` 必须显式声明**：默认 GITHUB_TOKEN 只读，
+  缺了会「build 成功、push 403 denied」，报错很不直观
+- ⚠️ **镜像名必须全小写**（GHCR 硬要求），而 GitHub 仓库名保留大小写 →
+  用 `repo_lc=${GITHUB_REPOSITORY,,}` 在 step 里转小写再喂给 metadata-action
+- ⚠️ **CI 刻意用官方 pip 源**（不传 PIP_INDEX_URL）：runner 在境外，直连
+  pypi.org 最快；国内服务器构建才需要镜像源 —— 两者诉求相反，别互相照抄
+- `APP_VERSION` build arg：tag 触发用 tag 名，分支触发用 `sha-<7位>`（写进
+  `BFF_VERSION` → `/healthz` 的 version，可回溯）
+- **刻意不加 ruff**：`ruff check app/` 现有 68 项、`tests/` 61 项（其中 60 项是
+  pytest 正常用法的 S101 `assert`，属误报，应配 per-file-ignores）。
+  现在加 CI 会一直红，反而让人不看 CI 结果。待独立清理一轮后再作为门禁加入。
+
+### compose 相应改动：镜像名可被 registry 覆盖
+```yaml
+image: ${BFF_IMAGE:-flovart-bff:${APP_VERSION}}
+```
+- 不设 `BFF_IMAGE` = 路线 A（服务器本地 build，名字不变）
+- 设 `BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest` = 路线 B（只拉不 build）
+- ⚠️ **本服务同时有 `build` 段**：若镜像本地不存在又没先 `pull`，compose 会回退
+  去 build → 现象是「配了 GHCR 地址却在服务器上装了十分钟依赖」。
+  正确顺序永远是先 `pull`，再 `up -d --no-build`
+
+### 服务器侧（路线 B）
+1. `echo <PAT> | docker login ghcr.io -u <用户名> --password-stdin`
+   （PAT 需 `read:packages`；用户名是账号名不是邮箱；凭证存 ~/.docker/config.json）
+2. `.env`：`BFF_IMAGE=ghcr.io/<owner>/flovart-bff:<tag>`
+3. `docker compose pull && docker compose up -d --no-build`
+- 私有仓库的 GHCR 包默认 private → 必须认证。PAT 若设了有效期，到期后 pull
+  会 denied（运行中的容器不受影响，但下次发版拉不动）
+
+### 意外收获：CI 是「Dockerfile 从未真机 build」的解法
+本机 Docker daemon 一直没起来，Dockerfile 从未真实构建过。runner 就是干净的
+Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机验证。
+**首次很可能失败**（pip 装包 / COPY 路径），必须先在 CI 上跑绿再上服务器。
+
+### `.dockerignore` 补充
+加了 `.github/`（CI 配置由 GitHub 直接读取，不经过 dockerignore，无需进上下文）。
+注意 `.dockerignore` 里已有 `*.md`，所以 `DEPLOY-CUTOVER.md` 不会进镜像。
+
+## 七、待办
+- **切换执行**：按仓库根 `DEPLOY-CUTOVER.md` 走（10:30 已交付）。顺序要点：
+  ① 验 PAT（`/api/user/self` 判 200/401）② 起容器 8310 ③ `/readyz`（不碰 new-api）
+  ④ 停宝塔旧项目**并关自启**（只点停止会被拉起抢 8300）⑤ 改反代指向 8310
+  ⚠️ 若 PAT 已 401，必须把「停宝塔」提到「起容器」之前，否则两套 BFF 同账号互踢
 - 飞哥：去 Logfire **新建项目**取新 token，并改 `.env`：
-  `LOGFIRE_TOKEN=<新>`、`LOGFIRE_ENVIRONMENT=flovart-prod`（现为 `local`）
-- 服务器上 hewapi 的部署目录名、以及 flovart 打算放的目录（显式 name 后已不影响
-  卷名，但 Nginx 反代与运维习惯仍需知道）
+  `LOGFIRE_TOKEN=<新>`、`LOGFIRE_ENVIRONMENT=flovart-prod`（现为 `local`）。
+  可后补 —— 配置全运行期注入，改完 `docker compose up -d --force-recreate` 即可，
+  **不需要重打镜像**
+- `.e2e/{cookies,hdr,user}.txt` **已在 `fcf5f93` 进仓库**（本地 127.0.0.1 的 e2e
+  测试账号凭证，非线上真实用户）。`.gitignore` 已补 `.e2e/` / `dist/` / `*.bak*`，
+  但已入库的三个文件需出仓：`git rm --cached .e2e/cookies.txt .e2e/hdr.txt .e2e/user.txt`
 - Docker daemon 本机未运行，镜像 build 与真容器 run **尚未实测**（配置层已全验）
+  → 首次远端构建请预留调试时间，见手册第 3 节的失败对照表
+- **workflow 推到 main 后手工 `Run workflow` 一次**，把它跑绿 —— 这既是首次真机
+  build 验证，也是路线 B 的前提（不绿就别指望服务器能 pull 到）
+- **ruff 清理（独立一轮）**：`app/` 68 项、`tests/` 61 项。清理顺序建议：
+  ① `pyproject.toml` 加 `[tool.ruff.lint.per-file-ignores]` 豁免 `tests/*` 的 S101
+  ② `ruff check app/ --fix` 能自动修 53 项
+  ③ 剩下 15 项（S110 try-except-pass / E702 / E741 / S608 / ASYNC230 / F811）
+     需人工判断
+  ④ 全绿后再把 ruff 加进 CI 的 test job 作为门禁

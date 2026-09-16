@@ -51,7 +51,7 @@ async def get_site_config():
     换品牌/域名/赠送档位都只改环境变量，不动前端代码。
     """
     return ok({
-        "service": "flovart-bff",
+        "service": config.SERVICE_NAME,
         "brand": {
             "name": config.BRAND_NAME,
             "tagline": config.BRAND_TAGLINE,

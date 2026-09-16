@@ -45,7 +45,18 @@ services:
         #   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple docker compose build
         # 也可写进 .env 长期生效。留空则用 Dockerfile 的默认（官方源）。
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
-    image: flovart-bff:${APP_VERSION}
+    # 镜像名可被 BFF_IMAGE 整体覆盖，这是「CI 打镜像、服务器只拉不构建」的关键：
+    # 默认值是本地构建出来的名字（flovart-bff:<APP_VERSION>），
+    # 设了 BFF_IMAGE 就走 GHCR 拉取：
+    #   .env: BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest
+    #   服务器: docker compose pull && docker compose up -d
+    #
+    # 注意本服务同时声明了 build 段，两者共存时的行为：
+    #   - 本地/服务器构建：不设 BFF_IMAGE，docker compose build && up -d
+    #   - CI 镜像：先 pull（镜像就位后 up 不会重新构建），或 up -d --no-build
+    # 反过来若本地没有该镜像又没先 pull，compose 会回退去执行 build ——
+    # 表现为「明明配了 GHCR 地址，却在本机吭哧吭哧装了十分钟依赖」。
+    image: ${BFF_IMAGE:-flovart-bff:${APP_VERSION}}
     container_name: flovart-bff
     restart: unless-stopped
 

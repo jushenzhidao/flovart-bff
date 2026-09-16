@@ -1,0 +1,594 @@
+# 部署切换手册：宝塔裸跑 → Docker 容器
+
+> 目标：在**不影响线上用户**的前提下，把 flovart-bff 从「宝塔 Python 项目管理器
+> 裸跑 uvicorn」切到「Docker 容器」，失败可一键回滚。
+>
+> 适用前提：单机、单副本、local SQLite + `data/media`（当前测试环境形态）。
+>
+> ⚠️ 全程与 hewapi-bff **同机并存**。凡带固定名的资源（容器名 / 镜像名 / 卷名 /
+> 宿主端口）本手册已全部改名隔离，执行时**不要退回同名**，理由见
+> `docker-compose.yml` 顶部注释。
+
+---
+
+## 0. 变量速填表
+
+动手前先把这张表填满，后面所有命令都引用它。**留空的一格就是一次事故**。
+
+| 变量 | 值 | 从哪来 |
+|---|---|---|
+| `<REPO>` | 服务器上仓库路径，如 `/www/wwwroot/flovart-bff` | `git clone` 的位置 |
+| `<OLD_DIR>` | 旧 BFF 的项目目录（宝塔 Python 项目管理器里显示） | 宝塔面板 |
+| `<NEWAPI_BASE_URL>` | 网关地址，如 `https://newapi.example.com`（**不带 `/v1`**） | 现网 `.env` |
+| `BFF_SECRET_KEY` | 32+ 字符 | 现网 `.env`，**必须原值照抄** |
+| `NEWAPI_ADMIN_UID` | 本业务专属管理员 uid | 现网 `.env` |
+| `NEWAPI_ADMIN_USERNAME` / `PASSWORD` | 同上账号 | 现网 `.env` |
+| `<DOCKER0_IP>` | 一般是 `172.17.0.1` | 第 1.5 步实测 |
+| `APP_VERSION` | 如 `1.0.0` | 你定 |
+| `<GHCR_IMAGE>` | `ghcr.io/<owner>/flovart-bff:latest` | 走路线 B 才填，见第 3 节 |
+
+**最容易搞错的两项**，先说清楚：
+
+1. **`BFF_SECRET_KEY` 必须与现网完全一致。** 它经 HKDF 派生出会话 Cookie 的
+   AES-256-GCM 密钥。换了值 = 所有在线用户立刻被登出。切流时这条保证用户无感。
+2. **`NEWAPI_ADMIN_UID` / 账号密码必须与现网一致，且这套账号只能本业务用。**
+   见第 1.4 步的 PAT 校验。
+
+---
+
+## 1. 前置检查（每一项都要过，不许跳）
+
+### 1.1 Docker 与 compose
+
+```bash
+docker --version            # 需要 >= 20.10
+docker compose version      # 需要 v2（`docker-compose` 也行，命令自行替换）
+docker info >/dev/null && echo "daemon OK"
+```
+
+宝塔面板没装 Docker 的话：软件商店搜「Docker管理器」安装，或
+`curl -fsSL https://get.docker.com | sh`。
+
+### 1.2 仓库就位
+
+```bash
+cd <REPO>
+git log --oneline -1        # 记下这个 commit，出问题要回溯
+ls Dockerfile docker-compose.yml    # 两个都要在
+```
+
+### 1.3 `.env` 必填项自检
+
+compose 里 7 个 `${VAR:?}` 是**硬校验**，缺一个就直接报错退出。先干跑一次：
+
+```bash
+cd <REPO>
+docker compose config >/dev/null && echo "配置解析通过"
+```
+
+报 `xxx 必须设置` 就是缺项，按第 2 步补。
+
+### 1.4 🔴 PAT 校验（**这一步决定后面能不能并行起容器**）
+
+`app/newapi_client.py` 的 `_admin_login()` 会 `POST /api/user/login` 后紧接着
+`GET /api/user/token` —— **重新生成 PAT 并作废旧值**。
+
+推论：如果新旧两套 BFF 共用同一个 `NEWAPI_ADMIN_UID`，**任一边走到登录流程，
+就会把对方的 PAT 踢失效**，表现为两边轮流 401、互相触发重登、逼近 new-api 的
+50 会话上限，最终 409/503。
+
+关键：**触发条件是「PAT 失效」而不是「两套并存」**。PAT 有效时两边都不走登录。
+所以先测：
+
+```bash
+source <REPO>/.env    # 或手动 export 下面三个
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $NEWAPI_ADMIN_PAT" \
+  -H "New-Api-User: $NEWAPI_ADMIN_UID" \
+  "$NEWAPI_BASE_URL/api/user/self"
+```
+
+| 返回 | 含义 | 怎么做 |
+|---|---|---|
+| `200` | PAT 有效，两边都不会走登录 | 可以并行起容器（5.2 步可跳过） |
+| `401` | PAT 已失效 | **不要并行**。必须先停旧的，再起新的（第 6 步提到第 5 步之前） |
+| 其它 | 网络/地址不对 | 先修 `NEWAPI_BASE_URL`，别往下走 |
+
+> ⚠️ 还有一种更隐蔽的状态：**`.env` 里配了一个失效的 PAT**。
+> `_save_admin_cred()` 开头是 `if config.NEWAPI_ADMIN_PAT: return` —— 配了 PAT
+> 就永不落盘自愈缓存。所以「配一个失效 PAT」比「留空」更危险。留空反而每次冷启
+> 走账密登录，是干净的。**测试环境的建议：`NEWAPI_ADMIN_PAT` 直接留空。**
+
+### 1.5 确认 docker0 网段（切流后限流是否误伤，全靠这个）
+
+反代在宿主机、请求经 docker 网桥进容器时，容器看到的源 IP 是 **网桥网关 IP**，
+不是 `127.0.0.1`。若 `FORWARDED_ALLOW_IPS` 保持默认 `127.0.0.1`，uvicorn 会**丢弃
+`X-Forwarded-For`**，BFF 拿不到真实客户端 IP → 按 IP 限流会把所有用户当成同一个人。
+
+```bash
+ip -4 addr show docker0 | grep inet     # 例：inet 172.17.0.1/16
+```
+
+把这个 IP 记成 `<DOCKER0_IP>`，第 2 步写进 `.env`。
+
+**绝不能填 `*`** —— 等于允许任意客户端自带伪造 XFF 绕过限流。
+
+### 1.6 宝塔侧信息核对
+
+- Python 项目管理器里旧项目的**启动命令**与**监听端口**（确认是 8300）
+- 旧项目的 **data 目录绝对路径**（本手册记作 `<OLD_DIR>/data`）
+  - 若不在这里，翻旧项目启动脚本里的 `BFF_DATA_DIR`
+- PHP 站点的**反向代理目标**（确认是 `127.0.0.1:8300`）
+- 旧项目**是否开了自启**（第 6 步必须关掉）
+
+---
+
+## 2. 准备 `.env`
+
+`.env` 被 `.gitignore` 与 `.dockerignore` **双重忽略，不会随代码走**。
+服务器上必须手动放一份。
+
+```bash
+cd <REPO>
+cp .env.example .env
+vi .env
+```
+
+至少填这些（**容器不会读宿主 `.env` 里其它变量** —— compose 刻意不用
+`env_file`，只注入显式列出的项）：
+
+```dotenv
+# ---- 必填 ----
+APP_VERSION=1.0.0
+VCS_REF=<git rev-parse --short HEAD 的输出>
+BFF_SECRET_KEY=<现网原值，逐字符照抄>
+
+NEWAPI_BASE_URL=<现网值>
+NEWAPI_ADMIN_UID=<现网值>
+NEWAPI_ADMIN_USERNAME=<现网值>
+NEWAPI_ADMIN_PASSWORD=<现网值>
+NEWAPI_ADMIN_PAT=              # 测试环境建议留空，见 1.4
+
+# ---- 本机适配 ----
+FLOVART_BFF_PORT=8310          # 蓝绿用的临时端口，切流后才换成 8300
+FORWARDED_ALLOW_IPS=<DOCKER0_IP>
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 仅路线 A（本地构建）需要
+
+# ---- 镜像来源（二选一，见第 3 节）----
+# 删掉/注释掉下面这行 = 路线 A（服务器本地构建）
+BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest             # 路线 B（CI 打镜像）
+
+# ---- 可观测性（可后补）----
+LOGFIRE_TOKEN=
+LOGFIRE_ENVIRONMENT=flovart-prod
+
+# ---- 品牌（按现网 .env 对齐）----
+BFF_BRAND_NAME=<现网值>
+BFF_BRAND_ICP=<现网值>
+BFF_BRAND_CONTACT=<现网值>
+BFF_API_BASE_URL=<现网值>
+
+# ---- 聊天补全 ----
+BFF_CHAT_DEFAULT_MODEL=<现网值>
+BFF_CHAT_VISION_MODEL=<现网值>
+
+# ---- WaveSpeed ----
+WAVESPEED_API_KEY=<现网值>
+
+# ---- 媒体与元数据：按测试环境形态留空 = 容器内 /data ----
+POSTGRES_DSN=
+OSS_ENABLED=0
+```
+
+> **`PIP_INDEX_URL` 不是可选项。** 本项目有 fastapi / asyncpg / boto3 / Pillow /
+> psd-tools / logfire 几十个依赖，直连 `pypi.org` 常见「下载极慢 → Read timed
+> out → 整次构建白跑」。国内服务器务必填镜像源。
+
+> **Logfire 可以先留空。** 配置全部是运行期注入（镜像里不带 `.env`），所以
+> 事后拿到 token 只要改这一行 + `docker compose up -d --force-recreate`，
+> **不需要重新打镜像**。留空时上报完全关闭，业务零影响。
+
+---
+
+## 3. 拿到镜像（两条路线，二选一）
+
+**首次切换建议走 A**（一次性验证构建能过），之后日常发版走 B。
+
+### 路线 A · 服务器本地构建
+
+```bash
+cd <REPO>
+export APP_VERSION=1.0.0
+export VCS_REF=$(git rev-parse --short HEAD)
+export PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+docker compose build
+```
+
+> ⚠️ **这是本编排第一次真机构建**（开发机上 Docker daemon 没起来过，只验到
+> 配置层）。首次构建请预留调试时间，常见失败：
+>
+> | 报错 | 处理 |
+> |---|---|
+> | `Read timed out` / 卡在 pip | `PIP_INDEX_URL` 没填或镜像源不可达 |
+> | `Bad Gateway` 拉不到 `python:3.13-slim` | 降级：`.env` 加 `PYTHON_IMAGE=python:3.12-slim`（代码 `requires-python >= 3.12`，官方支持）；或在 `daemon.json` 配 `registry-mirrors` 后 `systemctl restart docker` |
+> | `no space left on device` | `docker system prune -f` 清旧镜像层 |
+
+确认镜像出来了：
+
+```bash
+docker images flovart-bff
+```
+
+### 路线 B · CI 打镜像，服务器只拉（GHCR）
+
+镜像由 `.github/workflows/build-image.yml` 在 push `main` 或打 `v*` tag 时
+自动构建并推到 `ghcr.io/<owner>/flovart-bff`。
+
+**① 先让 CI 跑绿一次**
+
+GitHub 仓库 → **Actions** → 左侧应出现 **Build & Push Image**。
+若那里仍是「Get started with GitHub Actions」的模板引导页，说明 workflow 文件
+还没推到 `main`（GitHub 只认默认分支上的 workflow 定义）。
+
+然后手工触发一次：Actions → Build & Push Image → **Run workflow**。
+
+> **这一步顺带补上一个悬了很久的缺口**：`Dockerfile` 从没被真机 build 过。
+> runner 就是干净的 Linux + Docker 环境，正好拿它做首次真实构建。
+> **第一次很可能失败** —— 重点看 `Build & Push Image` 那步的日志，
+> 常见原因是 pip 装包超时或 COPY 路径，按报错改即可。
+> 这类问题在开发机上无法复现，所以必须先在 CI 上把它跑绿。
+
+CI 里会依次做：跑 `pytest`（44 项）→ 构建镜像 → 推 GHCR。
+**测试不过就不会推镜像**，所以 registry 里不会有坏版本。
+
+**② 服务器认证一次**（私有仓库必须，否则 pull 报 denied）
+
+```bash
+echo <GitHub_PAT> | docker login ghcr.io -u <GitHub用户名> --password-stdin
+```
+
+> PAT 需勾选 `read:packages`。用户名是 GitHub 账号名，**不是邮箱**。
+> 凭证存在 `~/.docker/config.json`，之后不用重复登录。
+> 把 GHCR 包的可见性改为 public 可免认证，但私有代码配公开镜像一般不合适。
+
+**③ `.env` 指定镜像**
+
+```dotenv
+BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest
+```
+
+> `:latest` 省事但**不可回溯**（说不清服务器上跑的是哪个 commit）。
+> 想精确回溯就填 sha tag：`ghcr.io/<owner>/flovart-bff:sha-1a2b3c4`
+> —— 每次 push 都会打这个 tag，可用
+> `docker inspect flovart-bff --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'`
+> 反查对应的 commit。
+
+**④ 拉取**（`up` 在第 4 节）
+
+```bash
+cd <REPO>
+docker compose pull
+git rev-parse --short HEAD    # 记下来，切流后核对用
+```
+
+> ⚠️ **顺序不能反**。本服务同时声明了 `build` 段：若镜像在本地不存在又没先
+> `pull`，compose 会回退去执行 build —— 表现为「配了 GHCR 地址，服务器却
+> 吭哧吭哧装了十分钟依赖」。保险起见第 4 节可用 `docker compose up -d --no-build`。
+
+### 两条路线怎么选
+
+| | A 本地构建 | B CI 拉取 |
+|---|---|---|
+| 首次成本 | 低 | 要等 CI 跑绿 + 配一次 docker login |
+| 发版速度 | 每次在服务器编译几分钟 | 秒级 pull |
+| 服务器要求 | 能拉 Docker Hub + pypi | 只需能拉 GHCR |
+| 可回溯性 | 取决于 `APP_VERSION` 填得准不准 | tag 自带 commit sha |
+
+---
+
+## 4. 起容器（**8310，先不碰生产端口**）
+
+```bash
+cd <REPO>
+docker compose up -d
+# 走路线 B（镜像来自 GHCR）时建议加 --no-build，杜绝 compose 回退去本地构建：
+#   docker compose up -d --no-build
+docker compose ps
+```
+
+期望 `State` 是 `running`，`Health` 在 ~40s 内变 `healthy`。
+
+> 容器挂了会自动重启（`restart: unless-stopped`）。若反复重启，直接看日志
+> （第 8 步）。
+
+---
+
+## 5. 验证（三项全过才允许往下）
+
+### 5.1 `/readyz` —— 配置自检
+
+```bash
+curl -s http://127.0.0.1:8310/readyz | python3 -m json.tool
+```
+
+要通过必须三项全 `true`：
+
+| 检查项 | 对应配置 | 不过怎么办 |
+|---|---|---|
+| `secret_key_configured` | `BFF_SECRET_KEY` 长度 >= 32 且非弱值 | 改 `.env` |
+| `admin_cred_configured` | 有 `UID+PAT` 或 `账密` 任一组 | 补 `NEWAPI_ADMIN_*` |
+| `state_dir_writable` | `/data` 可写 | 见 5.4 |
+
+> `/readyz` **不碰 new-api**（只查本地配置），所以这一步**不会触发 PAT 互踢**，
+> 可以放心在旧服务还在跑的时候执行。这是刻意设计。
+
+顺手确认服务名与版本对得上：
+
+```bash
+curl -s http://127.0.0.1:8310/healthz
+```
+
+### 5.2 业务冒烟
+
+```bash
+# 站点配置（免登录接口，最轻的一枪）
+curl -s http://127.0.0.1:8310/api/config | python3 -m json.tool | head -20
+```
+
+然后在浏览器里（此时还没切流，用 `http://<服务器IP>:8310` 打不通，因为端口只
+绑了回环）——所以业务冒烟走 SSH 隧道：
+
+```bash
+# 在你自己电脑上执行
+ssh -L 8310:127.0.0.1:8310 root@<服务器IP>
+# 然后本地浏览器开 http://127.0.0.1:8310
+```
+
+或用 `curl` 打几个只读接口即可。**真正完整的 UX 验证放在切流之后**（第 7 步），
+因为那时反代才通。
+
+### 5.3 日志
+
+```bash
+docker compose logs -f --tail=200 bff
+```
+
+启动期应看到 `service=flovart-bff`，若配了 token 还有
+`environment=flovart-prod fastapi_traces=on`。
+
+> ⚠️ **应用刻意不写文件日志**：根文件系统 `read_only`，写容器内路径会抛
+> `Errno 30`。所有日志走 stdout → docker json-file（10m × 5 轮转）。
+> 所以排查**只有这一条路**，别去容器里找 `.log` 文件。
+> 业务请求日志是另一回事，已落库：`GET /api/tasks`（`cloudstore.request_log`）。
+
+### 5.4 `/data` 卷检查
+
+```bash
+docker compose exec bff ls -la /data
+docker compose exec bff sh -c 'touch /data/.probe && rm /data/.probe && echo "可写"'
+```
+
+---
+
+## 6. 数据迁移
+
+**顺序很重要：先停旧进程，再拷数据。** 反过来会在拷贝途中被 SQLite 写入，
+拷出一份不一致的库。
+
+### 6.1 停旧 BFF（宝塔 Python 项目管理器）
+
+面板 → 网站 / Python 项目管理器 → 找到旧项目：
+
+1. 点 **停止**
+2. **⚠️ 再关掉「开机自启」或直接删除项目**
+
+> **只点「停止」是不够的。** 宝塔的守护会把它拉起来，抢回 8300 端口，
+> 切流后表现为「一部分请求打旧服务、一部分打新服务」，而且两套 BFF 同时
+> 在跑会让 PAT 互踢的概率陡增。
+>
+> 若第 1.4 步测出 PAT 已失效（401），**这一步必须提到第 4 步之前**。
+
+验证真的停了：
+
+```bash
+ss -lntp | grep 8300
+# 期望：无输出
+pgrep -af uvicorn
+# 期望：无 flovart-bff 相关进程
+```
+
+### 6.2 拷数据进卷
+
+⚠️ **不要用 `docker cp`**：它保留宿主 uid（宝塔下通常是 root = `0:0`），
+而容器以 `bff`（uid **10001**）运行，拷进去会权限拒绝。
+也 **不要用 `docker compose exec -u root chown`** —— compose 里 `cap_drop: ALL`
+连 root 的 `chown` 能力也一起丢了，会静默失败。
+
+正解：另起一个一次性容器挂同一个卷来拷（不受 `cap_drop` 约束）：
+
+```bash
+docker compose stop bff
+
+docker run --rm \
+  -v flovart-bff-data:/data \
+  -v "<OLD_DIR>/data:/src:ro" \
+  python:3.13-slim \
+  sh -c "cp -a /src/. /data/ && chown -R 10001:10001 /data && echo 迁移完成"
+
+docker compose start bff
+```
+
+拷完核对：
+
+```bash
+docker compose exec bff ls -la /data
+```
+
+应能看到（按旧环境实际有的）：
+
+| 文件/目录 | 丢了会怎样 |
+|---|---|
+| `admin_cred.json` | 管理员 PAT 缓存没了，下次冷启动走账密重登（可接受） |
+| `user_keys.json` | **所有用户的 Key 密文丢失**，用户需重新填 |
+| `signup_bonus.json` | 注册赠送账本重置 → **可重复领赠送**（真金白银） |
+| `flovart_cloud.db` | **全部云端数据与媒体不可见** |
+| `media/` | **用户媒体文件不可见** |
+
+再打一次 `/readyz` 确认 `state_dir_writable` 仍为 `true`。
+
+---
+
+## 7. 切流
+
+### 7.1 改反代目标
+
+宝塔 → 网站 → 找到前端站点 → 设置 → 反向代理 → 把目标端口从 `8300` 改成 `8310`。
+
+**如果手改 nginx 配置，注意这一条最容易踩的坑：**
+
+```nginx
+location /api/ {
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # ✅ 正确：末尾无 `/` → 保留原始 URI，BFF 收到 /api/config
+    proxy_pass http://127.0.0.1:8310;
+
+    # ❌ 错误：末尾带 `/` → nginx 把 /api/ 替换掉，BFF 收到 /config → 404
+    # proxy_pass http://127.0.0.1:8310/;
+}
+```
+
+> **为什么：** BFF 的路由**自带 `/api` 前缀**（`app/routers/*.py` 里是
+> `@router.get("/api/config")` 这种写法），**不靠 Nginx 剥离前缀**。
+> 所以反代必须原样透传，不做任何路径重写。
+>
+> 反代只需覆盖 `/api/`。`/healthz`、`/readyz` 不带前缀，从宿主机直接 curl 即可。
+
+重载：
+
+```bash
+nginx -t && nginx -s reload
+```
+
+### 7.2 切流后验证
+
+```bash
+# 前端页面正常
+curl -sI https://<你的域名>/ | head -3
+# 经过反代的接口正常
+curl -s https://<你的域名>/api/config | head -c 200
+```
+
+浏览器里走一遍真实路径：**打开站点 → 登录已有账号（验证 Cookie 未失效）→
+打一张图 → 刷新确认历史记录还在**。
+
+> 登录没被踹出来 = `BFF_SECRET_KEY` 抄对了。
+> 历史记录还在 = 数据迁移成功了。
+
+### 7.3 换回生产端口（可选，建议过几天再做）
+
+稳定运行后，把 `.env` 的 `FLOVART_BFF_PORT` 改回 `8300`（或干脆保留 8310，
+只要反代指对就行），然后：
+
+```bash
+cd <REPO>
+docker compose up -d
+```
+
+此时旧进程早已停掉，不会抢占。
+
+---
+
+## 8. 回滚
+
+**一句话：把反代目标改回 `127.0.0.1:8300`，启动宝塔旧项目。**
+
+```bash
+# 1. 反代改回 8300，重载 nginx
+nginx -t && nginx -s reload
+
+# 2. 宝塔面板启动旧项目（并恢复自启）
+
+# 3. 停新容器（先别删，留着排查）
+docker compose stop bff
+```
+
+旧目录 `<OLD_DIR>/data` **始终没被改动过**（迁移是单向拷贝），所以回滚后
+数据完整。
+
+> ⚠️ 若第 1.4 步测出 PAT 已失效，回滚时要留意：新容器如果在运行期间走过登录
+> 流程重签过 PAT，旧的裸跑进程的 PAT 也已失效 → 它自己会走账密重登自愈
+> （前提是配了账密）。这就是 `NEWAPI_ADMIN_USERNAME/PASSWORD` 必须配的原因。
+
+---
+
+## 9. 排查速查
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| `docker compose up` 报 `xxx 必须设置` | 缺 `${VAR:?}` 必填项 | 补 `.env`，再 `docker compose config` 验 |
+| 容器反复重启 | `/readyz` 不过，或 `/data` 不可写 | `docker compose logs --tail=100 bff` |
+| `Errno 30 Read-only file system` | 有代码往 `/app` 写 | 检查 `BFF_DATA_DIR` / `BFF_ADMIN_CRED_FILE` / `BFF_SIGNUP_STATE_FILE` 是否都指到 `/data` |
+| `port is already allocated` | 8310 被占，或旧 BFF 没真停 | `ss -lntp \| grep 8310`；按 6.1 确认旧进程已停**且关了自启** |
+| 接口 401 但用户说自己已登录 | `BFF_COOKIE_SECURE=1` 要求 HTTPS | 确认访问的是 `https://`；`http://` 下浏览器不发 Secure Cookie |
+| 反代后接口全 404 | `proxy_pass` 末尾多写了 `/` | 按 7.1 去掉 |
+| 首次冷启后两边轮流 401 | PAT 互踢（见 1.4） | 确认 uid 独立；或让 `NEWAPI_ADMIN_PAT` 留空走账密 |
+| 限流把所有用户当同一人 | `FORWARDED_ALLOW_IPS` 没改成 `<DOCKER0_IP>` | 见 1.5 与 2 |
+| 上传大 PSD 失败 | tmpfs `/tmp` 太小 | compose 里调大 `tmpfs: /tmp:size=` 与 `memory` |
+| 容器被 OOM Kill | 大图解码内存峰值 | compose 里调大 `deploy.resources.limits.memory`（现 1G） |
+| 看不到任何日志 | 应用不写文件日志，只能看 stdout | `docker compose logs -f bff` |
+| Actions 页面只有模板引导页 | workflow 文件不在默认分支上 | 确认 `.github/workflows/build-image.yml` 已推到 `main` |
+| CI 能构建但 push 报 403 denied | `GITHUB_TOKEN` 默认只读 | 确认 workflow 顶部有 `permissions: packages: write` |
+| `pull access denied for ghcr.io/...` | 服务器没 `docker login ghcr.io`，或 PAT 缺 `read:packages` | 重新登录，PAT 勾上 `read:packages` |
+| 配了 `BFF_IMAGE` 却在服务器上装依赖 | 没先 `pull`，compose 回退去 build 了 | `docker compose pull` 后再 `up -d --no-build` |
+| 服务器拉到的镜像不是最新 | `latest` 在 CI 侧没更新，或本地有旧层 | 改用具体 sha tag；`docker compose pull` 时看输出确认拉到新 digest |
+
+---
+
+## 10. 收尾与遗留
+
+### 切流完成后
+
+- [ ] `.env` 备份到密码管理器（**丢了就全员登出 + 数据卷找不到**）
+- [ ] 记录本次 `APP_VERSION` 与 `VCS_REF`（`docker inspect flovart-bff`）
+- [ ] 确认宝塔旧项目自启已关，或项目已删除
+- [ ] 拿到 Logfire token 后补进 `.env` 并重建容器：
+      `docker compose up -d --force-recreate`
+      控制台应出现 `service=flovart-bff` / `environment=flovart-prod`，
+      **与 hewapi 的 `newapi-bff` 完全分开**
+- [ ] 观察一周后清理旧目录与旧 venv
+- [ ] **仅路线 B**：GHCR 认证已配好（第 3 节②）。
+      ⚠️ `docker login` 用的 PAT 若设了有效期，到期后 `docker compose pull` 会报
+      denied。运行中的容器不受影响，但**下次发版会拉不动镜像**。建议这个 PAT
+      设成不过期，或记下到期日
+
+### 已知待办（与本次切换无关）
+
+- **video-gen 异步分支 body 形状**：现在是 `{"type": kind, "params": params}`，
+  网关会报 `Model name not specified`（需要顶层 `model`）。图片已改 `sync` 绕开，
+  视频异步待修。
+- **多副本不可用**：注册赠送幂等靠进程内 `asyncio.Lock` + `signup_bonus.json`，
+  故强制单 worker。要扩容须先迁 PG。
+
+---
+
+## 附：隔离契约速查
+
+两套 BFF 同机，改配置时对照此表，**不要退回同名**：
+
+| 资源 | hewapi 线上 | 本项目 |
+|---|---|---|
+| compose project | （目录名推导） | `flovart-bff` |
+| `container_name` | `newapi-bff` | `flovart-bff` |
+| image | `newapi-bff:${VER}` | `flovart-bff:${VER}` |
+| volume | `bff-data` | `flovart-bff-data` |
+| 宿主端口 | `${BFF_PORT:-8000}` | `${FLOVART_BFF_PORT:-8300}` |
+| Logfire service | `newapi-bff`（硬编码） | `flovart-bff` |
+| Logfire environment | `local` | `flovart-prod` |
+
+> hewapi **不用 PG / OSS**（纯 JSON + `/data` 卷），所以数据面天然不撞。
+> 本项目将来启用 PG / OSS 时，若复用同一实例，务必换 `POSTGRES_DB` 与 `OSS_PREFIX`。

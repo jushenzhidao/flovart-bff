@@ -46,7 +46,7 @@ async def _lifespan(_app: FastAPI):
         pass
 
 
-app = FastAPI(title="flovart-bff", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app = FastAPI(title=config.SERVICE_NAME, docs_url=None, redoc_url=None, lifespan=_lifespan)
 observability.setup(app)
 
 # 统一响应壳 {success, message, data}（同 hewapi）。注意：FastAPI 自动 422 校验
@@ -130,5 +130,6 @@ async def readyz():
 @app.get("/")
 async def root():
     """BFF 根路径：创作站前端由另一个仓库构建部署（同域反代），此处仅探活提示。"""
-    return ok({"service": "flovart-bff", "message": "API is at /api/*",
+    # 同上：服务名统一取 config.SERVICE_NAME，不要在这里写死字面量。
+    return ok({"service": config.SERVICE_NAME, "message": "API is at /api/*",
                "docs": "见 ARCHITECTURE.md"})
