@@ -190,26 +190,49 @@ GitHub 的「从模板建一个」引导页，与提交内容无关。
 
 ### compose 相应改动：镜像名可被 registry 覆盖
 ```yaml
-image: ${BFF_IMAGE:-flovart-bff:${APP_VERSION}}
+image: ${FLOVART_BFF_IMAGE:-flovart-bff:${APP_VERSION}}
 ```
-- 不设 `BFF_IMAGE` = 路线 A（服务器本地 build，名字不变）
-- 设 `BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest` = 路线 B（只拉不 build）
+- 不设 `FLOVART_BFF_IMAGE` = 路线 A（服务器本地 build，名字不变）
+- 设 `FLOVART_BFF_IMAGE=ghcr.io/<owner>/flovart-bff:<tag>` = 路线 B（只拉不 build）
 - ⚠️ **本服务同时有 `build` 段**：若镜像本地不存在又没先 `pull`，compose 会回退
   去 build → 现象是「配了 GHCR 地址却在服务器上装了十分钟依赖」。
   正确顺序永远是先 `pull`，再 `up -d --no-build`
 
-### 服务器侧（路线 B）
-1. `echo <PAT> | docker login ghcr.io -u <用户名> --password-stdin`
-   （PAT 需 `read:packages`；用户名是账号名不是邮箱；凭证存 ~/.docker/config.json）
-2. `.env`：`BFF_IMAGE=ghcr.io/<owner>/flovart-bff:<tag>`
-3. `docker compose pull && docker compose up -d --no-build`
-- 私有仓库的 GHCR 包默认 private → 必须认证。PAT 若设了有效期，到期后 pull
-  会 denied（运行中的容器不受影响，但下次发版拉不动）
+### 🔴 变量名从 `BFF_IMAGE` 改成 `FLOVART_BFF_IMAGE`（2026-09-16 真实事故）
+**症状**（飞哥服务器实测）：
+```
+flovart-bff  Image ghcr.io/jushenzhidao/newapi-bff:sha-1d8fb3e Pulling
+Image ... Error failed to resolve reference ...: not found
+```
+**根因**：`image: ${BFF_IMAGE:-...}` 里的变量名与 hewapi 的 `.env` **完全同名**。
+两套配置项大面积相同（`BFF_SECRET_KEY`/`BFF_POINTS_PER_CNY`/`NEWAPI_*` 都一样），
+「照抄 hewapi 的 .env」是很自然的动作 → 这一行被静默劫持成对方的镜像地址。
+注意报错里 **sha 是对的、仓库名是错的**（`newapi-bff`）。
+compose **不会**报任何配置错误 —— 语法完全合法，只是拉了个不存在的仓库。
+- 改名后残留的 `BFF_IMAGE` 行**失效且刻意不兼容**（已验证：设了也不生效）
+- 本项目已改名项：`BFF_IMAGE`→`FLOVART_BFF_IMAGE`、`BFF_PORT`→`FLOVART_BFF_PORT`
+- **原则**：新增任何带固定名的资源/变量前，先问「hewapi 有没有同名的？」
 
-### 意外收获：CI 是「Dockerfile 从未真机 build」的解法
-本机 Docker daemon 一直没起来，Dockerfile 从未真实构建过。runner 就是干净的
-Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机验证。
-**首次很可能失败**（pip 装包 / COPY 路径），必须先在 CI 上跑绿再上服务器。
+### 服务器侧（路线 B）
+1. **当前免认证**：实测 GHCR 包 `jushenzhidao/flovart-bff` **匿名可拉**
+   （无凭证取 manifest 返回 200）。日后若改 private 才需要：
+   `echo <PAT> | docker login ghcr.io -u <用户名> --password-stdin`
+   （PAT 需 `read:packages`；用户名是账号名不是邮箱；凭证存 ~/.docker/config.json）
+2. `.env`：`FLOVART_BFF_IMAGE=ghcr.io/<owner>/flovart-bff:<tag>`
+   并让 `APP_VERSION` 与 tag 一致（路线 B 下它只参与 compose 解析，
+   镜像里的版本是 CI 构建时烧死的）
+3. **先验引用存在**：`docker manifest inspect <完整地址> >/dev/null && echo OK`
+4. `docker compose pull && docker compose up -d --no-build`
+
+### ✅ CI 已实测跑绿（2026-09-16）
+push `main` 自动触发并成功，GHCR 上已有 4 个 tag：
+`latest` / `main` / `sha-1d8fb3e` / `sha-6abf3fa`。
+镜像内实测落地值：`BFF_VERSION=sha-1d8fb3e`、`BFF_SERVICE_NAME=flovart-bff`、
+`BFF_DATA_DIR=/data`、`BFF_ADMIN_CRED_FILE=/data/admin_cred.json`、
+`BFF_SIGNUP_STATE_FILE=/data/signup_bonus.json`；
+OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD 对得上；
+平台 linux/amd64（+ buildx 的 unknown/unknown attestation，正常）。
+→ **「Dockerfile 从未真机 build」这个缺口已关闭**。
 
 ### `.dockerignore` 补充
 加了 `.github/`（CI 配置由 GitHub 直接读取，不经过 dockerignore，无需进上下文）。
@@ -227,6 +250,25 @@ Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机�
   - 正解：给 flovart 单开管理员账号；`.env` 换新账号 UID/账密；`NEWAPI_ADMIN_PAT` 留空
   - ⚠️ **绝不能照抄那串失效 PAT**：配了它，首个管理员请求就 login → 当场踢死 hewapi，
     且新 PAT 只存内存 → 每次容器重启再踢一次。**比留空更危险**
+  - ⚠️⚠️ **更正（2026-09-16 晚）：`NEWAPI_ADMIN_PAT` 留空也不是解法**
+    —— 留空只把频次从「每次重启」降到「首次冷启一次」，只要两套都在线乒乓照旧。
+    **唯一稳定解 = 独立管理员账号**，别指望靠调 PAT 字段绕开。
+    另：compose 原注释「留空则每次冷启走账密登录」不准确 —— 实际是首次冷启登录一次
+    并落盘 `/data/admin_cred.json`，之后复用（`_load_admin_cred` 先读盘）。
+  - 🔑 **「PAT 每次调用都轮换」已从注释断言升级为实证**：上游路由
+    `selfRoute.GET("/token", …, controller.GenerateAccessToken)` —— handler 名为
+    **Generate**，且挂 `UserCriticalRateLimit("access-token")` + `DisableCache()`；
+    观察闭环：账密登录实测 200（role=100）但 .env 那串 401，若只返回现值则不会失效。
+    路由存在性对照：`/api/user/token`→401（已注册）、伪造路径→404。
+  - 🔴 **「先验 PAT，200 就可并行」不充分**：`AccessToken` 是**用户记录上的单个字段**，
+    两边不可能各持一把有效 PAT，同时工作只能是**握着完全相同的同一串** →
+    200 仅代表「此刻不会立刻开踢」，任何一次轮换都会打破。
+  - 📌 **概念分界（飞哥反复追问的点）**：**能登录 ≠ PAT 有效**。
+    `_probe_two_channel.py` 实测：`POST /api/user/login`（账密）**200** ✅ 与
+    `GET /api/user/self`（PAT）**401** ❌ **可以同时成立**。登录返回的 `access_token`
+    带 `access_expires_at`，是**会话令牌**，与长期 PAT 是两回事。
+    且正是「账密有效」让 401 后必然自愈成功 → 必然轮换 → 必然互踢；
+    若账密也失效反而只是 503，不会互踢。
   - 影响面已核实（比想象中窄）：主路径 `/api/models` 走**用户自己的 PAT**
     （`keys.py:69 _ensure_token_plain` → `_ensure_token_user`），管理员 PAT 只是 401
     降级兜底（`admin_ensure_user_api_key`）→ 互踢主要打在**管理台 `/api/console/*`**
@@ -234,8 +276,8 @@ Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机�
   - 查 hewapi 是否已在循环：
     `docker compose logs bff | grep -c "admin PAT rejected, re-login to rotate"`
 - 🔴 **别直接把开发机 `.env` 拷到服务器**。除账号共用外还有 6 处：
-  `BFF_SECRET_KEY` 需与现网一致（否则全员登出 + **兑换码账号全部失联**，其用户名密码
-  由它 HMAC 派生）、`LOGFIRE_TOKEN` 是 hewapi 的、`LOGFIRE_ENVIRONMENT=local`、
+  `BFF_SECRET_KEY` 需与现网一致（否则全员登出；**并更正：不存在「兑换码账号失联」这回事**，
+  见下条）、`LOGFIRE_TOKEN` 是 hewapi 的、`LOGFIRE_ENVIRONMENT=local`、
   `APP_VERSION`/`VCS_REF` 过时、缺 `PIP_INDEX_URL`、
   **缺 `FORWARDED_ALLOW_IPS`（默认 127.0.0.1 容器化后是错的，静默劣化限流）**
   已产出服务器底稿 `.env.server`（被忽略，需手动上传）
@@ -243,23 +285,45 @@ Linux + Docker 环境 → 手工 `Run workflow` 一次即可完成首次真机�
     不传也没问题（config.py 默认就是 `v1/images/generations`）
   - `BFF_COOKIE_SECURE=false` 看似危险实则无害：compose 硬编码 `"1"` 覆盖，
     且不用 `env_file` 所以根本进不去容器
+- 🔴 **更正一处凭印象写错的技术结论（2026-09-16 晚）**：此前多处写「兑换码账号的用户名
+  密码由 `BFF_SECRET_KEY` HMAC 派生，换 key 等于那批账号全部失联」——**纯属错误**。
+  依据：`auth.py:112` 是 `admin_create_user(username, body.password)`，影子账号用
+  **用户自己填的密码**；全仓 `grep -rn "hmac\|HMAC" app/` **零命中**；
+  `ARCHITECTURE.md:195` 写明邀请/兑换码仍是 **M4 未实现规划**。
+  **`BFF_SECRET_KEY` 唯一用途** = `security.py:44-49` HKDF(`bff-session-aead-v2`)
+  → 会话 Cookie 的 AES-256-GCM 密钥。**换值后果仅「所有在线用户被登出，重新登录即可」**。
+  已在 `.env.server` 与 `DEPLOY-CUTOVER.md`（2 处）更正。
+  > 教训：错误注释比没有注释更危险 —— 它会把一个其实安全的操作写成禁地。
+- 🔍 **两侧会话密钥当前是同一把**：flovart 与 hewapi 的 `BFF_SECRET_KEY` 逐字符相同
+  （`e97052e9…`）。配合两边同名的 `COOKIE_NAME=bff_session`、同 HKDF info、
+  同载荷 `{uid,username,pat,role}`、同一 new-api 实例（uid 语义一致）
+  → **两套服务的会话可互相解开**。Cookie 未设 `domain=`（host-only），
+  浏览器不会跨主机名自动携带 → **非紧急漏洞**，列为后续加固项，
+  **别在切流当天换**（换了 = 全员登出）。
+- ✅ **Logfire token 已实测有效并填入 `.env.server`**。判据做了对照实验：
+  `force_flush()` 返回 True **不能**单独当判据（假 token 也返回 True）。
+  真 token → 零告警；假 token → `UserWarning: … 401 Detail: Invalid token` +
+  `LogfireServerWarning` + `ERROR otlp… 401`。
+  格式差异辅助辨认：hewapi 的 v1 = **59** 字符，新项目 v2 = **92** 字符。
+  `LOGFIRE_ENVIRONMENT` → `production`（本地那份保持 `pre`，同项目内区分本地/生产流量）。
+  > ⚠️ 过程中自伤一次：凭前缀+长度**编造**了 token 后半段写进文件，靠长度校验（79≠92）
+  > 才发现。**密钥值必须从源头程序化搬运，绝不凭已见片段续写。**
 - `.gitignore` 已补 `.env.*` —— 之前只有 `.env`，导致 `.env.server` 这种带真实密钥的
   环境变体会被提交。`.dockerignore` 早就写对了
 - **切换执行**：按仓库根 `DEPLOY-CUTOVER.md` 走。顺序要点：
   ① 验 PAT（`/api/user/self` 判 200/401）② 起容器 8310 ③ `/readyz`（不碰 new-api）
   ④ 停宝塔旧项目**并关自启**（只点停止会被拉起抢 8300）⑤ 改反代指向 8310
   ⚠️ PAT 已 401 → 必须把「停宝塔」提到「起容器」之前，否则两套 BFF 同账号互踢
-- 飞哥：去 Logfire **新建项目**取新 token，并改 `.env`：
-  `LOGFIRE_TOKEN=<新>`、`LOGFIRE_ENVIRONMENT=flovart-prod`（现为 `local`）。
-  可后补 —— 配置全运行期注入，改完 `docker compose up -d --force-recreate` 即可，
-  **不需要重打镜像**
+  ⚠️ 但根治仍是①之前的**独立管理员账号**（见本文件开头「多业务隔离」）。
+
+- ~~飞哥：去 Logfire 新建项目取新 token~~ **已完成**（`.env` 与 `.env.server` 均已填
+  `pylf_v1_us_…` 92 字符新 token，`LOGFIRE_ENVIRONMENT=production`，实测可上报）。
+  ⚠️ 本项目与 hewapi 是**两个 Logfire 项目、两把 token**，别再混用
 - `.e2e/{cookies,hdr,user}.txt` **已在 `fcf5f93` 进仓库**（本地 127.0.0.1 的 e2e
   测试账号凭证，非线上真实用户）。`.gitignore` 已补 `.e2e/` / `dist/` / `*.bak*`，
   但已入库的三个文件需出仓：`git rm --cached .e2e/cookies.txt .e2e/hdr.txt .e2e/user.txt`
-- Docker daemon 本机未运行，镜像 build 与真容器 run **尚未实测**（配置层已全验）
-  → 首次远端构建请预留调试时间，见手册第 3 节的失败对照表
-- **workflow 推到 main 后手工 `Run workflow` 一次**，把它跑绿 —— 这既是首次真机
-  build 验证，也是路线 B 的前提（不绿就别指望服务器能 pull 到）
+- ~~Dockerfile 从未真机 build~~ **已关闭**：CI 于 2026-09-16 构建成功并推 GHCR
+- ~~workflow 手工 Run workflow 一次~~ **已关闭**：push `main` 自动触发即跑绿
 - **ruff 清理（独立一轮）**：`app/` 68 项、`tests/` 61 项。清理顺序建议：
   ① `pyproject.toml` 加 `[tool.ruff.lint.per-file-ignores]` 豁免 `tests/*` 的 S101
   ② `ruff check app/ --fix` 能自动修 53 项

@@ -25,13 +25,22 @@
 | `NEWAPI_ADMIN_USERNAME` / `PASSWORD` | 同上账号 | 现网 `.env` |
 | `<DOCKER0_IP>` | 一般是 `172.17.0.1` | 第 1.5 步实测 |
 | `APP_VERSION` | 如 `1.0.0` | 你定 |
-| `<GHCR_IMAGE>` | `ghcr.io/<owner>/flovart-bff:latest` | 走路线 B 才填，见第 3 节 |
+| `<GHCR_IMAGE>` | `ghcr.io/<owner>/flovart-bff:sha-xxxxxxxx` | 走路线 B 才填，见第 3 节；变量名 `FLOVART_BFF_IMAGE` |
 
 **最容易搞错的两项**，先说清楚：
 
 1. **`BFF_SECRET_KEY` 必须与现网完全一致。** 它经 HKDF 派生出会话 Cookie 的
-   AES-256-GCM 密钥。换了值 = 所有在线用户立刻被登出；更麻烦的是**兑换码账号的
-   用户名密码也由它 HMAC 派生，换了等于那批账号全部失联**。切流时这条保证用户无感。
+   AES-256-GCM 密钥。换了值的唯一后果 = **所有在线用户被登出，重新登录即可**，
+   不丢账号也不丢数据（注册时 new-api 影子账号用的是用户自己填的密码，
+   `app/routers/auth.py:112`；BFF 不存密码，全仓无任何 HMAC 派生）。
+   > 📌 更正：本节此前写的「兑换码账号口令由它 HMAC 派生、更换即全部失联」**是错的**，
+   > 已核实无代码依据；邀请/兑换码在 `ARCHITECTURE.md:195` 仍是 M4 未实现的规划。
+   > 当时把它写进来是凭印象，属于典型的「错误注释比没有更危险」。
+   切流时这条保证用户无感。
+   ⚠️ 另外注意：本值目前与 hewapi **逐字符相同**，即两套服务的会话可互相解开
+   （同名 Cookie + 同 HKDF info + 同载荷 + 同 new-api uid 语义）。Cookie 是
+   host-only，浏览器不会跨主机名自动携带，故非紧急漏洞；作为**后续加固项**处理，
+   别在切流当天换。
 2. **`NEWAPI_ADMIN_UID` / 账号密码——现状是错的，见第 1.4 步。**
    实测确认本项目与 hewapi **共用同一个 new-api 管理员账号**（uid=1 / `newapi-bff`），
    而 PAT 是账号级的、每次重签作废旧值 → 两边会互踢。
@@ -72,8 +81,8 @@ docker compose config >/dev/null && echo "配置解析通过"
 报 `xxx 必须设置` 就是缺项，按第 2 步补。
 
 ⚠️ **解析通过 ≠ 配置正确**。`BFF_SECRET_KEY` 最容易在这里翻车：它不报错，
-只会在切流那一刻把所有在线用户踢下线，而且**兑换码账号（用户名密码由它 HMAC
-派生）会全部失联**。上传 `.env` 之前先比指纹，别肉眼比字符串（容易漏掉尾部空格）：
+只会在切流那一刻把所有在线用户踢下线（重新登录即可恢复，不丢数据）。
+上传 `.env` 之前先比指纹，别肉眼比字符串（容易漏掉尾部空格）：
 
 ```bash
 # 服务器上，现网宝塔那份：
@@ -93,26 +102,47 @@ grep '^BFF_SECRET_KEY=' <REPO>/.env     | sha256sum
 就会把对方的 PAT 踢失效**，表现为两边轮流 401、互相触发重登、逼近 new-api 的
 50 会话上限，最终 409/503。
 
-关键：**触发条件是「PAT 失效」而不是「两套并存」**。PAT 有效时两边都不走登录。
-所以先测：
+#### ⚠️ 关键更正：共用账号下**不存在稳定态**
+
+一个账号的 `AccessToken` 是**用户记录上的单个字段**（不是「一账号多 token」）。
+所以两边不可能各持一把有效 PAT —— 想同时工作，就只能是**两边握着完全相同的那一串**。
+
+推论：**「先验 PAT，200 就并行」只能说明「此刻不会立刻开踢」，不能说明安全。**
+任何一次轮换（任何一边的 401 自愈、管理员在面板点「系统访问令牌」、new-api 重启）
+都会打破这个状态，然后两边互相触发重登、互相作废 —— **乒乓循环必然发生**。
+
+因此：**PAT 校验只用来判断「现在起容器会不会当场踢」，不作为「可以共用账号」的依据。**
+唯一稳定解是独立管理员账号（见本节末）。
+
+顺带更正一条我先前给错的建议：**「把 `NEWAPI_ADMIN_PAT` 留空」并不能避开互踢。**
+留空只是把频次从「每次重启一次」降到「首次冷启一次」；只要两套都在线，
+乒乓照旧，只是节奏慢一点。
+
+先测一把（判断是不是「立刻开踢」）：
 
 ```bash
 source <REPO>/.env    # 或手动 export 下面三个
 curl -s -o /dev/null -w '%{http_code}\n' \
   -H "Authorization: Bearer $NEWAPI_ADMIN_PAT" \
-  -H "New-Api-User: $NEWAPI_ADMIN_UID" \
+  -H "New-Api-User $NEWAPI_ADMIN_UID" \
   "$NEWAPI_BASE_URL/api/user/self"
 ```
 
 | 返回 | 含义 | 怎么做 |
 |---|---|---|
-| `200` | PAT 有效，两边都不会走登录 | 可以并行起容器（5.2 步可跳过） |
+| `200` | 此刻两边都不走登录 | 可以并行起容器（5.2 步可跳过）—— 但**共用账号仍是随时会爆的雷** |
 | `401` | PAT 已失效 | **不要并行**。必须先停旧的，再起新的（第 6 步提到第 5 步之前） |
-| 其它 | 网络/地址不对 | 先修 `NEWAPI_BASE_URL`，别往下走 |
+| `其它` | 网络/地址不对 | 先修 `NEWAPI_BASE_URL`，别往下走 |
 
 > **对照项**：假 token 也会返回 401，公开端点 `/api/status` 返回 200 ——
 > 用它排除「端点本来就不吃 PAT」的误判。三个端点建议都打一遍
 > （`/api/channel/models_enabled`、`/api/user/?p=0&page_size=1`、`/api/user/self`）。
+>
+> **零成本自查轮换是否正在发生**（比打网关更有信息量，且无副作用）：
+> ```bash
+> docker compose logs bff | grep -c "admin PAT rejected, re-login to rotate"
+> ```
+> 非 0 就说明 hewapi 一直在自愈轮换 —— 那「填一把好的 PAT」这条路就不通。
 
 #### 🔴 实测结论（2026-09-16）：本编排与 hewapi **共用同一个管理员账号**
 
@@ -232,7 +262,9 @@ PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple   # 仅路线 A（本地�
 
 # ---- 镜像来源（二选一，见第 3 节）----
 # 删掉/注释掉下面这行 = 路线 A（服务器本地构建）
-BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest             # 路线 B（CI 打镜像）
+# ⚠️ 变量名是 FLOVART_BFF_IMAGE，不是 BFF_IMAGE（后者是 hewapi 的变量名，
+#    照抄它的 .env 会劫持成它的镜像地址 → not found。详见第 3 节路线 B ③）
+FLOVART_BFF_IMAGE=ghcr.io/<owner>/flovart-bff:sha-xxxxxxxx   # 路线 B（CI 打镜像）
 
 # ---- 可观测性（可后补）----
 LOGFIRE_TOKEN=
@@ -268,7 +300,8 @@ OSS_ENABLED=0
 
 ## 3. 拿到镜像（两条路线，二选一）
 
-**首次切换建议走 A**（一次性验证构建能过），之后日常发版走 B。
+**两条路线都可用。** CI 已实测推成功（见路线 B ①），所以走 B 更快 —— 服务器
+不用装十分钟依赖。A 的价值只剩「本机没网/CI 挂了」时的兜底。
 
 ### 路线 A · 服务器本地构建
 
@@ -301,24 +334,29 @@ docker images flovart-bff
 镜像由 `.github/workflows/build-image.yml` 在 push `main` 或打 `v*` tag 时
 自动构建并推到 `ghcr.io/<owner>/flovart-bff`。
 
-**① 先让 CI 跑绿一次**
+**① CI 已经跑绿了，先确认有哪些 tag 可用**
 
-GitHub 仓库 → **Actions** → 左侧应出现 **Build & Push Image**。
-若那里仍是「Get started with GitHub Actions」的模板引导页，说明 workflow 文件
-还没推到 `main`（GitHub 只认默认分支上的 workflow 定义）。
+实测（2026-09-16）`ghcr.io/jushenzhidao/flovart-bff` 上已有：
 
-然后手工触发一次：Actions → Build & Push Image → **Run workflow**。
+```
+latest  main  sha-1d8fb3e  sha-6abf3fa
+```
 
-> **这一步顺带补上一个悬了很久的缺口**：`Dockerfile` 从没被真机 build 过。
-> runner 就是干净的 Linux + Docker 环境，正好拿它做首次真实构建。
-> **第一次很可能失败** —— 重点看 `Build & Push Image` 那步的日志，
-> 常见原因是 pip 装包超时或 COPY 路径，按报错改即可。
-> 这类问题在开发机上无法复现，所以必须先在 CI 上把它跑绿。
+> 所以「CI 能不能建出镜像」这个悬了很久的缺口**已经补上了** ——
+> `Dockerfile` 真机构建通过，pytest 44 项通过，镜像可拉。
+> 以后每次 push `main` 都会自动重跑；想手动重跑：
+> GitHub 仓库 → **Actions** → **Build & Push Image** → **Run workflow**。
 
-CI 里会依次做：跑 `pytest`（44 项）→ 构建镜像 → 推 GHCR。
-**测试不过就不会推镜像**，所以 registry 里不会有坏版本。
+想确认某个 tag 真的存在（**上传 `.env` 前先跑这条**，1 秒，远好过起容器才 404）：
 
-**② 服务器认证一次**（私有仓库必须，否则 pull 报 denied）
+```bash
+docker manifest inspect ghcr.io/<owner>/flovart-bff:<tag> >/dev/null && echo OK
+```
+
+**② 认证：当前不需要**
+
+实测该 GHCR 包**匿名可拉**（无凭证直接取 manifest 返回 200），所以跳过 `docker login`。
+若日后把包可见性改成 private，则要认证一次：
 
 ```bash
 echo <GitHub_PAT> | docker login ghcr.io -u <GitHub用户名> --password-stdin
@@ -326,19 +364,35 @@ echo <GitHub_PAT> | docker login ghcr.io -u <GitHub用户名> --password-stdin
 
 > PAT 需勾选 `read:packages`。用户名是 GitHub 账号名，**不是邮箱**。
 > 凭证存在 `~/.docker/config.json`，之后不用重复登录。
-> 把 GHCR 包的可见性改为 public 可免认证，但私有代码配公开镜像一般不合适。
 
 **③ `.env` 指定镜像**
 
 ```dotenv
-BFF_IMAGE=ghcr.io/<owner>/flovart-bff:latest
+APP_VERSION=sha-1d8fb3e      # 与下面的 tag 保持一致
+FLOVART_BFF_IMAGE=ghcr.io/<owner>/flovart-bff:sha-1d8fb3e
 ```
 
-> `:latest` 省事但**不可回溯**（说不清服务器上跑的是哪个 commit）。
-> 想精确回溯就填 sha tag：`ghcr.io/<owner>/flovart-bff:sha-1a2b3c4`
-> —— 每次 push 都会打这个 tag，可用
+> ⚠️ **变量名是 `FLOVART_BFF_IMAGE`，不是 `BFF_IMAGE`。**
+> hewapi 的 `.env` 里也有个 `BFF_IMAGE`（值是它的镜像地址）。两套配置项大面积
+> 相同，「照抄 hewapi 的 .env」是很自然的动作 —— 而这行会**静默劫持**本服务，
+> 报错长这样（2026-09-16 实际发生）：
+>
+> ```
+> flovart-bff  Image ghcr.io/<owner>/newapi-bff:sha-1d8fb3e Pulling
+> Image ghcr.io/<owner>/newapi-bff:sha-1d8fb3e Error
+>   failed to resolve reference ... not found
+> ```
+>
+> 注意**容器名是自己的、仓库名是对方的**。compose 不会报任何配置错误，
+> 因为语法完全合法，只是拉了个不存在的仓库。变量已改名（刻意不与 hewapi 同名），
+> 残留在 `.env` 里的 `BFF_IMAGE` 行现在会被忽略。
+
+> 生产请钉 `sha-xxxxxxx`，别用 `latest` —— `latest` 随每次 push `main` 漂移，
+> 一旦线上行为与预期不符，你无法判断跑的是哪一版。
+> `APP_VERSION` 在路线 B 下只用于解析 compose（镜像里的版本是 CI 构建时烧死的），
+> 所以让它与镜像 tag 一致，`.env` 才是自洽的。
+> 反查镜像对应的 commit：
 > `docker inspect flovart-bff --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'`
-> 反查对应的 commit。
 
 **④ 拉取**（`up` 在第 4 节）
 
@@ -620,7 +674,9 @@ docker compose stop bff
 | Actions 页面只有模板引导页 | workflow 文件不在默认分支上 | 确认 `.github/workflows/build-image.yml` 已推到 `main` |
 | CI 能构建但 push 报 403 denied | `GITHUB_TOKEN` 默认只读 | 确认 workflow 顶部有 `permissions: packages: write` |
 | `pull access denied for ghcr.io/...` | 服务器没 `docker login ghcr.io`，或 PAT 缺 `read:packages` | 重新登录，PAT 勾上 `read:packages` |
-| 配了 `BFF_IMAGE` 却在服务器上装依赖 | 没先 `pull`，compose 回退去 build 了 | `docker compose pull` 后再 `up -d --no-build` |
+| 配了 `FLOVART_BFF_IMAGE` 却在服务器上装依赖 | 没先 `pull`，compose 回退去 build 了 | `docker compose pull` 后再 `up -d --no-build` |
+| pull 报 `not found`，**且仓库名是对方项目**（如 `.../newapi-bff:sha-xxx`） | 照抄 hewapi 的 `.env` 时被同名的 `BFF_IMAGE` 劫持了 | 改用 `FLOVART_BFF_IMAGE`，并核对仓库名是 `flovart-bff`；先 `docker manifest inspect` 验存在 |
+| pull 报 `not found`，仓库名正确 | tag 写错或该次 CI 没推成功 | `docker manifest inspect ghcr.io/<owner>/flovart-bff:<tag>` 逐个试；Actions 里看构建记录 |
 | 服务器拉到的镜像不是最新 | `latest` 在 CI 侧没更新，或本地有旧层 | 改用具体 sha tag；`docker compose pull` 时看输出确认拉到新 digest |
 
 ---
@@ -637,7 +693,7 @@ docker compose stop bff
       控制台应出现 `service=flovart-bff` / `environment=flovart-prod`，
       **与 hewapi 的 `newapi-bff` 完全分开**
 - [ ] 观察一周后清理旧目录与旧 venv
-- [ ] **仅路线 B**：GHCR 认证已配好（第 3 节②）。
+- [ ] **仅路线 B**：镜像引用已验证存在（`docker manifest inspect` 通过，第 3 节①）
       ⚠️ `docker login` 用的 PAT 若设了有效期，到期后 `docker compose pull` 会报
       denied。运行中的容器不受影响，但**下次发版会拉不动镜像**。建议这个 PAT
       设成不过期，或记下到期日
@@ -661,6 +717,7 @@ docker compose stop bff
 | compose project | （目录名推导） | `flovart-bff` |
 | `container_name` | `newapi-bff` | `flovart-bff` |
 | image | `newapi-bff:${VER}` | `flovart-bff:${VER}` |
+| **image 的变量名** | `BFF_IMAGE` | `FLOVART_BFF_IMAGE` |
 | volume | `bff-data` | `flovart-bff-data` |
 | 宿主端口 | `${BFF_PORT:-8000}` | `${FLOVART_BFF_PORT:-8300}` |
 | Logfire service | `newapi-bff`（硬编码） | `flovart-bff` |

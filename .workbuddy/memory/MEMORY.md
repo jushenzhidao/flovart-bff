@@ -21,6 +21,7 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
 - 业务请求日志**是另一回事、已落库**：`GET /api/tasks`、`GET /api/tasks/{id}`（`cloudstore.request_log`）
 - ⚠️ 报错 `services.bff.environment.NEWAPI_BASE_URL must be set` **出自 hewapi 的 `docker-compose.yml:66`**（service 名 `bff` / `container_name: newapi-bff` / `ports 127.0.0.1:${BFF_PORT:-8000}:8000`），**不是 flovart-bff 的文件**。飞哥 `.env` 里那段是粘贴的**面板报错备注**，别当成配置内容
 - 完整部署隔离清单（容器名/镜像名/卷名/端口/SERVICE_NAME 逐项对照）+ 容器化踩坑见 `topics/deployment.md`
+- 🔴 **跨项目绝不复用环境变量名**（2026-09-16 真实事故）：镜像变量原名 `BFF_IMAGE`，与 hewapi 的 `.env` **同名**。照抄 hewapi 配置时被填成 `ghcr.io/<owner>/newapi-bff:sha-xxx` → `docker compose` 报 `failed to resolve reference ... not found`（**容器名是自己的、仓库名是对方的**，compose 不报配置错误，因为语法合法）。已改名 **`FLOVART_BFF_IMAGE`**（刻意不兼容残留的 `BFF_IMAGE`）。同类已改名项：`FLOVART_BFF_PORT`（原 `BFF_PORT`）。**新增任何带固定名的资源前先问：hewapi 有没有同名变量？**
 
 ## 架构铁律
 - 登录=BFF 独立注册；注册=管理员影子建 new-api 号+赠送+自动登录（口令只换 PAT，不存密码）
