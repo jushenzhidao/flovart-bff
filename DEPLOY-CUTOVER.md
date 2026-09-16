@@ -461,13 +461,64 @@ curl -s http://127.0.0.1:8310/healthz
 
 ### 5.2 业务冒烟
 
+用仓库里的脚本，**不要手搓 curl** —— 它会按「是否触碰管理员凭证通道」分层，
+把会踢 hewapi 的用例默认挡掉：
+
 ```bash
-# 站点配置（免登录接口，最轻的一枪）
+cd <REPO>
+chmod +x scripts/smoke_test.sh
+BASE_URL=http://127.0.0.1:8310 ./scripts/smoke_test.sh
+```
+
+默认只跑 **L0**（配置体检 + 探针 + 站点配置 + 未登录鉴权闸门），**完全不接触
+new-api**，可以在旧服务还开着的时候放心跑。全绿说明「容器起来了、配置对了、
+鉴权没漏」。
+
+```bash
+# 加一层：用户通道（只影响该测试账号自己的 PAT）
+./scripts/smoke_test.sh --user 某个普通用户:它的密码
+```
+
+> 脚本会拒绝用管理员账号登录 —— 那会重新签发它的 PAT 并当场踢掉 hewapi。
+
+#### ⚠️ 为什么业务冒烟默认测不完整（这是设计，不是脚本偷懒）
+
+这个 BFF 里**大量「用户级接口」在兜底时会走管理员凭证通道**。按 `app/routers/*`
+实际调用逐个核过：
+
+| 接口 | 走的通道 | 跑它的后果 |
+|---|---|---|
+| `/healthz` `/readyz` `/` `/api/config` | 纯本地 | 无 |
+| `/api/user/login` `/logout` `/self` `/api/token` `/api/log/self` | 用户自己 | 仅该账号 PAT 被重签 |
+| `/api/me/points` | **恒走 admin** `admin_get_user` | 🔴 触发轮换 |
+| `/api/console/*`（全部） | **恒走 admin** | 🔴 触发轮换 |
+| `/api/user/register` | **恒走 admin** `admin_create_user` | 🔴 触发轮换 |
+| `/api/shares/*` | **恒走 admin** | 🔴 触发轮换 |
+| `/api/models` | 用户 sk-，**失败回落 admin** | ⚠️ 正常时不碰，异常时碰 |
+| `/api/chat/completions`、`/api/tasks`（生图/生视频） | 复用本地缓存 sk-，**缓存未命中走 admin 代建** | ⚠️ 新卷首次请求必碰 |
+
+所以：**只要管理员账号仍与 hewapi 共用，「注册新用户」「看积分」「进管理台」
+「新卷首次生图」这些动作都会踢 hewapi**。`admin_cred_configured` 在 `/readyz`
+里只是「配置存在」的意思，不代表凭证真的可用 —— 别被那个绿勾骗了。
+
+确认 `.env` 已换成独立管理员账号后，才加 `--admin-channel` 把 L2 跑完：
+
+```bash
+./scripts/smoke_test.sh --user 某普通用户:密码 --admin-channel
+```
+
+#### 站点配置单独看一眼
+
+```bash
 curl -s http://127.0.0.1:8310/api/config | python3 -m json.tool | head -20
 ```
 
-然后在浏览器里（此时还没切流，用 `http://<服务器IP>:8310` 打不通，因为端口只
-绑了回环）——所以业务冒烟走 SSH 隧道：
+重点核对 `brand.name`（应为 `oneArt`，若是「Workbuddy积分」说明 `.env` 抄错了
+hewapi 那份）和 `version`（应与 `.env` 的 `APP_VERSION`、镜像 tag 三者一致）。
+
+#### 想看真实页面
+
+端口只绑回环，`http://<服务器IP>:8310` 打不通，走 SSH 隧道：
 
 ```bash
 # 在你自己电脑上执行
@@ -475,8 +526,7 @@ ssh -L 8310:127.0.0.1:8310 root@<服务器IP>
 # 然后本地浏览器开 http://127.0.0.1:8310
 ```
 
-或用 `curl` 打几个只读接口即可。**真正完整的 UX 验证放在切流之后**（第 7 步），
-因为那时反代才通。
+**真正完整的 UX 验证放在切流之后**（第 7 步），那时反代才通。
 
 ### 5.3 日志
 
@@ -678,6 +728,11 @@ docker compose stop bff
 | pull 报 `not found`，**且仓库名是对方项目**（如 `.../newapi-bff:sha-xxx`） | 照抄 hewapi 的 `.env` 时被同名的 `BFF_IMAGE` 劫持了 | 改用 `FLOVART_BFF_IMAGE`，并核对仓库名是 `flovart-bff`；先 `docker manifest inspect` 验存在 |
 | pull 报 `not found`，仓库名正确 | tag 写错或该次 CI 没推成功 | `docker manifest inspect ghcr.io/<owner>/flovart-bff:<tag>` 逐个试；Actions 里看构建记录 |
 | 服务器拉到的镜像不是最新 | `latest` 在 CI 侧没更新，或本地有旧层 | 改用具体 sha tag；`docker compose pull` 时看输出确认拉到新 digest |
+| `/api/config` 里 `brand.name` 是「Workbuddy积分」 | `.env` 抄了 hewapi 那份 | 改 `BFF_BRAND_NAME=oneArt`，`up -d --force-recreate` |
+| `/api/config` 里 `version` 与镜像 tag 不一致 | `.env` 的 `APP_VERSION` 没跟着 tag 刷新 | 两个值对齐（走路线 B 时它们只用于解析 compose） |
+| **未登录就能拿到业务数据**（`smoke_test.sh` 第 3 节的闸门项返回 200） | 鉴权依赖被漏挂 | 🔴 严重，先别切流。检查对应路由的 `Depends(require_session)` |
+| 业务接口一调，hewapi 那边就开始报错 | 管理员凭证通道被触发（见 5.2 的通道表） | 只有换独立管理员账号能根治 |
+| `smoke_test.sh` 的 L2 全红 | 账号仍是共用的、或 `.env` 里 `NEWAPI_ADMIN_*` 没换 | 先做 1.4 的独立账号 |
 
 ---
 
@@ -686,6 +741,9 @@ docker compose stop bff
 ### 切流完成后
 
 - [ ] `.env` 备份到密码管理器（**丢了就全员登出 + 数据卷找不到**）
+- [ ] **切流后再跑一次完整冒烟**（这次带上管理通道）：
+      `./scripts/smoke_test.sh --url http://127.0.0.1:8310 --user 普通用户:密码 --admin-channel`
+      L2 全绿才说明注册/管理台/积分这些路径真的通
 - [ ] 记录本次 `APP_VERSION` 与 `VCS_REF`（`docker inspect flovart-bff`）
 - [ ] 确认宝塔旧项目自启已关，或项目已删除
 - [ ] 拿到 Logfire token 后补进 `.env` 并重建容器：

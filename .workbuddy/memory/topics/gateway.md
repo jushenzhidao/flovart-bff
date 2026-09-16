@@ -45,3 +45,48 @@
 - ✅ **已修**：`/api/models` 改用**该用户自己的 sk-** 查 `/v1/models`（**按分组过滤**），失败才回落全站。`newapi_client.user_available_models(sk)`（**不带 New-Api-User**）。契约：**目录里有的就是真能调的，不得硬塞能力**
 - 判定：管理员账密登网关（**PAT 易失效，排查别用**）→ `GET /api/channel/?p=0&page_size=100` 看 `group` 与 `models`
 
+### 🔴 更正（2026-09-16 实测）：上面那条契约**只对自建 new-api 成立**
+
+**外部中转站（chatfire 等）不适用**，别拿这条去推断「列表里有 = 能调」。
+
+- 实测对象：`POST https://api.chatfire.cn/v1/images/generations`，用**该用户自己的 sk-** 打：
+  - `GET /v1/models` → **760** 条，**赫然包含** `gemini-2.5-flash-image-preview`
+  - 拿同名模型去生成 → **503** `No available channel for model gemini-2.5-flash-image-preview
+    under group gemin (distributor)`，`type=rix_api_error`
+- 关键差异：报错类型是 **`rix_api_error`** —— chatfire **不是 new-api**，是第三方中转，
+  它的 `/v1/models` 返回**全站目录**、**不按 key 分组过滤**。分组只在调用时生效。
+- 所以判定口径要分两套：
+  | 上游 | `/v1/models` 语义 | 「列表里有 = 能调」可信吗 |
+  |---|---|---|
+  | 自建 new-api（BFF 网关） | 按用户 sk- 的分组过滤（`user_available_models`） | ✅ 可信 |
+  | 外部中转（chatfire / oneapis 等） | **全站目录**，与 key 的分组无关 | ❌ **不可信，必须实测** |
+- 同型历史案例：`gpt-image-2.5` 也在列表里、调用 503 无渠道；真名是 `-flare` / `-sunburst`。
+- 🆕 实测工具：`scripts/probe_upstream_models.py`
+  （`list --grep` / `image --model`，key 走 `--key` 或 `UPSTREAM_KEY` 环境变量，不落仓库）。
+
+## 🆕 chatfire 会「HTTP 200 空产出」（2026-09-16 实测，gemini 系列）
+
+**响应形态**（`POST /v1/images/generations`，**200**）：
+```json
+{"created":1789541248,
+ "usage":{"prompt_tokens":5,"completion_tokens":0,"total_tokens":5,
+          "prompt_tokens_details":{"cached_tokens_details":{}},"completion_tokens_details":{}}}
+```
+**完全不带 `data`**。`completion_tokens=0` ⇒ 模型侧确实没出图（不是解析问题、不是渠道问题、不是计费问题）。
+
+- 触发条件：**只与时间/上游负载相关，与入参无关** —— 最小 payload `{model,prompt}` 同样复现，
+  `mode` / `quality` / `size` 均无影响。实测偶发率约 **3/8**；换时段复测 4 模型×3 + `_2k`×6 = **0/18**。
+- 四个可用 gemini 图模型都会有：`gemini-3.1-flash-image-preview`、`-flash-lite-image`、
+  `-3-pro-image-preview`、`-flash-image-preview_2k`。
+- 返回形态差异（与空产出无关，但改前端要记）：正名 → **b64_json**，`_1k/_2k/_4k` 变体 → **CDN url**（s3ai.cn）。
+- 判空配方（探针脚本已内建）：
+  `isinstance(d.get("data"), list) and d["data"] and (d["data"][0].get("url") or d["data"][0].get("b64_json"))`
+
+⚠️ **BFF 侧的旧坑（2026-09-16 已修）**：`_normalize_sync_result` 会把该响应归一化成
+`{"created","usage"}` 并**按 `status=succeeded` 落库** ⇒ 前端只显示兜底文案「任务未返回媒体」，
+**上游空产出的真相 100% 丢失**（等于把失败记成成功）。现在 `_run_sync` /
+`_external_call_and_record` 会判 `_iter_outputs(result)` 为空即记 `failed`
+（`error.type=upstream_empty_result`，含 `usage` 与上游顶层键）。
+前端配套：`imageTaskError()`（`services/imageTask.ts`）—— `_task_view()` **从不下发 `error` 字段**，
+真正原因在 `result.error.message`，只读 `t.error?.message` 恒为 undefined。
+

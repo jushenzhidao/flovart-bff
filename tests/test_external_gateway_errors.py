@@ -155,3 +155,68 @@ def test_external_request_masks_api_key_before_persist(monkeypatch):
     assert stored["_gateway"]["api_key"] == "***"
     assert "sk-super-secret" not in json.dumps(stored)
     assert logs["req-ext-3"]["status"] == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# 3) 上游 HTTP 200 但无产物 → 必须记 failed（2026-09-16）
+# ---------------------------------------------------------------------------
+EMPTY_200_BODY = {
+    "created": 1789541248,
+    "usage": {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5},
+}
+
+
+def test_upstream_empty_result_is_failed_not_succeeded(monkeypatch):
+    """上游 200 但正文只有 usage、没有图片 → 记 failed 并留痕原因。
+
+    实测（2026-09-16，chatfire /v1/images/generations，gemini 系列）该形态偶发率约 1/4，
+    且**直连同一把 key 可复现** —— 是模型侧空产出，不是 BFF 解析问题。
+    此前它被 `_normalize_sync_result` 归一化成 `{"created","usage"}` 并按 `succeeded`
+    落库，前端拿不到产物、只能显示兜底文案「任务未返回媒体」，
+    上游空产出这个真相彻底丢失。本测试守护「不许再记 succeeded」。
+    """
+    logs = _install_fake_log(monkeypatch)
+
+    async def empty_ok(method, url, *, api_key, json=None, client=None):
+        return dict(EMPTY_200_BODY)
+
+    monkeypatch.setattr(tasks.na, "request_external", empty_ok)
+
+    async def fake_persist(task, task_id, uid, kind="image"):
+        return task
+
+    monkeypatch.setattr(tasks, "_persist_outputs", fake_persist)
+
+    asyncio.run(tasks._external_call_and_record(
+        11, "req-empty-1", "image-gen",
+        "https://api.chatfire.cn/v1/images/generations", "sk-x",
+        {"model": "gemini-3.1-flash-image-preview"}))
+
+    entry = logs["req-empty-1"]
+    assert entry["status"] == "failed", "空产出绝不可能算成功"
+    err = entry["result"]["error"]
+    assert err["type"] == "upstream_empty_result"
+    assert err["usage"]["completion_tokens"] == 0
+    assert err["upstream_keys"] == ["created", "usage"]
+
+
+def test_upstream_with_media_still_succeeds(monkeypatch):
+    """对照组：带 url 的正常 200 必须仍记 succeeded —— 守卫不能误伤真产物。"""
+    logs = _install_fake_log(monkeypatch)
+
+    async def ok(method, url, *, api_key, json=None, client=None):
+        return {"data": [{"url": "https://s3ai.cn/cdn/x.jpg"}]}
+
+    monkeypatch.setattr(tasks.na, "request_external", ok)
+
+    async def fake_persist(task, task_id, uid, kind="image"):
+        return task
+
+    monkeypatch.setattr(tasks, "_persist_outputs", fake_persist)
+
+    asyncio.run(tasks._external_call_and_record(
+        12, "req-ok-1", "image-gen",
+        "https://api.chatfire.cn/v1/images/generations", "sk-x",
+        {"model": "gemini-3.1-flash-image-preview_2k"}))
+
+    assert logs["req-ok-1"]["status"] == "succeeded"

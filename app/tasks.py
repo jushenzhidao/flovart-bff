@@ -251,6 +251,38 @@ def _iter_outputs(result: dict) -> "list[dict]":
     return outs
 
 
+def _upstream_usage(raw: Any) -> Any:
+    """取上游 usage，用于诊断「200 但无产物」（completion_tokens=0 ⇒ 模型侧未产出）。"""
+    if isinstance(raw, dict):
+        return raw.get("usage")
+    return None
+
+
+def _no_media_error(raw: Any) -> dict:
+    """上游 HTTP 200 但归一化后无任何产物 → 生成可诊断的失败记录。
+
+    实测（2026-09-16，chatfire /v1/images/generations）：
+    gemini 系列图片模型会以 **HTTP 200** 返回
+    `{"created":…,"usage":{"prompt_tokens":5,"completion_tokens":0,…}}`，
+    **完全不带 data** —— 即模型侧确实没出图（直连同一把 key 可复现，
+    非 BFF 解析问题；实测偶发率约 1/4）。
+
+    ⚠️ 此前该响应被归一化成 `{"created","usage"}` 并按 `status=succeeded` 落库，
+    前端拿不到任何产物 → 只能显示兜底文案「任务未返回媒体」，
+    上游「空产出」这个真实原因彻底丢失，排查时无从下手。
+    故此处必须记 failed，并把 usage / 上游顶层键一并留痕。
+    """
+    return {
+        "error": {
+            "message": "上游返回成功但未产出图片（模型侧空结果，属上游偶发失败，请重试）",
+            "type": "upstream_empty_result",
+            "stage": "normalize",
+            "usage": _upstream_usage(raw),
+            "upstream_keys": sorted(raw.keys()) if isinstance(raw, dict) else None,
+        }
+    }
+
+
 def _decode_b64(s: str) -> "tuple[bytes | None, str | None]":
     s = (s or "").strip()
     mime: "str | None" = None
@@ -480,6 +512,14 @@ async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dic
         await cloudstore.request_log_update(
             request_id, status="failed", gateway_request_id=gw_req_id, result=err)
         raise
+    if not isinstance(result, dict) or not _iter_outputs(result):
+        # 200 但无产物：绝不能记 succeeded，否则前端只剩「任务未返回媒体」。
+        err = _no_media_error(raw)
+        logger.warning("上游同步返回无产物 uid=%s req=%s path=%s usage=%s",
+                       uid, request_id, path, err["error"]["usage"])
+        await cloudstore.request_log_update(
+            request_id, status="failed", gateway_request_id=gw_req_id, result=err)
+        return _task_view(request_id, request_id, kind, "sync", "failed", {"result": err})
     await cloudstore.request_log_update(
         request_id, status="succeeded", task_id=request_id,
         gateway_request_id=gw_req_id, result=task.get("result"))
@@ -596,6 +636,14 @@ async def _external_call_and_record(uid: int, request_id: str, kind: str,
     except Exception as e:  # noqa: BLE001 —— 归一化/落盘失败同样要留痕
         logger.exception("外部网关结果处理失败 uid=%s req=%s url=%s", uid, request_id, url)
         err = _error_record(e, "external_result_error", "normalize/persist", url=url)
+        await cloudstore.request_log_update(
+            request_id, status="failed", gateway_request_id=gw_req_id, result=err)
+        return
+    if not isinstance(result, dict) or not _iter_outputs(result):
+        # 同 _run_sync：外部网关（chatfire 等）同样会 200 空产出，必须记 failed。
+        err = _no_media_error(raw)
+        logger.warning("外部网关返回无产物 uid=%s req=%s url=%s usage=%s",
+                       uid, request_id, url, err["error"]["usage"])
         await cloudstore.request_log_update(
             request_id, status="failed", gateway_request_id=gw_req_id, result=err)
         return

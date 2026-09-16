@@ -238,6 +238,28 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
 加了 `.github/`（CI 配置由 GitHub 直接读取，不经过 dockerignore，无需进上下文）。
 注意 `.dockerignore` 里已有 `*.md`，所以 `DEPLOY-CUTOVER.md` 不会进镜像。
 
+## 六点五、部署后冒烟：`scripts/smoke_test.sh`（2026-09-16 新增）
+
+**核心设计：按「会碰到哪条凭证通道」分层，而不是按功能分层。** 因为上面的
+通道表说明——这个 BFF 有大量「用户级接口」兜底走 admin，功能分层会把危险项
+混进「正常测试」里。
+
+| 层 | 覆盖 | 开关 | 是否碰 new-api |
+|---|---|---|---|
+| **L0**（默认） | 配置体检 + `/healthz` `/readyz` `/` + `/api/config` + **未登录鉴权闸门 ×7** | 无 | ❌ 完全不碰 |
+| **L1** | `login` / `self` / `token` / `log/self` / `storage/overview` / `logout` + 登出后失效校验 | `--user 用户:密码` | 仅该账号自己的 PAT |
+| **L2** | `me/points` / `models` / `console/overview` / `console/models` | `--admin-channel` | 🔴 管理员通道 |
+
+- **安全闸门**：脚本硬拒用 `NEWAPI_ADMIN_USERNAME` 登录（会重签其 PAT → 踢 hewapi）；
+  没有 `--admin-channel` 时 L2 整层跳过并打印原因。
+- **配置体检**（读 `$REPO_DIR/.env`）：残留 `BFF_IMAGE=*newapi-bff*`、
+  `NEWAPI_ADMIN_UID=1`、`BFF_BRAND_NAME != oneArt`、`LOGFIRE_ENVIRONMENT=local`、
+  `FORWARDED_ALLOW_IPS=127.0.0.1`、`FLOVART_BFF_IMAGE` 用了 `:latest`。
+- 依赖：`bash` + `curl`；有 `python3` 时精确解析 JSON，没有则退化为 sed（够用）。
+- **实测**（本地 8399）：默认层 16 通过 / 0 失败 / 3 警告 / 2 跳过；
+  用管理员账号跑被拦 ✅；不存在账号 → 登录 401 并停住 ✅。
+- ⚠️ **未登录闸门里那 7 项如果返回 200，是 P0**（鉴权依赖漏挂），先别切流。
+
 ## 七、待办
 - 🔴🔴 **【最高优先级，上线前必须解决】new-api 管理员账号与 hewapi 共用**（2026-09-16 实测）
   - flovart 与 hewapi **完全同一个账号**：uid=1 / 用户名 `newapi-bff` / 密码逐字相同 /
@@ -269,10 +291,26 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
     带 `access_expires_at`，是**会话令牌**，与长期 PAT 是两回事。
     且正是「账密有效」让 401 后必然自愈成功 → 必然轮换 → 必然互踢；
     若账密也失效反而只是 503，不会互踢。
-  - 影响面已核实（比想象中窄）：主路径 `/api/models` 走**用户自己的 PAT**
-    （`keys.py:69 _ensure_token_plain` → `_ensure_token_user`），管理员 PAT 只是 401
-    降级兜底（`admin_ensure_user_api_key`）→ 互踢主要打在**管理台 `/api/console/*`**
-    （`console.py` 三处直接调 `admin_enabled_models()`）与冷启/降级路径
+  - ⚠️ **影响面更正（2026-09-16 11:40，比先前结论大得多）**：我上轮写「互踢主要打在
+    管理台与冷启/降级路径」——**过于乐观**。把 `app/routers/*` 所有 `na.admin_*` /
+    `admin_request` 调用点逐个核完后，**下面这些普通用户动作都会触发管理员通道**：
+
+    | 接口 | 通道 | 触发场景 |
+    |---|---|---|
+    | `/api/me/points`（billing.py:46） | **恒 admin** `admin_get_user` | 「我的积分」 |
+    | `/api/console/*`（20 处） | **恒 admin** | 进管理台 |
+    | `/api/user/register`（auth.py:112） | **恒 admin** `admin_create_user` | **每个新用户注册** |
+    | `/api/shares/*`（64/111/136） | **恒 admin** | 分享/打开分享 |
+    | `/api/user/self` 401 降级（auth.py:177） | admin | 用户 PAT 失效时刷新页面 |
+    | `/api/models`（keys.py:139） | 用户 sk-，失败回落 admin | 模型列表异常时 |
+    | `/api/chat/completions`（chat.py:69）、`/api/tasks`（tasks.py:58） | 复用 `user_keys` 缓存 sk-，**缓存未命中 → admin_mint** | **新卷首次生图/聊天** |
+
+    即：**注册、看积分、分享、新卷首次生图 —— 全是管理员通道**。
+    `_user_api_key` 先查 `user_keys` 本地缓存（在 DATA_DIR），**新卷缓存为空**，
+    所以切流后第一个生图请求必然走 admin。
+  - ⚠️ **`/readyz` 的 `admin_cred_configured` 只校验「配置存在」**
+    （`main.py:92 _check_admin_cred` = `PAT+UID` 或 `账密` 任一组非空），
+    **不代表管理员凭证真的可用** —— 别被那个绿勾骗了。
   - 查 hewapi 是否已在循环：
     `docker compose logs bff | grep -c "admin PAT rejected, re-login to rotate"`
 - 🔴 **别直接把开发机 `.env` 拷到服务器**。除账号共用外还有 6 处：
@@ -315,6 +353,13 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
   ④ 停宝塔旧项目**并关自启**（只点停止会被拉起抢 8300）⑤ 改反代指向 8310
   ⚠️ PAT 已 401 → 必须把「停宝塔」提到「起容器」之前，否则两套 BFF 同账号互踢
   ⚠️ 但根治仍是①之前的**独立管理员账号**（见本文件开头「多业务隔离」）。
+- ✅ **容器已起成功**（2026-09-16 11:39 飞哥截图确认：logfire 已启用
+  `service=flovart-bff environment=production version=sha-1d8fb3e`、uvicorn 0.0.0.0:8000、
+  `GET /readyz 200`）
+- ▶️ **下一步：跑 `scripts/smoke_test.sh`（默认 L0 层，不碰 new-api）**
+  - L0 全绿 = 容器本身健康（探针 / 配置 / 鉴权闸门）
+  - 想验业务必须 `--user`；想验注册/管理台/积分必须 `--admin-channel`
+  - ⚠️ 那 7 项未登录闸门若返回 200 = P0（鉴权依赖漏挂），先别切流
 
 - ~~飞哥：去 Logfire 新建项目取新 token~~ **已完成**（`.env` 与 `.env.server` 均已填
   `pylf_v1_us_…` 92 字符新 token，`LOGFIRE_ENVIRONMENT=production`，实测可上报）。
@@ -330,3 +375,97 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
   ③ 剩下 15 项（S110 try-except-pass / E702 / E741 / S608 / ASYNC230 / F811）
      需人工判断
   ④ 全绿后再把 ruff 加进 CI 的 test job 作为门禁
+
+## 前端反代接入（2026-09-16 12:30 核过代码）
+
+**结论：反代不是「可选优化」，是唯一可用形态。**
+
+- 前端 `flovart-web/services/hostedClient.ts:43` 全部走 `fetch('/api'+path)` 相对路径 +
+  `credentials:'include'`；**后端 `app/main.py` 没有 `CORSMiddleware`**（全仓 `allow_origins` 零命中）。
+  → 跨域浏览器直接拦（连预检都没有），**必须同域同端口**（不同端口也算跨域）。
+- **路径透传规则**（BFF 路由自带 `/api` 前缀，`app/routers/*.py` 里硬写 `@router.get("/api/xxx")`）：
+  ```nginx
+  location /api/ { proxy_pass http://127.0.0.1:8310; }   # ✅ location 带尾斜杠、proxy_pass 不带路径
+  ```
+  ⚠️ 写成 `proxy_pass http://127.0.0.1:8310/;`（带尾斜杠）会**剥掉 `/api` 前缀** → 全站 404。
+  与 hewapi 的 `proxy_pass` 规约同源（见上文切流段）。前端 dev 侧对照：`vite.config.ts:32`
+  的 `/api` → `FLOVART_BFF_TARGET`（默认 8300）**没有 rewrite**，证实「不改写路径」是既定约定。
+- **三条极易漏的 Nginx 项**：
+  | 项 | 值 | 不加的后果 |
+  |---|---|---|
+  | `client_max_body_size` | `100m` | 媒体上传（`POST /api/me/media`）被 413 拒 |
+  | `proxy_read_timeout` | `600s` | **同步生图会阻塞**，默认 60s → 客户端 504（图其实已生成，白花钱） |
+  | `proxy_buffering off` | — | `/api/chat/completions` 是 SSE（`chat.py:137` `media_type="text/event-stream"`），缓冲会让流式退化成一坨 |
+- 🔴 **HTTP 访问必然登录不上**：compose 把 `BFF_COOKIE_SECURE: "1"` **写死**（见上文 324 行同一条），
+  Secure Cookie 在 `http://` 下浏览器**不发送** → 表现为「登录接口 200、但刷新即掉登录」。
+  所以要反代给用户用，**站点必须挂 HTTPS**（自签不算，浏览器仍判不安全上下文）。
+- 反代若与 BFF **不同机/不同网络**：`127.0.0.1:8310` 要换成实际可达地址；容器内互访走
+  compose 服务名或 `host.docker.internal`，不能用 `127.0.0.1`（那是前端容器自己）。
+- `FORWARDED_ALLOW_IPS` 此时必须放行**前端的真实来源**（同机反代 = `172.17.0.1`，`.env.server` 已设）。
+
+## 运维观测：日志看哪、落什么文件（2026-09-16 12:35 核过）
+
+**日志三条腿**（`app/observability.py` 模块头 + compose 264-272 行注释都写明了）：
+
+| 通道 | 怎么看 | 内容 |
+|---|---|---|
+| stdout → docker json-file | `docker logs -f --tail=200 flovart-bff` | 全部 `logging` 输出（uvicorn / bff logger） |
+| Logfire 控制台 | 按 `service_name=flovart-bff` + `environment=production` 过滤 | 每个请求的 span + 出站 httpx span + 日志 |
+| 业务请求日志 | `GET /api/tasks`、`GET /api/tasks/{id}` | `cloud_request_log` 表，**仅生图/生视频** |
+
+- ⚠️ **service 名是 `bff`**（compose `30:  bff:`），与 hewapi 的 service 名**撞名** →
+  在服务器上看日志优先用**容器名** `docker logs flovart-bff`，不要用 `docker compose logs bff`
+  （两台机器的 compose 都在时容易搞错对象）。
+- ⚠️ **json-file 上限 = 10m × 5 ≈ 50MB**，超过就轮转冲掉。**这不是长期审计日志** ——
+  要留痕得靠 Logfire（云端留存）或 `cloud_request_log`（库）。
+- ⚠️ Logfire 开了 `capture_headers=False` + `scrubbing`，**请求头/请求体看不到**
+  （PAT / Cookie / password 一律 `[scrubbed]`）。要看调用参数只能查 `cloud_request_log.payload_json`。
+- 容器内**绝不写日志文件**（`read_only: true`，写了抛 `Errno 30`），这是刻意设计不是缺失。
+  仓库根的 `_bff.log` 是 9-15 本地调试重定向留下的 **0 字节残留**，已被 `.dockerignore` 排除，
+  与容器无关。
+
+🔴 **切流后发现的实际状态：服务器 `.env.server` 里 `POSTGRES_DSN` 与 `OSS_*` 全部为空** →
+两块都回落本地：
+
+- 元数据 → **容器内 SQLite `/data/flovart_cloud.db`**（不是 PostgreSQL！）
+- 媒体字节 → **`/data/media`**（不是 OSS/COS！）
+
+两者都在卷 `flovart-bff-data` 里。**卷丢 = 用户云端数据 + 媒体全丢**（`docker compose down -v`
+即可抹掉）。当前单副本可用；要上多副本**必须**先配 `POSTGRES_DSN`（多副本各自 SQLite 会读不到彼此数据）
+与 `OSS_*`。备份也要按「卷」来做，不是按数据库。
+
+### Logfire 控制台入口（2026-09-16 12:40 飞哥实测截图确认）
+
+- 主机是 **`logfire-us.pydantic.dev`**（US region），不是 `logfire.pydantic.dev`
+- 项目地址：`https://logfire-us.pydantic.dev/adam-he-git-hub/flovart`
+  （org slug = `adam-he-git-hub`，显示名「阿毅」；project = `flovart`）
+- ⚠️ 飞哥第一次卡在 **`/settings/setup` 项目设置页** —— 那页只有配置项，没有数据。
+  观测数据在 **Live 视图**（项目根路径，默认落地页）与 **Explore**（SQL Workbench）
+- 顶部 **environment 选择器**默认 `all envs`，建议切 `production`（本地那份是 `pre`，混着看会乱）
+- 判据：右上 Status 显示 **Connected** 才算连上实时流
+- 搜索：Live 视图里按 `/` 或点 `Search your spans`，往里写的是 **WHERE 子句**
+  （如 `service_name = 'flovart-bff'`），不是完整 SELECT
+- ⚠️ **Live 页空白是正常的**：探针 `/healthz` `/readyz` 被 `excluded_urls` 排除，
+  且没有真实业务请求就不会产生 span。想看到数据必须先在前端点几下（拉平台服务/生图）
+- `requirements.txt:24` 是 **`logfire[fastapi,httpx]==4.41.0`**（extras 已装）→ 启动日志应为
+  `fastapi_traces=on`。若为 `off`，说明镜像里 extras 缺失，HTTP 维度完全不上报（只剩日志行）。
+  诊断顺序：`docker logs flovart-bff | grep logfire` → 无「logfire 已启用」= token 没进容器；
+  有但 `fastapi_traces=off` = 缺 extras；两者都正常 = 只是没流量。
+
+### 服务器上「有没有数据库/本地文件落日志」（2026-09-16 13:38 飞哥问）
+
+**直答：BFF 应用自己既不写日志文件，也没有数据库** —— 无状态设计（会话在加密 Cookie，
+服务端零存储；唯一持久层是 cloudstore 元数据）。但宿主机上确实有**三份落地的记录**：
+
+| 落点 | 路径 | 内容 | 留存 |
+|---|---|---|---|
+| docker json-file | `docker inspect --format '{{.LogPath}}' flovart-bff` → `/var/lib/docker/containers/<id>/<id>-json.log` | 容器 stdout 全部（= 应用所有 logging） | 10m×5≈50MB 轮转 |
+| **Nginx access log** | 宝塔 `/www/wwwlogs/<域名>.log`；原生 `/var/log/nginx/access.log` | **每个 /api 请求一行**（IP/方法/路径/状态码/UA/耗时） | 看面板轮转配置 |
+| 卷内 SQLite | `flovart-bff-data:/data/flovart_cloud.db` | `cloud_request_log` —— **仅生图/生视频**的任务审计（含 `payload_json`） | 不轮转（除删卷） |
+
+- ⭐ **Nginx access log 是反代白送的**，是最省事的「本地文件日志」：不需要改代码、
+  不受 read_only 限制。飞哥已配反代 → 这份已经在记了。
+- 想主动导出运行日志留档（不改代码）：
+  `docker logs --since 24h flovart-bff > /root/bff-logs/$(date +%F).log 2>&1`
+- 真要常驻文件日志，得改代码加 `FileHandler` + 在 compose 挂一个卷（**不要**写 /app 下，
+  read_only 会抛 Errno 30）。当前三重覆盖（stdout / Logfire / Nginx）已够，无审计需求不必加。
