@@ -3,7 +3,7 @@
 > **细节卷**（血案全过程 / 完整表格 / 代码片段）在 `.workbuddy/memory/topics/`：
 > `gateway.md`（/v1 凭证 · 路径前缀 · 端点选择 · 渠道分组）· `tasks.md`（图片/视频任务）·
 > `product-model.md`（产品模型解析 · 条目拆分）· `frontend-storage.md`（keyVault · 多账号隔离）·
-> `platform-services.md`（平台共享服务 · 平台 Key 注入 · UI 语义）· `cloudstore.md`（云同步/素材）·
+> `platform-services.md`（平台共享服务 · 平台 Key 注入 · UI 语义 · **下架/删除准入闸门**）· `cloudstore.md`（云同步/素材）·
 > `pitfalls.md`（其他坑 · 接口速查）· `packaging.md`（打包交付口径）·
 > `deployment.md`（部署 / 容器化 / 与 hewapi 的同机隔离 · read_only 踩坑）。
 > 每日流水见同目录 `YYYY-MM-DD.md`。原完整版备份：`MEMORY.md.bak20260916`。
@@ -12,6 +12,16 @@
 Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。前端独立仓库 `D:\code\flovart-web`（同机并存，直接改）。
 **约定**：不执行任何 git commit/push（飞哥自己来，只在末尾提醒）。
 ⚠️ 两个「打包」别混：**交付给飞哥的产物 = zip 压缩包**（他明确说过「我们之前不是 python 项目吗，压缩包就行」，别主动上 Docker 镜像）；**生产部署形态 = Docker compose**（2026-09-16 起补齐 Dockerfile + docker-compose.yml，见 `topics/deployment.md`）。
+
+### 本地起服务（飞哥要自己点着测时用）
+| 服务 | 地址 | 命令 |
+|---|---|---|
+| BFF | http://127.0.0.1:8300 | `PYTHONUNBUFFERED=1 C:/Users/81068/.workbuddy/binaries/python/envs/flovart-bff/Scripts/python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8300`（`cd D:\code\flovart-bff`）|
+| 前端 | http://127.0.0.1:37522 | `npm run dev`（`cd D:\code\flovart-web`）|
+- ⚠️ uvicorn 输出重定向到文件时**块缓冲**，不加 `PYTHONUNBUFFERED=1` 会几十秒才刷一次、看着像卡死
+- 前端 `/api` 经 `vite.config.ts` 代理到 8300（`FLOVART_BFF_TARGET` 可覆盖）；默认端口 37522（`FLOVART_WEB_PORT` 可覆盖）
+- 本地 `.env` 未配 `POSTGRES_*` → `USE_PG=False` → LocalMeta(SQLite) `data/flovart_cloud.db`，**与生产隔离**
+- 管理区可见性：`is_admin()` = 上游 `role>=10` **或** `BFF_ADMIN_USERNAMES` 名单（本地没配名单 → 要拿管理员账号登录）
 
 ## 🔭 日志 / 可观测性（2026-09-16 **已接入 Logfire**）
 **仍然没有文件日志，这是刻意的**：生产容器根文件系统 `read_only`，写容器内路径会抛 `OSError: [Errno 30]`。日志走两条腿 —— **stdout（docker json-file，10m×5 轮转）+ Logfire 上报**。

@@ -8,7 +8,7 @@ import logging
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from .. import config, newapi_client as na
+from .. import config, newapi_client as na, platform_catalog
 from ..resp import fail, ok
 from ..security import require_session
 
@@ -127,14 +127,20 @@ async def user_model_catalog(session: dict = Depends(require_session)):
 
     降级：取不到 sk- 或查 /v1/models 失败时，回落管理员全站列表（保证目录非空，
     前端不至于空白；宁可多显示也不要让平台服务整体消失）。
+
+    ⭐ 2026-09-16：出口统一过一遍**下架过滤器**（`platform_catalog.filter_available`）。
+    被管理员下架/删除的模型名在这里就被剔掉 —— 这样即使用户本地 keyVault 里
+    还留着那条平台服务影子条目（页面没刷新），模型选择器里也不会再列出来。
+    本函数只治「显示」，真正的准入拦截在 `/api/tasks` 与 `/api/chat/completions`。
     """
     try:
         info = await _ensure_token_plain(session)
         models = await na.user_available_models(info["key"])
         if models:
+            models = await platform_catalog.filter_available(models)
             return ok({"items": models, "total": len(models), "scoped": True})
         logger.warning("用户态 /v1/models 返回空，回落全站列表 uid=%s", session.get("uid"))
     except Exception as e:  # noqa: BLE001 — 任何失败都不应让模型目录整体 500
         logger.warning("用户态模型目录获取失败，回落全站列表 uid=%s: %s", session.get("uid"), e)
-    models = await na.admin_enabled_models()
+    models = await platform_catalog.filter_available(await na.admin_enabled_models())
     return ok({"items": models, "total": len(models), "scoped": False})

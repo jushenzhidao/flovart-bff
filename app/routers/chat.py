@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .. import config, newapi_client as na
 from ..newapi_client import NewApiError
 from ..security import require_session
-from .. import user_keys
+from .. import platform_catalog, user_keys
 
 logger = logging.getLogger("bff.chat")
 router = APIRouter()
@@ -93,6 +93,11 @@ async def chat_completions(request: Request, session: dict = Depends(require_ses
         )
     payload["model"] = model
     payload["stream"] = True
+
+    # ⭐ 平台下架闸门：模型被管理员下架/删除后，即便调用方本地还缓存着平台服务
+    #    影子条目（没刷新页面），也必须在此拦掉并给出明确原因。
+    #    抛 ModelSuspendedError，由 main.py 统一转成 409 + {success:false,message}。
+    await platform_catalog.assert_model_available(model)
 
     uid = session["uid"]
     user_pat = session["pat"]

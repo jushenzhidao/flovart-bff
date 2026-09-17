@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from . import config, newapi_client as na, observability, store, tasks, oss, db
 from .newapi_client import NewApiError
+from .platform_catalog import ModelSuspendedError
 from .resp import ok
 from .routers import (auth, billing, cloud, console, convert, keys, platform_services,
                       tasks as tasks_router, usage, chat, shares)
@@ -60,6 +61,24 @@ for r in (auth.router, keys.router, usage.router, console.router, convert.router
 async def newapi_error_handler(request: Request, exc: NewApiError):
     return JSONResponse(status_code=exc.status_code,
                         content={"success": False, "message": exc.message})
+
+
+@app.exception_handler(ModelSuspendedError)
+async def model_suspended_handler(request: Request, exc: ModelSuspendedError):
+    """平台已下架/已删除的模型被调用 —— 409 + 明确文案。
+
+    ⚠️ 必须返回**统一响应壳**（`{success, message, code}`）而不是 FastAPI 默认的
+    `{"detail": ...}`：前端 `hostedClient.api()` 只读 `body.message`，
+    走默认形状会退化成「请求失败(409)」—— 那就等于把「模型已下架」这个
+    关键信息又吞掉了（正是本次要修的毛病）。
+    """
+    logger.info("模型已下架被拒 %s %s model=%s code=%s",
+                request.method, request.url.path, exc.model, exc.code)
+    return JSONResponse(
+        status_code=409,
+        content={"success": False, "message": exc.message,
+                 "code": exc.code, "data": {"model": exc.model, "reason": exc.reason}},
+    )
 
 
 @app.exception_handler(Exception)

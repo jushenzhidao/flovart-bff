@@ -20,7 +20,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .. import cloudstore, tasks
+from .. import cloudstore, platform_catalog, tasks
 from ..resp import ok
 from ..security import require_session
 
@@ -38,6 +38,14 @@ async def create_task(body: SubmitBody, session: dict = Depends(require_session)
         raise HTTPException(status_code=400, detail=f"不支持的任务类型: {body.type}")
     if not isinstance(body.params, dict):
         raise HTTPException(status_code=400, detail="params 必须是对象")
+    # ⭐ 平台下架闸门（飞哥 2026-09-16）：模型被管理员下架/删除后，**即使调用方
+    #    本地还缓存着那条平台服务影子条目**（没刷新页面），也必须在这里被拦掉。
+    #    前端拉取只能治「显示」，治不了「能不能调」—— 准入判定只能放服务端。
+    # ⚠️ 带 `_gateway` 的请求是**用户 BYOK 直连自己的端点**（与平台供给无关），
+    #    绝不能拦：那些模型名从来没进过平台目录。见 app/platform_catalog.py 模块头。
+    if not body.params.get("_gateway"):
+        await platform_catalog.assert_model_available(
+            body.params.get("model") or body.params.get("model_name"))
     # BFF 按 type 的 mode 分流（async 透传网关 tasks / sync 阻塞直出），并记录请求日志。
     task = await tasks.submit(int(session["uid"]), body.type, body.params)
     return ok(task)
