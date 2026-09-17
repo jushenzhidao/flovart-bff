@@ -347,3 +347,46 @@ def test_suspended_model_returns_unified_shell_over_http(store):
     assert "gemini-3.1-flash-image" in body["message"]
     assert "detail" not in body, "必须返回统一响应壳，否则前端只能显示『请求失败(409)』"
     assert body["data"]["reason"] == "removed"
+
+
+# ---------------------------------------------------------------------------
+# 7) 模型级下架（suspendedModels，2026-09-17 飞哥：下架/上架解耦到具体模型）
+# ---------------------------------------------------------------------------
+def test_service_level_publish_ignores_suspended_models(store):
+    """上架条目里被模型级下架的模型：不计入已发布、闸门拦截（reason=suspended）。"""
+    asyncio.run(_put([_svc("s1", "A", ["m1", "m2", "m3"], suspendedModels=["m2"])]))
+    state = asyncio.run(catalog.read_state(force=True))
+    assert set(state["published"]) == {"m1", "m3"}
+    with pytest.raises(ModelSuspendedError) as ei:
+        asyncio.run(catalog.assert_model_available("m2"))
+    assert ei.value.reason == "suspended"
+    asyncio.run(catalog.assert_model_available("m1"))
+    asyncio.run(catalog.assert_model_available("m3"))
+
+
+def test_model_level_resume_restores_gate(store):
+    """模型级下架 → 恢复：重新进入已发布集，撤回集自愈放行。"""
+    asyncio.run(_put([_svc("s1", "A", ["m1", "m2"], suspendedModels=["m1"])]))
+    with pytest.raises(ModelSuspendedError):
+        asyncio.run(catalog.assert_model_available("m1"))
+    asyncio.run(_put([_svc("s1", "A", ["m1", "m2"])]))
+    asyncio.run(catalog.assert_model_available("m1"))
+
+
+def test_suspended_whole_service_ignores_suspended_models(store):
+    """整体下架 + 模型级清单并存：全部模型都拦，互不冲突。"""
+    asyncio.run(_put([_svc("s1", "A", ["m1", "m2"], suspended=True, suspendedModels=["m2"])]))
+    for m in ("m1", "m2"):
+        with pytest.raises(ModelSuspendedError):
+            asyncio.run(catalog.assert_model_available(m))
+
+
+def test_sanitize_keeps_suspended_models_clean(store):
+    """白名单放行 + 类型兜底：非列表丢弃、空串剔除、去重保序。"""
+    asyncio.run(_put([{"id": "s1", "name": "A", "models": ["m1", "m2"],
+                       "suspendedModels": ["m2", "m2", " ", "m1"]}]))
+    svc = store.doc["payload"]["services"][0]
+    assert svc["suspendedModels"] == ["m2", "m1"]
+
+    asyncio.run(_put([{"id": "s1", "name": "A", "models": ["m1"], "suspendedModels": "m2"}]))
+    assert "suspendedModels" not in store.doc["payload"]["services"][0]

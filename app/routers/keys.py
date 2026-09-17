@@ -3,14 +3,15 @@
 创作站前端把 Provider 地址指向 new-api `{base}/v1`、用这里创建的 Key 注入
 keyVault，即完成「平台供 Key」改造 —— 模型统一走运营方渠道，用户不自带 Key。
 """
+import json
 import logging
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from .. import config, newapi_client as na, platform_catalog
+from .. import cloudstore, config, newapi_client as na, platform_catalog
 from ..resp import fail, ok
-from ..security import require_session
+from ..security import decrypt_secret, encrypt_secret, require_session
 
 logger = logging.getLogger("bff.keys")
 
@@ -144,3 +145,59 @@ async def user_model_catalog(session: dict = Depends(require_session)):
         logger.warning("用户态模型目录获取失败，回落全站列表 uid=%s: %s", session.get("uid"), e)
     models = await platform_catalog.filter_available(await na.admin_enabled_models())
     return ok({"items": models, "total": len(models), "scoped": False})
+
+
+# ─── 用户 AI 服务配置云端同步（接口1，2026-09-17 飞哥需求）────────────────────
+#
+# 需求：管理员/普通用户配置的 AI 服务（BYOK 卡片）不再只存浏览器 localStorage，
+# 而是存到服务器 —— 换设备登录同一账号，直接看到之前配置的服务。
+#
+# 安全：前端把「自己的 AI 服务」数组（**已剔除平台影子条目**，那是服务端下发的
+# 派生数据，不能回存）整体 JSON 后交给这里；服务端用 AES-256-GCM（security.
+# encrypt_secret，与服务端会话同一把主密钥）加密后再落 cloudstore。
+# DB 泄漏拿不到明文 key；传输走 HTTPS + 会话 Cookie。
+#
+# 同步语义（v1，Last-Write-Wins）：
+#   - 登录后前端先 GET：服务器有 → 整体采纳（替换本地 own keys）；
+#     服务器没有而本地有 → 推上去。
+#   - 之后本地每次改动（防抖）→ PUT 整体覆盖。多设备并发编辑以后到者胜。
+
+_USER_SERVICES_SCOPE = "user_keys"
+_USER_SERVICES_DOC = "ai_services"
+_USER_SERVICES_MAX_KEYS = 200
+
+
+class AiServicesBody(BaseModel):
+    keys: list[dict]
+
+
+@router.get("/api/user/ai-services")
+async def get_user_ai_services(session: dict = Depends(require_session)):
+    """读当前用户的 AI 服务配置（返回解密后的 keys 数组与更新时间）。"""
+    doc = await cloudstore.doc_get(session["uid"], _USER_SERVICES_SCOPE, _USER_SERVICES_DOC)
+    if not doc:
+        return ok({"keys": [], "updated_at": None})
+    payload = doc.get("payload") or {}
+    blob = payload.get("blob")
+    keys: list = []
+    if blob:
+        try:
+            decrypted = json.loads(decrypt_secret(str(blob)))
+            if isinstance(decrypted, list):
+                keys = decrypted
+        except Exception as e:  # noqa: BLE001 — 密钥轮换/损坏时按空处理，不让 GET 500
+            logger.warning("用户 AI 服务配置解密失败 uid=%s: %s", session["uid"], e)
+    return ok({"keys": keys, "updated_at": doc.get("updated_at")})
+
+
+@router.put("/api/user/ai-services")
+async def put_user_ai_services(body: AiServicesBody, session: dict = Depends(require_session)):
+    """覆盖保存当前用户的 AI 服务配置（整体替换，Last-Write-Wins）。"""
+    if len(body.keys) > _USER_SERVICES_MAX_KEYS:
+        raise HTTPException(status_code=413, detail=f"AI 服务数量超过上限 {_USER_SERVICES_MAX_KEYS}")
+    blob = encrypt_secret(json.dumps(body.keys, ensure_ascii=False))
+    if len(blob) > 512 * 1024:
+        raise HTTPException(status_code=413, detail="AI 服务配置体积过大")
+    doc = await cloudstore.doc_put(
+        session["uid"], _USER_SERVICES_SCOPE, _USER_SERVICES_DOC, {"blob": blob})
+    return ok({"updated_at": doc.get("updated_at"), "count": len(body.keys)})

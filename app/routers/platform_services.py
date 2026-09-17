@@ -66,6 +66,7 @@
       "routeMappings": [...],
       "extraConfig": {...},          // 不含 flovart_platform（由前端注入时打标）
       "suspended": false,            // ⭐ 下架标记：true = 用户侧不注入 + 调用被闸门拒绝
+      "suspendedModels": [],         // ⭐ 模型级下架（2026-09-17）：上架条目里被单独下架的模型名
       "updatedBy": "admin",          // 审计：最后修改者用户名
       "updatedAt": 1789106662000
     }
@@ -101,10 +102,12 @@ _ALLOWED_FIELDS = (
     "id", "provider", "name", "baseUrl", "key", "capabilities",
     "models", "customModels", "defaultModel", "imageGenModel", "imageGenMode",
     "videoGenModel", "videoGenMode", "routeMappings", "extraConfig",
-    "status", "websiteUrl", "suspended", "updatedAt",
+    "status", "websiteUrl", "suspended", "suspendedModels", "updatedAt",
 )
 
 _LIST_FIELDS = ("capabilities", "models", "customModels", "routeMappings")
+# ⚠️ suspendedModels 不进 _LIST_FIELDS：它有专属兜底（非列表=剔除键，而非强转空表），
+#    见 _sanitize 尾部 —— 否则字符串输入会被先转成 []，掩盖调用方的脏数据。
 
 
 def _sanitize(service: dict, username: str) -> dict:
@@ -136,6 +139,18 @@ def _sanitize(service: dict, username: str) -> dict:
     out["baseUrl"] = str(out.get("baseUrl") or "")
     # 下架标记归一化：前端可能传 true / 'true' / 1，统一成 bool（缺省 = 上架）。
     out["suspended"] = bool(out.get("suspended"))
+    # ⭐ 模型级下架清单（2026-09-17 飞哥：下架要解耦到具体模型）：
+    #   只保留非空字符串并去重保序；闸门侧用 platform_catalog.service_suspended_set 归一。
+    sm = out.get("suspendedModels")
+    if isinstance(sm, list):
+        seen: list[str] = []
+        for m in sm:
+            name = str(m or "").strip()
+            if name and name not in seen:
+                seen.append(name)
+        out["suspendedModels"] = seen
+    else:
+        out.pop("suspendedModels", None)
     out["updatedBy"] = username
     return out
 

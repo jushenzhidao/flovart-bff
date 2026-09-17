@@ -128,27 +128,56 @@ def is_suspended(service: dict) -> bool:
     return bool(isinstance(service, dict) and service.get("suspended"))
 
 
+def service_suspended_set(service: dict) -> set[str]:
+    """单条服务里被**模型级下架**的模型名（小写集合，2026-09-17 飞哥：下架要解耦到模型）。
+
+    `suspendedModels` 只在服务整体上架时生效；服务整体下架时它的全部模型
+    本来就不可用，无需再看这份清单。
+    """
+    if not isinstance(service, dict):
+        return set()
+    raw = service.get("suspendedModels")
+    if not isinstance(raw, list):
+        return set()
+    return {norm(m) for m in raw if str(m or "").strip()}
+
+
 def published_models(services: list) -> dict[str, str]:
-    """当前**已发布**的模型名 → 服务展示名（下架条目不计入）。键为小写。"""
+    """当前**已发布**的模型名 → 服务展示名。
+
+    不计入：①整体下架的条目；②上架条目里被模型级下架（`suspendedModels`）的模型。
+    """
     out: dict[str, str] = {}
     for s in services:
         if not isinstance(s, dict) or is_suspended(s):
             continue
         name = str(s.get("name") or "").strip()
+        hidden = service_suspended_set(s)
         for m in service_models(s):
+            if norm(m) in hidden:
+                continue
             out.setdefault(norm(m), name)
     return out
 
 
 def suspended_models(services: list) -> dict[str, str]:
-    """当前**被下架**条目的模型名 → 服务展示名（用于把错误说清楚）。"""
+    """当前**不可用**的模型名 → 服务展示名（用于把错误说清楚）。
+
+    两部分并集：①整体下架条目的全部模型；②上架条目里被模型级下架的模型。
+    """
     out: dict[str, str] = {}
     for s in services:
-        if not isinstance(s, dict) or not is_suspended(s):
+        if not isinstance(s, dict):
             continue
         name = str(s.get("name") or "").strip()
+        if is_suspended(s):
+            for m in service_models(s):
+                out.setdefault(norm(m), name)
+            continue
+        hidden = service_suspended_set(s)
         for m in service_models(s):
-            out.setdefault(norm(m), name)
+            if norm(m) in hidden:
+                out.setdefault(norm(m), name)
     return out
 
 
