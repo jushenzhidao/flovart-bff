@@ -11,7 +11,7 @@ import os
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from . import config, newapi_client as na, observability, store, tasks, oss, db
+from . import cloudstore, config, newapi_client as na, observability, store, tasks, oss, db
 from .newapi_client import NewApiError
 from .platform_catalog import ModelSuspendedError
 from .resp import ok
@@ -33,6 +33,14 @@ async def _lifespan(_app: FastAPI):
         config.NEWAPI_ADMIN_USERNAME and config.NEWAPI_ADMIN_PASSWORD
     ):
         logger.error("管理员凭证未配置：注册（影子建号）/ 加额度 / 管理台不可用。")
+    # 启动兜底：同步出图是进程内后台协程，进程重启会丢在途任务 → 对应行永远停在
+    # submitted（僵尸行，干扰排障）。启动时把超过 6 小时仍未终态的 submitted 标 failed。
+    try:
+        swept = await cloudstore.request_log_fail_stale(hours=6)
+        if swept:
+            logger.warning("启动清扫：%s 条超时 submitted 请求标记为 failed（服务重启丢任务）", swept)
+    except Exception:  # noqa: BLE001 —— 清扫失败不阻塞启动
+        logger.exception("启动清扫 stale submitted 失败")
     # 图片任务（同步/异步双模式）：BFF 不跑 worker；异步透传网关、同步阻塞直出后落盘，
     # 每次提交写一条请求日志（落 PG，见 app/tasks.py）。只需归还 httpx 连接池。
     yield

@@ -47,12 +47,18 @@ logger = logging.getLogger("bff.newapi")
 
 
 class NewApiError(Exception):
-    """new-api 返回业务失败或网络错误。message 可直接展示给用户。"""
+    """new-api 返回业务失败或网络错误。message 可直接展示给用户。
 
-    def __init__(self, message: str, status_code: int = 502):
+    detail：底层真实原因（异常类型+原文 / 上游响应预览），只进请求日志
+    （request_log.result.error.detail）与服务器日志，不直接展示给用户——
+    此前网络层异常只留通用文案，日志里查不到具体原因（2026-09-18 图生图 502 血案）。
+    """
+
+    def __init__(self, message: str, status_code: int = 502, detail: str = ""):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.detail = detail
 
 
 _client: Optional[httpx.AsyncClient] = None
@@ -248,8 +254,9 @@ async def request(method: str, path: str, *, headers: dict, json: Any = None,
     cli = client or get_client()
     try:
         resp = await cli.request(method, path, headers=headers, json=json, params=params)
-    except httpx.HTTPError:
-        raise NewApiError("上游服务暂时不可用，请稍后重试", 502)
+    except httpx.HTTPError as e:
+        raise NewApiError("上游服务暂时不可用，请稍后重试", 502,
+                          detail=f"{type(e).__name__}: {e}") from e
     return _parse_response(resp, method, path)
 
 
@@ -297,13 +304,14 @@ def _parse_response(resp: "httpx.Response", method: str, target: str) -> Any:
         )
         # 网关把未知路由兜底成前端 SPA（text/html）——说明该后端端点根本没实现/路径拼错，
         # 不是偶发上游异常。给前端一个能直接看懂的提示，避免被「上游返回异常」误导。
+        preview = f"status={resp.status_code} content_type={content_type} body_preview={text[:300]}"
         if "text/html" in content_type:
             raise NewApiError(
                 f"网关未实现该图片端点（{target} 返回了前端页面而非 JSON）。"
                 f"请确认网关已落地图片接口，或核对同步/异步端点路径配置。",
-                502,
+                502, detail=preview,
             )
-        raise NewApiError("上游返回异常（非 JSON）", 502)
+        raise NewApiError("上游返回异常（非 JSON）", 502, detail=preview)
     if isinstance(body, dict) and body.get("success") is False:
         raise NewApiError(body.get("message") or "操作失败", 400)
     return body
@@ -339,8 +347,9 @@ async def request_external(method: str, url: str, *, api_key: str,
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     try:
         resp = await cli.request(method, url, headers=headers, json=json)
-    except httpx.HTTPError:
-        raise NewApiError("上游服务暂时不可用，请稍后重试", 502)
+    except httpx.HTTPError as e:
+        raise NewApiError("上游服务暂时不可用，请稍后重试", 502,
+                          detail=f"{type(e).__name__}: {e}") from e
     return _parse_response(resp, method, url)
 
 

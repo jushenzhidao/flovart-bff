@@ -469,3 +469,19 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
   `docker logs --since 24h flovart-bff > /root/bff-logs/$(date +%F).log 2>&1`
 - 真要常驻文件日志，得改代码加 `FileHandler` + 在 compose 挂一个卷（**不要**写 /app 下，
   read_only 会抛 Errno 30）。当前三重覆盖（stdout / Logfire / Nginx）已够，无审计需求不必加。
+
+## 八、管理员账号分家（2026-09-18 拍板，待执行）
+
+事故驱动：USER_SESSION_ISSUANCE_LIMIT（默认100次/24h、按账号计、DB计数）被
+自动登录脚本+双BFF共用账号打爆 → 飞哥一天登不进面板。
+
+死循环：人用账密登录测试站 → na.login 会 GenerateAccessToken 轮换该账号 PAT
+→ BFF 配置的 PAT 作废 401 → BFF 兜底账密重登 → 再轮换+烧签发额度。
+
+执行清单（与上文「最高优先级待办」合流）：
+1. new-api 面板建 `flovart-admin`（role≥10，强密码）
+2. 服务器 flovart-bff `.env`：换 UID/USERNAME/PASSWORD，**NEWAPI_ADMIN_PAT 留空**
+   → 冷启登录一次落盘 /data/admin_cred.json，之后恒走 PAT
+3. hewapi 不动（继续 uid=1）→ 互踢根治
+4. new-api .env：USER_SESSION_ISSUANCE_LIMIT=10000 防呆
+5. 🔴 纪律：机器账号密码只存服务器 .env，绝不进浏览器/登录表单

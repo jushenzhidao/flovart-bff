@@ -20,7 +20,7 @@ import os
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from . import config
@@ -86,6 +86,10 @@ class _Meta:
         raise NotImplementedError
 
     async def reqlog_list(self, uid, limit, offset) -> list:
+        raise NotImplementedError
+
+    async def reqlog_fail_stale(self, hours: int) -> int:
+        """启动兜底：把「submitted 且超过 hours」的行标 failed（进程重启丢在途后台任务）。返回条数。"""
         raise NotImplementedError
 
     # ---- 素材共享（A 点对点：指定 new-api 用户）----
@@ -267,6 +271,17 @@ class PgMeta(_Meta):
                 ORDER BY created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}""",
             *args, limit, offset)
         return [_pg_reqlog_summary(r) for r in rows], int(total)
+
+    async def reqlog_fail_stale(self, hours: int) -> int:
+        stale = json.dumps({"error": _STALE_SUBMITTED_ERROR}, ensure_ascii=False,
+                           separators=(",", ":"))
+        pool = await self._c()
+        tag = await pool.execute(
+            """UPDATE cloud_request_log
+               SET status='failed', result=$1, updated_at=now()
+               WHERE status='submitted' AND created_at < now() - make_interval(hours => $2)""",
+            stale, hours)
+        return int(tag.split()[-1]) if tag and tag.startswith("UPDATE") else 0
 
     # ---- 素材共享：A 点对点 ----
     async def share_put_batch(self, owner_uid, target_uid, perm, name_map, keys):
@@ -601,6 +616,34 @@ class LocalMeta(_Meta):
             return [dict(r) for r in rows], int(total)
         return await asyncio.to_thread(_)
 
+    async def reqlog_fail_stale(self, hours: int) -> int:
+        def _():
+            conn = self._connect()
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+            stale = json.dumps({"error": _STALE_SUBMITTED_ERROR}, ensure_ascii=False,
+                               separators=(",", ":"))
+            rows = conn.execute(
+                "SELECT request_id, created_at FROM cloud_request_log WHERE status='submitted'"
+            ).fetchall()
+            n = 0
+            for r in rows:
+                try:
+                    created = datetime.fromisoformat(str(r["created_at"]))
+                except ValueError:
+                    continue
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                if created < cutoff:
+                    conn.execute(
+                        """UPDATE cloud_request_log
+                           SET status='failed', result=?, updated_at=?
+                           WHERE request_id=? AND status='submitted'""",
+                        (stale, _utcnow(), r["request_id"]))
+                    n += 1
+            conn.commit()
+            return n
+        return await asyncio.to_thread(_)
+
     # ---- 素材共享（LocalMeta 补齐：之前漏实现导致 SQLite 回退后端共享 500）----
     async def media_index_get_by_key(self, key):
         def _():
@@ -865,6 +908,15 @@ async def storage_overview(uid: int) -> dict:
 
 
 # ---------------- 请求日志 ----------------
+# 启动清扫的落库错误：进程重启会丢在途后台同步任务（asyncio.create_task），
+# 对应行永远停在 submitted（2026-09-18 测试环境实测 3 条僵尸行），启动时统一标 failed。
+_STALE_SUBMITTED_ERROR = {
+    "message": "任务因服务重启丢失，请重试",
+    "type": "stale_submitted",
+    "status": 502,
+    "stage": "startup_sweep",
+}
+
 # 注：strip_b64 是日志层公共设施（console 管理员详情 / chat 落库共用），
 # 放这里而不是某个 router，避免跨 router import。
 def strip_b64(obj, _max: int = 256):
@@ -895,6 +947,11 @@ async def request_log_put(uid: int, request_id: str, kind: str, provider: str, m
 async def request_log_update(request_id: str, status=None, task_id=None,
                              gateway_request_id=None, result=None) -> None:
     await META.reqlog_update(request_id, status, task_id, gateway_request_id, result)
+
+
+async def request_log_fail_stale(hours: int = 6) -> int:
+    """启动兜底：把超时未终态的 submitted 行标 failed（进程重启丢在途后台任务）。返回条数。"""
+    return await META.reqlog_fail_stale(hours)
 
 
 async def request_log_get(request_id: str) -> Optional[dict]:

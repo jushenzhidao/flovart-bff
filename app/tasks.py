@@ -496,8 +496,9 @@ async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dic
         raw = await _gw_call("POST", path, uid, json=params, client=_sync_client())
     except Exception as e:  # noqa: BLE001
         err = _error_record(e, "gateway_sync_error", "request", path=path, uid=uid)
-        logger.warning("网关同步调用失败 uid=%s req=%s path=%s err=%s",
-                       uid, request_id, path, err["error"]["message"])
+        logger.warning("网关同步调用失败 uid=%s req=%s path=%s err=%s detail=%s",
+                       uid, request_id, path, err["error"]["message"],
+                       err["error"].get("detail", ""))
         await cloudstore.request_log_update(request_id, status="failed", result=err)
         raise
     gw_req_id = _extract_gw_request_id(raw)
@@ -537,6 +538,7 @@ def _error_record(exc: BaseException, err_type: str, stage: str,
     """
     msg = getattr(exc, "message", None) or str(exc) or exc.__class__.__name__
     status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    detail = getattr(exc, "detail", None) or ""
     err = {
         "error": {
             "message": str(msg),
@@ -545,6 +547,9 @@ def _error_record(exc: BaseException, err_type: str, stage: str,
             "stage": stage,
         }
     }
+    if detail:
+        # 底层真实原因（httpx 异常类型+原文 / 上游非 JSON 响应预览），排障专用
+        err["error"]["detail"] = str(detail)
     if url:
         err["error"]["url"] = url
     if path:
