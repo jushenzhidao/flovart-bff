@@ -100,7 +100,8 @@ PLATFORM_DOC_KEY = catalog.PLATFORM_DOC_KEY
 # 内部标记；白名单能保证共享出去的东西是「可预期的一小组」。
 _ALLOWED_FIELDS = (
     "id", "provider", "name", "baseUrl", "key", "capabilities",
-    "models", "customModels", "defaultModel", "imageGenModel", "imageGenMode",
+    "models", "customModels", "defaultModel", "isDefault",
+    "imageGenModel", "imageGenMode",
     "videoGenModel", "videoGenMode", "routeMappings", "extraConfig",
     "status", "websiteUrl", "suspended", "suspendedModels", "updatedAt",
 )
@@ -139,6 +140,10 @@ def _sanitize(service: dict, username: str) -> dict:
     out["baseUrl"] = str(out.get("baseUrl") or "")
     # 下架标记归一化：前端可能传 true / 'true' / 1，统一成 bool（缺省 = 上架）。
     out["suspended"] = bool(out.get("suspended"))
+    # ⭐ 默认服务标记（2026-09-17 飞哥：管理员「设为默认」要对用户生效）：
+    #   归一成 bool（缺省 = 非默认）。用户影子条目据此继承 isDefault，
+    #   是 resolveWorkflowDefaultModel 在普通用户侧选默认模型的唯一依据。
+    out["isDefault"] = bool(out.get("isDefault"))
     # ⭐ 模型级下架清单（2026-09-17 飞哥：下架要解耦到具体模型）：
     #   只保留非空字符串并去重保序；闸门侧用 platform_catalog.service_suspended_set 归一。
     sm = out.get("suspendedModels")
