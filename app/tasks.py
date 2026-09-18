@@ -489,11 +489,86 @@ async def _run_sync_safe(uid: int, request_id: str, kind: str, path: str, params
         logger.exception("同步任务后台执行异常 uid=%s req=%s path=%s", uid, request_id, path)
 
 
+def _is_gemini_image_model(model: str) -> bool:
+    """gemini 系图片模型（Nano Banana 等）：走网关 /v1beta 原生端点而非 images 端点。
+
+    2026-09-18 血案：chatfire 的 /v1/images/generations 只认「图片模型分类」，
+    gemini-*-image 全部 400（images endpoint requires an image model）；且网关渠道
+    （Gemini 类型）只吃原生 generateContent 格式。
+    """
+    m = (model or "").strip().lower()
+    return m.startswith("gemini") and "image" in m
+
+
+async def _gemini_inline_parts(images: Any) -> list:
+    """把 OpenAI 风格 image[]（data URL / http URL）转成 Gemini inlineData parts。"""
+    parts: list = []
+    for href in images if isinstance(images, list) else []:
+        if not isinstance(href, str) or not href.strip():
+            continue
+        href = href.strip()
+        m = re.match(r"^data:([^;,]+)?;base64,(.*)$", href, re.S)
+        if m:
+            parts.append({"inlineData": {
+                "mimeType": m.group(1) or "image/png", "data": m.group(2)}})
+            continue
+        if href.startswith(("http://", "https://")):
+            # 用户链路理论恒为 data URL（前端 materialize）；http 兜底下载转 inline
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as cli:
+                    resp = await cli.get(href)
+                    resp.raise_for_status()
+                mime = (resp.headers.get("content-type") or "image/png").split(";")[0]
+                parts.append({"inlineData": {
+                    "mimeType": mime or "image/png",
+                    "data": base64.b64encode(resp.content).decode()}})
+            except Exception:  # noqa: BLE001 —— 单张参考图失败不拖死整个请求
+                logger.warning("gemini 参考图下载失败，已跳过: %s", href[:80])
+    return parts
+
+
+def _gemini_response_to_openai(raw: Any) -> Any:
+    """Gemini generateContent 响应 → OpenAI images 风格 {data:[{b64_json}]}。
+
+    非 Gemini 形状（错误体 / 上游兜底返回 OpenAI 格式）原样透传，不影响既有解析。
+    """
+    if not isinstance(raw, dict) or not raw.get("candidates"):
+        return raw
+    imgs, text_bits = [], []
+    for part in ((raw["candidates"][0].get("content") or {}).get("parts") or []):
+        inline = part.get("inlineData") or part.get("inline_data")
+        if isinstance(inline, dict) and inline.get("data"):
+            imgs.append({"b64_json": inline["data"]})
+        elif isinstance(part.get("text"), str) and part["text"]:
+            text_bits.append(part["text"])
+    if not imgs:
+        return raw
+    out: dict = {"data": imgs}
+    if text_bits:
+        out["gemini_text"] = "".join(text_bits)
+    return out
+
+
 async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dict) -> dict:
     # 同 _run_external：失败必须留痕（catch 所有异常 + 写 result），否则 status=failed 却查不到原因。
     try:
         # ⚠️ 同异步分支：/v1 只认用户 sk-，不能用管理员 PAT（否则 401）。
-        raw = await _gw_call("POST", path, uid, json=params, client=_sync_client())
+        model = (params.get("model") or params.get("model_name") or "")
+        use_gemini = _is_gemini_image_model(model)
+        if use_gemini:
+            # Gemini 原生协议：网关渠道为 Gemini 类型，只吃 generateContent 格式
+            # （chatfire 对 gemini 图片模型：images 端点 400「requires an image model」）。
+            path = f"v1beta/models/{model}:generateContent"
+            payload: dict = {"contents": [{
+                "role": "user",
+                "parts": [{"text": str(params.get("prompt") or "")}]
+                + await _gemini_inline_parts(params.get("image")),
+            }]}
+        else:
+            payload = params
+        raw = await _gw_call("POST", path, uid, json=payload, client=_sync_client())
+        if use_gemini:
+            raw = _gemini_response_to_openai(raw)
     except Exception as e:  # noqa: BLE001
         err = _error_record(e, "gateway_sync_error", "request", path=path, uid=uid)
         logger.warning("网关同步调用失败 uid=%s req=%s path=%s err=%s detail=%s",
