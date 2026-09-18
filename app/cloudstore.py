@@ -238,6 +238,36 @@ class PgMeta(_Meta):
             uid, limit, offset)
         return [_pg_reqlog_summary(r) for r in rows]
 
+    async def reqlog_admin_list(self, uid, kind, status, model, limit, offset):
+        """管理员视角查询请求日志（console）：filters 全部可选；返回 (items, total)。
+
+        uid=None 不过滤用户；kind/status 精确匹配；model 子串匹配（ILIKE）。
+        """
+        pool = await self._c()
+        where, args = [], []
+        if uid is not None:
+            args.append(uid)
+            where.append(f"uid=${len(args)}")
+        if kind:
+            args.append(kind)
+            where.append(f"kind=${len(args)}")
+        if status:
+            args.append(status)
+            where.append(f"status=${len(args)}")
+        if model:
+            args.append(f"%{model}%")
+            where.append(f"model ILIKE ${len(args)}")
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        total = await pool.fetchval(
+            f"SELECT COUNT(*) FROM cloud_request_log {clause}", *args) or 0
+        rows = await pool.fetch(
+            f"""SELECT request_id, uid, kind, provider, model, status, task_id,
+                       gateway_request_id, mode, created_at, updated_at
+                FROM cloud_request_log {clause}
+                ORDER BY created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}""",
+            *args, limit, offset)
+        return [_pg_reqlog_summary(r) for r in rows], int(total)
+
     # ---- 素材共享：A 点对点 ----
     async def share_put_batch(self, owner_uid, target_uid, perm, name_map, keys):
         pool = await self._c()
@@ -330,10 +360,11 @@ def _pg_reqlog_row(row) -> dict:
 
 def _pg_reqlog_summary(row) -> dict:
     return {
-        "request_id": row["request_id"], "kind": row["kind"], "provider": row["provider"],
-        "model": row["model"], "status": row["status"], "task_id": row["task_id"],
-        "gateway_request_id": row["gateway_request_id"], "mode": row["mode"],
-        "created_at": _iso(row["created_at"]), "updated_at": _iso(row["updated_at"]),
+        "request_id": row["request_id"], "uid": row["uid"], "kind": row["kind"],
+        "provider": row["provider"], "model": row["model"], "status": row["status"],
+        "task_id": row["task_id"], "gateway_request_id": row["gateway_request_id"],
+        "mode": row["mode"], "created_at": _iso(row["created_at"]),
+        "updated_at": _iso(row["updated_at"]),
     }
 
 
@@ -545,6 +576,31 @@ class LocalMeta(_Meta):
         rows = await asyncio.to_thread(_)
         return [_local_reqlog_summary(r) for r in rows]
 
+    async def reqlog_admin_list(self, uid, kind, status, model, limit, offset):
+        """管理员视角查询请求日志（Local 兜底，与 PgMeta 同契约）。"""
+        def _():
+            conn = self._connect()
+            where, args = [], []
+            if uid is not None:
+                where.append("uid=?"); args.append(uid)
+            if kind:
+                where.append("kind=?"); args.append(kind)
+            if status:
+                where.append("status=?"); args.append(status)
+            if model:
+                where.append("model LIKE ?"); args.append(f"%{model}%")
+            clause = ("WHERE " + " AND ".join(where)) if where else ""
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM cloud_request_log {clause}", args).fetchone()[0]
+            rows = conn.execute(
+                f"""SELECT request_id, uid, kind, provider, model, status, task_id,
+                           gateway_request_id, mode, created_at, updated_at
+                    FROM cloud_request_log {clause}
+                    ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                args + [limit, offset]).fetchall()
+            return [dict(r) for r in rows], int(total)
+        return await asyncio.to_thread(_)
+
     # ---- 素材共享（LocalMeta 补齐：之前漏实现导致 SQLite 回退后端共享 500）----
     async def media_index_get_by_key(self, key):
         def _():
@@ -657,10 +713,10 @@ def _local_reqlog_row(row) -> dict:
 
 def _local_reqlog_summary(row) -> dict:
     return {
-        "request_id": row["request_id"], "kind": row["kind"], "provider": row["provider"],
-        "model": row["model"], "status": row["status"], "task_id": row["task_id"],
-        "gateway_request_id": row["gateway_request_id"], "mode": row["mode"],
-        "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "request_id": row["request_id"], "uid": row["uid"], "kind": row["kind"],
+        "provider": row["provider"], "model": row["model"], "status": row["status"],
+        "task_id": row["task_id"], "gateway_request_id": row["gateway_request_id"],
+        "mode": row["mode"], "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
 
 
@@ -808,6 +864,29 @@ async def storage_overview(uid: int) -> dict:
     return await META.overview(uid)
 
 
+# ---------------- 请求日志 ----------------
+# 注：strip_b64 是日志层公共设施（console 管理员详情 / chat 落库共用），
+# 放这里而不是某个 router，避免跨 router import。
+def strip_b64(obj, _max: int = 256):
+    """递归把超长 base64 / data-uri 字段替换成占位符（日志只需诊断信息，不必存几 MB 图片）。"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if (kl in ("b64_json", "b64", "image_base64", "base64")
+                    and isinstance(v, str) and len(v) > _max):
+                out[k] = f"<base64:{len(v)} chars>"
+            elif (kl == "url" and isinstance(v, str) and v.startswith("data:")
+                  and len(v) > _max):
+                out[k] = f"<data-uri:{len(v)} chars>"
+            else:
+                out[k] = strip_b64(v, _max)
+        return out
+    if isinstance(obj, list):
+        return [strip_b64(x, _max) for x in obj]
+    return obj
+
+
 async def request_log_put(uid: int, request_id: str, kind: str, provider: str, model: str,
                           payload: dict, status: str, mode: str) -> None:
     await META.reqlog_put(uid, request_id, kind, provider, model, payload, status, mode)
@@ -824,6 +903,13 @@ async def request_log_get(request_id: str) -> Optional[dict]:
 
 async def request_log_list(uid: int, limit: int, offset: int) -> list:
     return await META.reqlog_list(uid, limit, offset)
+
+
+async def request_log_admin_list(uid=None, kind: str = "", status: str = "",
+                                 model: str = "", limit: int = 50,
+                                 offset: int = 0) -> "tuple[list, int]":
+    """管理员查询：uid=None 查全部；返回 (摘要列表, 总数)。"""
+    return await META.reqlog_admin_list(uid, kind, status, model, limit, offset)
 
 
 # ---------------- 素材共享（A 点对点：指定 new-api 用户）----------------

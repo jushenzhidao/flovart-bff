@@ -11,7 +11,7 @@ import re
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, Field
 
-from .. import config, image_model_modes, newapi_client as na, promo
+from .. import config, cloudstore, image_model_modes, newapi_client as na, promo
 from ..resp import fail, ok
 from ..security import require_admin
 
@@ -251,7 +251,70 @@ async def console_image_models(_s: dict = Depends(require_admin)):
 
 @router.post("/api/console/image-models")
 async def console_set_image_model_mode(body: ImageModelModeBody,
-                                        _s: dict = Depends(require_admin)):
+                                       _s: dict = Depends(require_admin)):
     """设置某图片模型的同步/异步模式。生图时 BFF 按 params.model 查此项覆盖全局默认。"""
     image_model_modes.set_mode(body.model, body.mode)
     return ok({"model": body.model, "mode": body.mode})
+
+
+# ---------- 用户请求日志（管理员视角）----------
+def _strip_b64(obj, _max=256):
+    """兼容别名：实现已上移 cloudstore.strip_b64（chat 落库也要用）。"""
+    return cloudstore.strip_b64(obj, _max)
+
+
+async def _uid_username_map(uids: set) -> dict:
+    """批量解析 uid→username（admin_list_users 翻页兜底，最多 5 页×100）。
+
+    失败不阻断主流程 —— 列表缺 username 只是展示降级，不是查询失败。
+    """
+    names: dict = {}
+    if not uids:
+        return names
+    try:
+        for page in range(1, 6):
+            d = await na.admin_list_users(page=page, page_size=100)
+            for u in d.get("items") or []:
+                if u.get("id") in uids:
+                    names[u["id"]] = u.get("username", "")
+            if len(names) >= len(uids) or len(d.get("items") or []) < 100:
+                break
+    except Exception:  # noqa: BLE001 —— 上游限流/不可达时降级为空映射
+        pass
+    return names
+
+
+@router.get("/api/console/requests")
+async def console_requests(username: str = "", uid: int = 0, kind: str = "",
+                           status: str = "", model: str = "",
+                           limit: int = 50, offset: int = 0,
+                           _s: dict = Depends(require_admin)):
+    """全站用户请求日志（cloud_request_log）。
+
+    筛选：username（精确，经 new-api 解析成 uid）/ uid 二选一；kind=image|video|chat…
+    status=submitted|processing|succeeded|failed|cancelled；model 子串匹配。
+    列表返回摘要行（含 username，不含 payload/result）；详情走 /{request_id}。
+    """
+    limit = min(max(1, limit), 200)
+    offset = max(0, offset)
+    filter_uid = int(uid) if uid else None
+    if username.strip():
+        filter_uid = await na.admin_resolve_uid_by_username(username.strip())
+    items, total = await cloudstore.request_log_admin_list(
+        filter_uid, kind.strip(), status.strip(), model.strip(), limit, offset)
+    names = await _uid_username_map({it["uid"] for it in items})
+    for it in items:
+        it["username"] = names.get(it["uid"], "")
+    return ok({"items": items, "total": total, "limit": limit, "offset": offset})
+
+
+@router.get("/api/console/requests/{request_id}")
+async def console_request_detail(request_id: str,
+                                 _s: dict = Depends(require_admin)):
+    """单条请求日志详情（完整 payload + result）。result 内超长 base64 替换为占位符。"""
+    row = await cloudstore.request_log_get(request_id)
+    if not row:
+        return fail("请求记录不存在", 404)
+    row["result"] = _strip_b64(row.get("result"))
+    row["payload"] = _strip_b64(row.get("payload"))
+    return ok(row)

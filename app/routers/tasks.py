@@ -15,14 +15,19 @@ BFF 同时兼容同步 / 异步（见 app/tasks.TASK_TYPES）：
 网关 4xx/5xx 由 newapi_client 抛 NewApiError，经 main 异常处理器原样透传前端
 （如 404=任务不存在/越权，429=网关限流，502=网关错误）。
 """
+import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .. import cloudstore, platform_catalog, tasks
+from ..platform_catalog import ModelSuspendedError
 from ..resp import ok
 from ..security import require_session
+
+logger = logging.getLogger("bff.tasks_router")
 
 router = APIRouter()
 
@@ -44,8 +49,26 @@ async def create_task(body: SubmitBody, session: dict = Depends(require_session)
     # ⚠️ 带 `_gateway` 的请求是**用户 BYOK 直连自己的端点**（与平台供给无关），
     #    绝不能拦：那些模型名从来没进过平台目录。见 app/platform_catalog.py 模块头。
     if not body.params.get("_gateway"):
-        await platform_catalog.assert_model_available(
-            body.params.get("model") or body.params.get("model_name"))
+        model_name = body.params.get("model") or body.params.get("model_name") or ""
+        try:
+            await platform_catalog.assert_model_available(model_name)
+        except ModelSuspendedError as e:
+            # 409 拦截也必须留痕（此前直接 raise，请求日志里查无此调用 ——
+            # 飞哥 2026-09-18：「失败但日志全空」盲区之一）。
+            # status=failed + mode=blocked：管理台 /api/console/requests 可筛。
+            req_id = uuid.uuid4().hex
+            try:
+                await cloudstore.request_log_put(
+                    int(session["uid"]), req_id, body.type, "gateway",
+                    model_name, cloudstore.strip_b64({**body.params}),
+                    status="failed", mode="blocked")
+                await cloudstore.request_log_update(
+                    req_id, result={"code": e.code, "reason": e.reason,
+                                    "message": e.message})
+            except Exception as log_err:  # noqa: BLE001 —— 记日志失败绝不能盖掉 409 本身
+                logger.warning("409 拦截日志落库失败 uid=%s model=%s: %s",
+                               session.get("uid"), model_name, log_err)
+            raise
     # BFF 按 type 的 mode 分流（async 透传网关 tasks / sync 阻塞直出），并记录请求日志。
     task = await tasks.submit(int(session["uid"]), body.type, body.params)
     return ok(task)
