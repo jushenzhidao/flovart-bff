@@ -60,7 +60,8 @@ class _Meta:
     async def doc_list(self, uid, scope) -> list:
         raise NotImplementedError
 
-    async def media_index_put(self, uid, key, kind, mime, size) -> None:
+    async def media_index_put(self, uid, key, kind, mime, size,
+                              source_request_id=None, source_kind=None) -> None:
         raise NotImplementedError
 
     async def media_index_get(self, uid, key) -> Optional[dict]:
@@ -160,23 +161,30 @@ class PgMeta(_Meta):
         return [{"doc_key": r["doc_key"], "revision": r["revision"], "updated_at": _iso(r["updated_at"])}
                 for r in rows]
 
-    async def media_index_put(self, uid, key, kind, mime, size):
+    async def media_index_put(self, uid, key, kind, mime, size,
+                              source_request_id=None, source_kind=None):
         pool = await self._c()
         now = datetime.now(timezone.utc)
         await pool.execute(
-            "INSERT INTO cloud_media(uid, media_key, kind, mime, size, created_at, updated_at) "
-            "VALUES($1,$2,$3,$4,$5,$6,$6)",
-            uid, key, kind or "media", mime or "application/octet-stream", size, now)
+            "INSERT INTO cloud_media(uid, media_key, kind, mime, size, "
+            "source_request_id, source_kind, created_at, updated_at) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)",
+            uid, key, kind or "media", mime or "application/octet-stream", size,
+            source_request_id, source_kind, now)
 
     async def media_index_get(self, uid, key):
         pool = await self._c()
         row = await pool.fetchrow(
-            "SELECT media_key, kind, mime, size, created_at FROM cloud_media WHERE uid=$1 AND media_key=$2",
+            "SELECT media_key, kind, mime, size, source_request_id, source_kind, created_at "
+            "FROM cloud_media WHERE uid=$1 AND media_key=$2",
             uid, key)
         if not row:
             return None
         return {"media_key": row["media_key"], "kind": row["kind"], "mime": row["mime"],
-                "size": row["size"], "created_at": _iso(row["created_at"])}
+                "size": row["size"],
+                "source_request_id": row["source_request_id"],
+                "source_kind": row["source_kind"],
+                "created_at": _iso(row["created_at"])}
 
     async def media_index_delete(self, uid, key):
         pool = await self._c()
@@ -271,6 +279,22 @@ class PgMeta(_Meta):
                 ORDER BY created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}""",
             *args, limit, offset)
         return [_pg_reqlog_summary(r) for r in rows], int(total)
+
+    async def reqlog_history(self, uid, limit, offset, kind=""):
+        """用户历史记录（含完整 params/result，供历史页 + 一键同款）。返回 (items, total)。"""
+        pool = await self._c()
+        where, args = ["uid=$1"], [uid]
+        if kind:
+            args.append(kind)
+            where.append(f"kind=${len(args)}")
+        clause = "WHERE " + " AND ".join(where)
+        total = await pool.fetchval(
+            f"SELECT COUNT(*) FROM cloud_request_log {clause}", *args) or 0
+        rows = await pool.fetch(
+            f"SELECT * FROM cloud_request_log {clause} "
+            f"ORDER BY created_at DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}",
+            *args, limit, offset)
+        return [_pg_reqlog_row(r) for r in rows], int(total)
 
     async def reqlog_fail_stale(self, hours: int) -> int:
         stale = json.dumps({"error": _STALE_SUBMITTED_ERROR}, ensure_ascii=False,
@@ -410,6 +434,8 @@ class LocalMeta(_Meta):
                 CREATE TABLE IF NOT EXISTS cloud_media(
                     uid INTEGER NOT NULL, media_key TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'media',
                     mime TEXT NOT NULL DEFAULT 'application/octet-stream', size INTEGER NOT NULL DEFAULT 0,
+                    source_request_id TEXT, source_kind TEXT,
+                    width INTEGER, height INTEGER, thumb_key TEXT, deleted_at TEXT,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS idx_cloud_media_uid ON cloud_media(uid);
                 CREATE TABLE IF NOT EXISTS cloud_request_log(
@@ -431,6 +457,15 @@ class LocalMeta(_Meta):
                 CREATE INDEX IF NOT EXISTS idx_shares_owner ON cloud_media_shares(owner_uid);
                 CREATE INDEX IF NOT EXISTS idx_shares_target ON cloud_media_shares(target_uid);
             """)
+            # 存量库补列：CREATE TABLE IF NOT EXISTS 不会给旧表加新列（血缘列 2026-09-20）
+            existing = {r[1] for r in conn.execute("PRAGMA table_info(cloud_media)").fetchall()}
+            for col, ddl in (("source_request_id", "TEXT"), ("source_kind", "TEXT"),
+                             ("width", "INTEGER"), ("height", "INTEGER"),
+                             ("thumb_key", "TEXT"), ("deleted_at", "TEXT")):
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE cloud_media ADD COLUMN {col} {ddl}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cloud_media_src ON cloud_media(source_request_id)")
             conn.commit()
             self._local.conn = conn
         return conn
@@ -487,14 +522,17 @@ class LocalMeta(_Meta):
             return [dict(r) for r in rows]
         return await asyncio.to_thread(_)
 
-    async def media_index_put(self, uid, key, kind, mime, size):
+    async def media_index_put(self, uid, key, kind, mime, size,
+                              source_request_id=None, source_kind=None):
         def _():
             conn = self._connect()
             now = _utcnow()
             conn.execute(
-                "INSERT INTO cloud_media(uid, media_key, kind, mime, size, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (uid, key, kind or "media", mime or "application/octet-stream", size, now, now))
+                "INSERT INTO cloud_media(uid, media_key, kind, mime, size, "
+                "source_request_id, source_kind, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (uid, key, kind or "media", mime or "application/octet-stream", size,
+                 source_request_id, source_kind, now, now))
             conn.commit()
         return await asyncio.to_thread(_)
 
@@ -502,8 +540,8 @@ class LocalMeta(_Meta):
         def _():
             conn = self._connect()
             row = conn.execute(
-                "SELECT media_key, kind, mime, size, created_at FROM cloud_media "
-                "WHERE uid=? AND media_key=?", (uid, key)).fetchone()
+                "SELECT media_key, kind, mime, size, source_request_id, source_kind, created_at "
+                "FROM cloud_media WHERE uid=? AND media_key=?", (uid, key)).fetchone()
             return dict(row) if row else None
         return await asyncio.to_thread(_)
 
@@ -614,6 +652,23 @@ class LocalMeta(_Meta):
                     ORDER BY created_at DESC LIMIT ? OFFSET ?""",
                 args + [limit, offset]).fetchall()
             return [dict(r) for r in rows], int(total)
+        return await asyncio.to_thread(_)
+
+    async def reqlog_history(self, uid, limit, offset, kind=""):
+        def _():
+            conn = self._connect()
+            where, args = ["uid=?"], [uid]
+            if kind:
+                where.append("kind=?")
+                args.append(kind)
+            clause = "WHERE " + " AND ".join(where)
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM cloud_request_log {clause}", args).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT * FROM cloud_request_log {clause} "
+                f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
+            return [_local_reqlog_row(r) for r in rows], int(total)
         return await asyncio.to_thread(_)
 
     async def reqlog_fail_stale(self, hours: int) -> int:
@@ -864,7 +919,9 @@ async def doc_list(uid: int, scope: str) -> list:
     return await META.doc_list(uid, scope)
 
 
-async def media_put(uid: int, kind: str, mime: str, blob: bytes) -> dict:
+async def media_put(uid: int, kind: str, mime: str, blob: bytes,
+                    source_request_id: "str | None" = None,
+                    source_kind: "str | None" = None) -> dict:
     if len(blob) > MAX_MEDIA_BYTES:
         raise ValueError(f"单文件超过 {MAX_MEDIA_BYTES // (1024 * 1024)} MB")
     if config.OSS_ENFORCE_QUOTA and config.OSS_QUOTA_BYTES:
@@ -873,7 +930,9 @@ async def media_put(uid: int, kind: str, mime: str, blob: bytes) -> dict:
             raise ValueError("云存储配额不足，请联系管理员扩容")
     key = uuid.uuid4().hex
     await BLOB.put(uid, key, blob, mime, kind)
-    await META.media_index_put(uid, key, kind, mime, len(blob))
+    await META.media_index_put(uid, key, kind, mime, len(blob),
+                               source_request_id=source_request_id,
+                               source_kind=source_kind)
     return {"media_key": key, "size": len(blob), "mime": mime, "url": f"/api/me/media/{key}"}
 
 
@@ -960,6 +1019,16 @@ async def request_log_get(request_id: str) -> Optional[dict]:
 
 async def request_log_list(uid: int, limit: int, offset: int) -> list:
     return await META.reqlog_list(uid, limit, offset)
+
+
+async def request_log_history(uid: int, limit: int, offset: int, kind: str = "") -> dict:
+    """历史记录（含完整 params/result）：b64/data-uri 剥离成占位符，防止单页几 MB。"""
+    items, total = await META.reqlog_history(uid, limit, offset, kind)
+    for it in items:
+        it["payload"] = strip_b64(it.get("payload"))
+        if it.get("result") is not None:
+            it["result"] = strip_b64(it["result"])
+    return {"items": items, "total": total}
 
 
 async def request_log_admin_list(uid=None, kind: str = "", status: str = "",

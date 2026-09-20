@@ -140,7 +140,7 @@ def test_external_request_masks_api_key_before_persist(monkeypatch):
 
     monkeypatch.setattr(tasks.na, "request_external", ok)
 
-    async def fake_persist(task, task_id, uid, kind="image"):
+    async def fake_persist(task, task_id, uid, kind="image", request_id=None):
         return task
 
     monkeypatch.setattr(tasks, "_persist_outputs", fake_persist)
@@ -182,7 +182,7 @@ def test_upstream_empty_result_is_failed_not_succeeded(monkeypatch):
 
     monkeypatch.setattr(tasks.na, "request_external", empty_ok)
 
-    async def fake_persist(task, task_id, uid, kind="image"):
+    async def fake_persist(task, task_id, uid, kind="image", request_id=None):
         return task
 
     monkeypatch.setattr(tasks, "_persist_outputs", fake_persist)
@@ -209,7 +209,7 @@ def test_upstream_with_media_still_succeeds(monkeypatch):
 
     monkeypatch.setattr(tasks.na, "request_external", ok)
 
-    async def fake_persist(task, task_id, uid, kind="image"):
+    async def fake_persist(task, task_id, uid, kind="image", request_id=None):
         return task
 
     monkeypatch.setattr(tasks, "_persist_outputs", fake_persist)

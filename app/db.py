@@ -33,10 +33,17 @@ CREATE TABLE IF NOT EXISTS cloud_media(
     kind TEXT NOT NULL DEFAULT 'media',
     mime TEXT NOT NULL DEFAULT 'application/octet-stream',
     size BIGINT NOT NULL DEFAULT 0,
+    source_request_id TEXT,
+    source_kind TEXT,
+    width INTEGER,
+    height INTEGER,
+    thumb_key TEXT,
+    deleted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_cloud_media_uid ON cloud_media(uid);
+CREATE INDEX IF NOT EXISTS idx_cloud_media_src ON cloud_media(source_request_id);
 CREATE TABLE IF NOT EXISTS cloud_media_shares(
     id          TEXT PRIMARY KEY,
     owner_uid   BIGINT NOT NULL,
@@ -89,6 +96,20 @@ async def migrate() -> None:
         return
     async with _POOL.acquire() as conn:
         await conn.execute(SCHEMA)
+        # 存量库补列（CREATE TABLE IF NOT EXISTS 不会给旧表加新列）。
+        # 血缘列（2026-09-20）：media ↔ request_log 关联 + 预留（宽高/缩略图/软删）。
+        for col, ddl in (
+            ("source_request_id", "TEXT"),
+            ("source_kind", "TEXT"),
+            ("width", "INTEGER"),
+            ("height", "INTEGER"),
+            ("thumb_key", "TEXT"),
+            ("deleted_at", "TIMESTAMPTZ"),
+        ):
+            await conn.execute(
+                f"ALTER TABLE cloud_media ADD COLUMN IF NOT EXISTS {col} {ddl}")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cloud_media_src ON cloud_media(source_request_id)")
 
 
 async def close_pool() -> None:

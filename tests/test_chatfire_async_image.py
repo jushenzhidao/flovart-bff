@@ -57,7 +57,7 @@ def _install_fakes(monkeypatch, captured, gw_raw):
             raise gw_raw
         return gw_raw
 
-    async def fake_persist(task, task_id, uid, kind="image"):
+    async def fake_persist(task, task_id, uid, kind="image", request_id=None):
         captured["persisted"] = (task_id, kind)
         return task
 

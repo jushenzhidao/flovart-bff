@@ -170,12 +170,18 @@ services:
       WAVESPEED_POLL_INTERVAL: ${WAVESPEED_POLL_INTERVAL:-2}
       WAVESPEED_POLL_MAX: ${WAVESPEED_POLL_MAX:-120}
 
-      # ---- 元数据层：PostgreSQL（留空则回落本地 SQLite）----
-      # 留空时用 /data/flovart_cloud.db，单副本可用；多副本必须配 PG。
-      POSTGRES_DSN: ${POSTGRES_DSN:-}
-      # 与 hewapi 无关（它不用 PG）。但若同机复用同一个 PG 实例，
-      # database 名不要与其它业务相同，否则表结构会互相覆盖。
+      # ---- 元数据层：PostgreSQL（本编排内置 postgres 服务）----
+      # 密码必填：compose 内置了 postgres 服务，缺了它两边都起不来。
+      # 生成方式：openssl rand -hex 16（十六进制纯字母数字，拼 DSN 不会撞特殊字符）。
+      # 与 hewapi 无关（它不用 PG）。若同机复用别的 PG 实例，database 名不要
+      # 与其它业务相同，否则表结构会互相覆盖。
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-flovart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置，用 openssl rand -hex 16 生成}
       POSTGRES_DB: ${POSTGRES_DB:-flovart}
+      # DSN 分项拼装即可，POSTGRES_DSN 留空（优先级更高，配了会覆盖上面分项）。
+      POSTGRES_DSN: ${POSTGRES_DSN:-}
 
       # ---- 媒体字节层：OSS / COS / S3（留空则回落容器内 /data/media）----
       OSS_ENABLED: ${OSS_ENABLED:-0}
@@ -237,6 +243,12 @@ services:
     volumes:
       - flovart-bff-data:/data
 
+    # 等 PG 真正可接受连接（pg_isready 通过）再启动 BFF：
+    # 否则冷启时 BFF 先起、PG 还没就绪，首建表/首请求会撞连接拒绝。
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     healthcheck:
       # 编排层探针查 /readyz（含配置校验），比镜像内置的 /healthz 更严格。
       # 用 python 而非 curl：镜像刻意没装 curl（少一个依赖、构建不依赖 apt 源）。
@@ -278,8 +290,48 @@ services:
           # 大图解码是内存峰值的主要来源，512M 下大 PSD 转换容易被 OOM Kill。
           memory: 1G
 
+  # ---- 元数据 PostgreSQL（flovart-bff 专属）----
+  # 2026-09-20 新增：此前元数据回落容器内 SQLite（flovart_cloud.db 在
+  # flovart-bff-data 卷里），单副本可用但「卷丢 = 数据丢」，且多副本读不到
+  # 彼此的数据。PG 数据落在独立卷 flovart-pgdata，备份/迁移都按卷操作。
+  #
+  # 安全说明：**刻意不发布端口**（没有 ports 段）——PG 只在 compose 内部网络
+  # 可达，公网和宿主机都连不进来，绕过反代的旁路不存在。要进库看数据：
+  #   docker compose exec postgres psql -U flovart -d flovart
+  #
+  # ⚠️ 与 hewapi 的隔离契约同样适用：volume 用绝对名 flovart-pgdata，
+  #    container_name 专属，绝不能与其它编排的同名资源撞车。
+  postgres:
+    image: postgres:16-alpine
+    container_name: flovart-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flovart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置，用 openssl rand -hex 16 生成}
+      POSTGRES_DB: ${POSTGRES_DB:-flovart}
+    volumes:
+      - flovart-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flovart} -d ${POSTGRES_DB:-flovart}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
 volumes:
   flovart-bff-data:
     # 显式绝对名，不带 project 前缀 —— 与 hewapi 的 bff-data 一眼可区分，
     # 也不会因为将来改 project name 导致「数据卷凭空消失」。
     name: flovart-bff-data
+  flovart-pgdata:
+    name: flovart-pgdata

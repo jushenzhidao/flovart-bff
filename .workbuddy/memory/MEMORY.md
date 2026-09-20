@@ -10,6 +10,7 @@
 
 ## 定位 / 操作约定
 Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。前端独立仓库 `D:\code\flovart-web`（同机并存，直接改）。
+⚠️ **命名坑（飞哥 2026-09-20 明确）**：`D:\code\newapi-bff\newapi-bff` 虽然名字像网关，**实际是「WorkBuddy 积分」应用**（flovart-bff 的母项目/前作），不是 new-api 网关；对话中说「newapi-bff / 另一个应用 / hewapi」均指它。
 **约定**：不执行任何 git commit/push（飞哥自己来，只在末尾提醒）。
 ⚠️ 两个「打包」别混：**交付给飞哥的产物 = zip 压缩包**（他明确说过「我们之前不是 python 项目吗，压缩包就行」，别主动上 Docker 镜像）；**生产部署形态 = Docker compose**（2026-09-16 起补齐 Dockerfile + docker-compose.yml，见 `topics/deployment.md`）。
 
@@ -44,6 +45,7 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
   缓解：`.env` 配**有效**的 `NEWAPI_ADMIN_PAT`，两边启动时 `_load_admin_cred()` 都直接用它、都不走登录 → 相安无事；**一旦该 PAT 失效即入循环**（日志刷 `admin PAT rejected, re-login to rotate`、高频登录逼近 new-api 50 会话上限 → 409 → BFF 返 503）。
   **根治：切换窗口内先停旧进程，或给新实例配独立管理员账号。** 
 - ⚠️ `.env` 的 `NEWAPI_ADMIN_PAT` 是易失效一次性快照（点控制台「系统访问令牌」即作废，预期行为）→ **不要让飞哥维护 PAT**；PAT 401 自动回落账密 `_admin_login` 重签。失效只需改 `NEWAPI_ADMIN_PASSWORD`（同账号）
+- ⭐ **网关 rc.37 安全验证 proof**（2026-09-20 全链适配完成）：rc.37 起 `GET /api/user/token` 无条件要求 `X-Security-Proof` 头，缺失 403「需要安全验证」→ `_parse_response` 包成 400 → 曾被 auth.py 改写成假 401「密码错误」（已修，透传原文案）。两仓均已接入 `_mint_access_token()`：`POST /api/verify {method:"password", scope:"access_token.generate"}` 换 proof → 带头换 PAT，旧网关 404/502 自动降级。⚠️ rc.37 `/api/user/self` **不再返回 access_token → 读回自愈失效**，PAT 失效只能走轮换兜底（会作废对端）→ 两台 BFF 共用管理号仍需避免，中期各配独立管理号。网关 MySQL=宝塔宿主机 3396（DSN 走 host-gateway IP，宿主机连 127.0.0.1 会拒），会话上限已抬 ACTIVE=200/ISSUANCE=10000。
 - 出口 quota→points（`config.quota_to_points*`），裸 quota 不外泄；单 worker
 - BFF venv：`C:\Users\81068\.workbuddy\binaries\python\envs\flovart-bff`；Windows 下 `pip install -r` 用 `D:\` 路径（Git Bash `/d/` 会被误解析）
 

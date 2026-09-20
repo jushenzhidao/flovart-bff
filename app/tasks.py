@@ -322,11 +322,13 @@ async def _resolve_blob(obj: dict, uid: int) -> "tuple[bytes | None, str | None]
     return None, None
 
 
-async def _persist_outputs(task: dict, task_id: str, uid: int, kind: str = "image") -> dict:
+async def _persist_outputs(task: dict, task_id: str, uid: int, kind: str = "image",
+                           request_id: "str | None" = None) -> dict:
     """任务成功：把 result 内图片/视频落 BFF cloud_media，改写 result 指向 BFF media。
 
     幂等：同进程已落过直接复用缓存的改写 result，不重复落盘。
     kind 用于决定落盘媒体类型：video-gen → "video"，其余（含分层透明 png）→ "image"。
+    request_id 用于血缘：产物 media 行记 source_request_id，关联 cloud_request_log。
     """
     if task_id in _PERSISTED:
         task["result"] = _PERSISTED[task_id]
@@ -559,7 +561,7 @@ async def _poll_chatfire_async_image(request_id: str, log: dict, uid: int) -> di
         result = _normalize_sync_result(body) if body["data"] else None
         if result is not None and _iter_outputs(result):
             task = {"result": result}
-            task = await _persist_outputs(task, task_id, uid, kind)
+            task = await _persist_outputs(task, task_id, uid, kind, request_id=request_id)
             await cloudstore.request_log_update(
                 request_id, status="succeeded", gateway_request_id=gw_req_id,
                 result=task.get("result"))
@@ -675,7 +677,7 @@ async def _run_sync(uid: int, request_id: str, kind: str, path: str, params: dic
         result = _normalize_sync_result(raw)
         task = {"result": result} if isinstance(result, dict) else {}
         if result is not None:
-            task = await _persist_outputs(task, request_id, uid, kind)
+            task = await _persist_outputs(task, request_id, uid, kind, request_id=request_id)
     except Exception as e:  # noqa: BLE001
         logger.exception("网关同步结果处理失败 uid=%s req=%s path=%s", uid, request_id, path)
         err = _error_record(e, "gateway_result_error", "normalize/persist", path=path)
@@ -806,7 +808,7 @@ async def _external_call_and_record(uid: int, request_id: str, kind: str,
         result = _normalize_sync_result(raw)
         task = {"result": result} if isinstance(result, dict) else {}
         if result is not None:
-            task = await _persist_outputs(task, request_id, uid, kind)
+            task = await _persist_outputs(task, request_id, uid, kind, request_id=request_id)
     except Exception as e:  # noqa: BLE001 —— 归一化/落盘失败同样要留痕
         logger.exception("外部网关结果处理失败 uid=%s req=%s url=%s", uid, request_id, url)
         err = _error_record(e, "external_result_error", "normalize/persist", url=url)
@@ -920,7 +922,7 @@ async def get_task(request_id: str, uid: int) -> dict:
             result = {"images": images}
             task = {"result": result}
             if urls:
-                task = await _persist_outputs(task, task_id, uid, kind)
+                task = await _persist_outputs(task, task_id, uid, kind, request_id=request_id)
             await cloudstore.request_log_update(
                 request_id, status="succeeded", result=task.get("result"))
             return _task_view(request_id, task_id, kind, "async", "succeeded", task)
@@ -936,7 +938,7 @@ async def get_task(request_id: str, uid: int) -> dict:
     task = _normalize_task(_unwrap(raw))
     gstatus = task.get("status")
     if gstatus == "succeeded":
-        task = await _persist_outputs(task, task_id, uid, kind)
+        task = await _persist_outputs(task, task_id, uid, kind, request_id=request_id)
         await cloudstore.request_log_update(request_id, status="succeeded", result=task.get("result"))
     elif gstatus in ("failed", "error"):
         await cloudstore.request_log_update(request_id, status="failed")

@@ -9,6 +9,7 @@
                                                  → {revision} | 409 {current_revision}
   DELETE /api/me/docs/{scope}/{doc_key}
   GET    /api/me/docs/{scope}                    → [{doc_key, revision, updated_at}]（列表）
+  GET    /api/me/history/records                 → {items, total}（生成历史，源 cloud_request_log）
   POST   /api/me/media                           multipart {file, kind?}
                                                  → {media_key, size, mime, url} | 413 | 507 配额
   GET    /api/me/media/{media_key}               → 307 重定向到 OSS presigned URL（或本地文件流）
@@ -89,6 +90,25 @@ async def doc_delete(scope: str, doc_key: str, session: dict = Depends(require_s
     return ok({"deleted": True})
 
 
+@router.get("/api/me/history/records")
+async def history_records(
+    limit: int = 20,
+    offset: int = 0,
+    kind: str = "",
+    session: dict = Depends(require_session),
+):
+    """生成历史（数据源 cloud_request_log，一笔一行）。
+
+    返回 {items, total}；item 含完整 params(result 前的提交参数) + result，
+    b64/data-uri 已剥离为占位符。前端「一键同款」直接拿 params 原样重提交
+    （b64 引用类参数除外）。旧 history JSON 文档路径不受影响，可并行迁移。
+    """
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+    data = await cloudstore.request_log_history(_uid(session), limit, offset, kind or "")
+    return ok(data)
+
+
 @router.post("/api/me/media")
 async def media_upload(
     file: UploadFile = File(..., description="媒体二进制（PNG/JPG/WebP/MP4/WAV…）"),
@@ -99,7 +119,8 @@ async def media_upload(
     if not blob:
         raise HTTPException(status_code=400, detail="空文件")
     try:
-        info = await cloudstore.media_put(_uid(session), kind, file.content_type or "", blob)
+        info = await cloudstore.media_put(_uid(session), kind, file.content_type or "", blob,
+                                          source_kind="upload")
     except ValueError as e:
         message = str(e)
         status = 507 if "配额" in message else 413

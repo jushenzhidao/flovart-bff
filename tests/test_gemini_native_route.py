@@ -118,7 +118,7 @@ def _install_fakes(monkeypatch, captured, gw_raw):
         captured["json"] = json
         return gw_raw
 
-    async def fake_persist(task, task_id, uid, kind="image"):
+    async def fake_persist(task, task_id, uid, kind="image", request_id=None):
         return task
 
     monkeypatch.setattr(cloudstore, "request_log_put", fake_put)
