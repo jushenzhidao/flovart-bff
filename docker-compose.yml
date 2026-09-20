@@ -224,8 +224,9 @@ services:
       # 在容器里就是 /app/data —— 而根文件系统 read_only，任何写入都会抛
       # OSError: [Errno 30] Read-only file system。
       BFF_DATA_DIR: /data
-      # ⭐ 2026-09-20 根治互踢：凭据文件与 hewapi 共享（同一个卷 /shared/admin_cred.json）。
-      BFF_ADMIN_CRED_FILE: /shared/admin_cred.json
+      # 管理员 PAT 本地缓存（同机多实例共享用；跨服务器一致性靠读回恢复
+      # NEWAPI_ADMIN_PAT_READBACK，见 newapi_client._self_heal_admin_cred）。
+      BFF_ADMIN_CRED_FILE: /data/admin_cred.json
       BFF_SIGNUP_STATE_FILE: /data/signup_bonus.json
 
     # 卷内容：admin_cred.json（管理员 PAT 缓存）、user_keys.json（用户密钥的
