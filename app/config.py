@@ -65,10 +65,21 @@ NEWAPI_ADMIN_PAT: str = os.getenv("NEWAPI_ADMIN_PAT", "").strip()
 NEWAPI_ADMIN_UID: int = _int("NEWAPI_ADMIN_UID", 0)
 
 # 管理员 PAT 落盘缓存：进程重启后直接复用，避免每次冷启都 login 消耗一个会话。
+# ⭐ 同机多实例（蓝绿/灰度）场景：把多个实例的 BFF_ADMIN_CRED_FILE 指到同一个文件，
+#   任一方兜底轮换出新 PAT 都会强制落盘，另一方 401 时重读该文件即可自愈。
+#   ⚠️ 跨服务器部署无法共享文件 —— 靠 NEWAPI_ADMIN_PAT_READBACK（读回恢复）兜底。
 ADMIN_CRED_FILE: str = os.getenv(
     "BFF_ADMIN_CRED_FILE",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "admin_cred.json"),
 )
+# ⭐ 跨机互踢根治（2026-09-20）：401 自愈时优先「读回」——login 拿会话后用
+#   GET /api/user/self 把账号当前 access_token 原样读回来（读操作不轮换、不作废
+#   旧值，其他服务器上共用该账号的 BFF 零感知）。只有账号压根没设过 access_token
+#   才最后走轮换兜底。设 NEWAPI_ADMIN_PAT_READBACK=0 可关闭读回（直接轮换，不推荐）。
+NEWAPI_ADMIN_PAT_READBACK: bool = os.getenv("NEWAPI_ADMIN_PAT_READBACK", "1").strip() not in ("0", "false", "no")
+# PAT 401 且读回/凭据文件均无法自愈时，是否允许账密兜底登录（会轮换 PAT + 消耗一个会话）。
+# 默认允许；设 NEWAPI_ADMIN_LOGIN_FALLBACK=0 可彻底禁用自动轮换（401 直接报错转人工）。
+NEWAPI_ADMIN_LOGIN_FALLBACK: bool = os.getenv("NEWAPI_ADMIN_LOGIN_FALLBACK", "1").strip() not in ("0", "false", "no")
 
 # BFF 管理员的静态名单兜底（普通判定走上游 user.role >= 10）。
 ADMIN_USERNAMES: frozenset = frozenset(
@@ -282,6 +293,24 @@ GATEWAY_SYNC_EDIT_PATH: str = os.getenv("GATEWAY_SYNC_EDIT_PATH", "v1/images/gen
 #   sync 模式下前端体验不变（仍是「提交 → 轮询 /api/tasks/{id}」），
 #   只是 BFF 在后台阻塞等待网关出图（`_run_sync` + 后台任务，不占用前端连接）。
 GATEWAY_IMAGE_GEN_MODE: str = _choice("GATEWAY_IMAGE_GEN_MODE", "sync", ("async", "sync"))
+# ⭐ 2026-09-20 新增：Chatfire 风格「真异步」生图（Apifox 文档 oneapis/515490684e0）。
+#   POST {submit_path}  body={model,prompt,image[]} → 202 {task_id,status=QUEUED,...}
+#   GET  {submit_path}/{task_id} → 处理中 202 {status:QUEUED|IN_PROGRESS}（无 data）；
+#                                  完成 200 {data:[{url|b64_json}],created,usage}（无 status）。
+#   与 new-api 统一 tasks 端点（{type,params} 包裹体 + status==succeeded 判终态）不兼容，
+#   tasks.py 单独分支（_submit_chatfire_async_image / _poll_chatfire_async_image）。
+#   ⚠️ 网关对 POST /async/* 是盲透传（假模型也 202），查询才按 model 走渠道路由 ——
+#   模型必须挂在用户分组的启用渠道下，否则查询 503 model_not_found。
+GATEWAY_ASYNC_IMAGE_SUBMIT_PATH: str = os.getenv(
+    "GATEWAY_ASYNC_IMAGE_SUBMIT_PATH", "async/v1/images/generations"
+).strip().strip("/")
+# 走 Chatfire 异步分支的模型（前缀匹配，逗号分隔，大小写不敏感）。
+# 前端该模型的服务配置仍需 mode=async（params.mode 或管理台 image_model_modes）。
+GATEWAY_ASYNC_IMAGE_MODELS: list = [
+    p.strip().lower()
+    for p in os.getenv("GATEWAY_ASYNC_IMAGE_MODELS", "doubao-seedream").split(",")
+    if p.strip()
+]
 # 同步调用网关的阻塞超时（秒）：同步生成可能较长，给足余量（前端仍走轮询，BFF 内部 await）。
 # 单 worker 下用异步 httpx 长超时不会阻塞事件循环，其他请求仍可并发处理。
 GATEWAY_SYNC_TIMEOUT: int = _int("GATEWAY_SYNC_TIMEOUT", 300)

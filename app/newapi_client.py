@@ -34,6 +34,7 @@
     字段丰富（user_id/model_name/quota/channel_name/request_id...），可做调用记录页。
 15. 渠道 model 型数据（详情用）: GET /api/channel/{id}；GET /api/channel/search?keyword=
 """
+import asyncio
 import json as _json
 import logging
 import os
@@ -129,10 +130,16 @@ def _load_admin_cred() -> None:
         pass
 
 
-def _save_admin_cred() -> None:
-    """PAT 落盘。失败不影响主流程（只是下次冷启多消耗一个会话）。"""
-    if config.NEWAPI_ADMIN_PAT:
-        return
+def _save_admin_cred(*, force: bool = False) -> None:
+    """PAT 落盘。失败不影响主流程（只是下次冷启多消耗一个会话）。
+
+    ⭐ 2026-09-20 多应用共存改造：force=True 时**无视 env 直供也必须落盘** ——
+    兜底轮换出的新 PAT 是共享凭据文件（单一事实来源）的最新值，不落盘的话
+    另一个共用该账号的 BFF 永远拿不到，会触发「轮换乒乓」（两边互相作废对方 PAT）。
+    env 模式的冗余保存仍走默认 force=False（避免无谓写文件）。
+    """
+    if config.NEWAPI_ADMIN_PAT and not force:
+        return  # env 直供且非强制时无需落盘
     try:
         os.makedirs(os.path.dirname(config.ADMIN_CRED_FILE), exist_ok=True)
         tmp = config.ADMIN_CRED_FILE + ".tmp"
@@ -144,8 +151,87 @@ def _save_admin_cred() -> None:
         logger.warning("save admin cred failed: %s", e)
 
 
-async def _admin_login() -> None:
-    """管理员登录换 PAT，换完立刻归还会话（避免占满 50 会话上限）。"""
+def _reload_admin_cred() -> bool:
+    """从共享凭据文件重读 PAT；发现与内存不同的新值则采纳并返回 True。
+
+    ⭐ 401 自愈第一步（2026-09-20 多应用共存）：共用同一管理员账号的另一个 BFF
+    可能刚完成兜底轮换并把新 PAT 落了盘 —— 此时本进程重读文件即可拿到新值，
+    **绝不能再走 login 轮换**（否则会把对方刚换的 PAT 又作废，形成乒乓循环，
+    每轮白白消耗一个会话 + 签发额度，直到 50 会话/100 签发双限打爆）。
+    磁盘值优先于 env/内存旧值：env 只在冷启时作为初始猜测，401 即证明它已失效。
+    """
+    try:
+        with open(config.ADMIN_CRED_FILE, "r", encoding="utf-8") as f:
+            d = _json.load(f)
+        pat, uid = d.get("pat"), d.get("uid")
+        if pat and uid and pat != _admin_cache["pat"]:
+            _admin_cache["pat"] = pat
+            _admin_cache["uid"] = int(uid)
+            logger.warning(
+                "admin PAT updated from shared cred file (peer instance rotated) uid=%s",
+                _admin_cache["uid"])
+            return True
+    except (OSError, ValueError, KeyError):
+        pass
+    return False
+
+
+# 兜底轮换单飞锁：并发 401 时只放一个协程去 login，其余等锁后先重读文件（双检）。
+# asyncio.Lock 自 3.10 起不再绑定事件循环，模块级懒创建安全。
+_LOGIN_LOCK: "asyncio.Lock | None" = None
+
+
+def _login_lock() -> "asyncio.Lock":
+    global _LOGIN_LOCK
+    if _LOGIN_LOCK is None:
+        _LOGIN_LOCK = asyncio.Lock()
+    return _LOGIN_LOCK
+
+
+async def _self_heal_admin_cred() -> None:
+    """PAT 401 后的自愈序列（多应用共存根治，2026-09-20；跨机版见 READBACK）：
+
+    1. 重读凭据文件 —— 同机多实例（蓝绿/灰度）场景对端可能已轮换并落盘，直接采纳即可；
+    2. 文件无新值 → 锁内再查（等锁期间同进程其他协程可能已治愈）；
+    3. ⭐ 读回恢复（NEWAPI_ADMIN_PAT_READBACK=1，默认开，跨服务器部署的关键）：
+       login 拿会话后 **GET /api/user/self 把账号当前 access_token 原样读回来**——
+       读操作不轮换 token，另一台服务器上共用该账号的 BFF 的 PAT 依然有效，
+       从根上消灭「轮换乒乓」（乒乓只在同账号跨机场景，共享文件帮不上忙）；
+    4. 读回失败（账号压根没设过 access_token）才最后兜底轮换
+      （NEWAPI_ADMIN_LOGIN_FALLBACK=0 可彻底禁用 3/4 步转人工）。
+    """
+    pat_before = _admin_cache["pat"]
+    if _reload_admin_cred():
+        return
+    if not config.NEWAPI_ADMIN_LOGIN_FALLBACK:
+        logger.error(
+            "admin PAT 401 且凭据文件无新值，兜底登录已禁用"
+            "(NEWAPI_ADMIN_LOGIN_FALLBACK=0) —— 需人工更新 PAT 或凭据文件。")
+        raise NewApiError("服务暂时不可用，请稍后重试或联系客服", 503)
+    async with _login_lock():
+        # 双检①：等锁期间同进程其他协程可能已完成治愈（缓存 PAT 已变）
+        if _admin_cache["pat"] != pat_before:
+            return
+        # 双检②：同机另一进程可能刚轮换并落盘
+        if _reload_admin_cred():
+            return
+        # 第 3 步：读回恢复（不轮换，跨机安全）
+        if config.NEWAPI_ADMIN_PAT_READBACK:
+            try:
+                if await _recover_admin_pat_by_readback():
+                    return
+            except NewApiError as e:
+                logger.warning("admin PAT readback failed: %s", e.message)
+        # 第 4 步：最后兜底——真轮换（会作废其他机器/对端的 PAT）
+        await _admin_login()
+
+
+async def _admin_session_login() -> tuple[int, str, dict]:
+    """账密登录 new-api，返回 (uid, session_access_token, session_info)。
+
+    只创建会话、**不轮换 access_token**。调用方用完必须 _release_session 归还。
+    登录失败一次即抛（不做任何重试——会话签发额度按账号计，绝不自动重试）。
+    """
     if not (config.NEWAPI_ADMIN_USERNAME and config.NEWAPI_ADMIN_PASSWORD):
         logger.error(
             "管理员凭证未配置：建号/加额度/管理台不可用。"
@@ -173,14 +259,59 @@ async def _admin_login() -> None:
         )
         raise NewApiError("共享/管理类服务暂时不可用（管理员凭证失效），请联系管理员", 503) from e
     data = body["data"]
-    uid = data["user"]["id"]
-    access_token = data["access_token"]
-    pat_body = await request("GET", "/api/user/token",
+    return int(data["user"]["id"]), data["access_token"], data.get("session") or {}
+
+
+async def _recover_admin_pat_by_readback() -> bool:
+    """读回恢复：登录后用 GET /api/user/self **读取**账号当前 access_token。
+
+    ⭐ 与 _admin_login 的本质区别：不调 GET /api/user/token（那个动作会轮换并作废
+    旧值）。读回来的 token 是账号现行有效值——其他机器/实例上用同一账号的 BFF
+    不受任何影响。这是跨服务器部署（无共享卷可用）下避免互踢的核心手段。
+    返回 True 表示已采纳新凭据；False 表示账号未设置过 access_token（需走轮换）。
+    """
+    uid, access_token, session = await _admin_session_login()
+    try:
+        body = await request("GET", "/api/user/self",
                              headers=user_headers(access_token, uid))
+    finally:
+        # 无论读回成败都立刻归还登录会话（会话是稀缺资源）
+        try:
+            await _release_session(access_token, uid, session)
+        except Exception:  # noqa: BLE001 归还失败不影响主流程
+            pass
+    pat = (body.get("data") or {}).get("access_token") or ""
+    if not pat:
+        logger.warning("admin account has no access_token set; readback empty")
+        return False
+    _admin_cache["pat"] = pat
+    _admin_cache["uid"] = uid
+    _save_admin_cred(force=True)
+    logger.warning("admin PAT recovered by readback (no rotation) uid=%s", uid)
+    return True
+
+
+async def _admin_login() -> None:
+    """管理员登录轮换 PAT，换完立刻归还会话（避免占满 50 会话上限）。
+
+    ⚠️ 只作最后兜底：GET /api/user/token 会**轮换并作废旧 access_token**，
+    会让其他共用该账号的 BFF/实例立刻 401。401 自愈序列见 _self_heal_admin_cred
+    （先读回、后轮换）。
+    """
+    uid, access_token, session = await _admin_session_login()
+    try:
+        pat_body = await request("GET", "/api/user/token",
+                                 headers=user_headers(access_token, uid))
+    finally:
+        try:
+            await _release_session(access_token, uid, session)
+        except Exception:  # noqa: BLE001
+            pass
     _admin_cache["pat"] = pat_body["data"]
     _admin_cache["uid"] = uid
-    _save_admin_cred()
-    await _release_session(access_token, uid, data.get("session") or {})
+    # ⭐ 强制落盘：新 PAT 是凭据文件的最新事实，env 直供模式也必须写（同机其他
+    #   实例 401 时重读文件即可自愈）。跨机同步靠读回恢复（见 _self_heal_admin_cred）。
+    _save_admin_cred(force=True)
 
 
 async def admin_request(method: str, path: str, *, json: Any = None,
@@ -202,9 +333,11 @@ async def admin_request(method: str, path: str, *, json: Any = None,
     except NewApiError as e:
         if e.status_code != 401:
             raise
-        # PAT 被外部轮换掉了（官方前端点一次「系统访问令牌」就会作废旧值）
-        logger.warning("admin PAT rejected, re-login to rotate")
-        await _admin_login()
+        # PAT 被外部轮换掉了（官方前端点一次「系统访问令牌」就会作废旧值）。
+        # ⭐ 2026-09-20 根治互踢：先重读共享凭据文件自愈，实在不行才锁内兜底轮换 ——
+        #   绝不盲目 login（盲目轮换会作废对端 PAT，两边乒乓直到会话/额度双爆）。
+        logger.warning("admin PAT rejected (401), self-healing cred")
+        await _self_heal_admin_cred()
         return await request(method, path, json=json, params=params,
                              headers=user_headers(_admin_cache["pat"], _admin_cache["uid"]),
                              client=client)
@@ -233,7 +366,9 @@ async def request_as_user(method: str, path: str, uid: int, *, json: Any = None,
     except NewApiError as e:
         if e.status_code != 401:
             raise
-        await _admin_login()
+        # 同 admin_request：先共享凭据自愈，再锁内兜底轮换（多应用共存根治）。
+        logger.warning("admin PAT rejected (401) in request_as_user, self-healing cred")
+        await _self_heal_admin_cred()
         return await request(method, path, json=json, params=params,
                              headers=user_headers(_admin_cache["pat"], int(uid)),
                              client=client)

@@ -432,6 +432,10 @@ async def submit(uid: int, kind: str, params: dict) -> dict:
     if params.get("_gateway"):
         return await _run_external(uid, request_id, kind, spec, params)
     if mode == "async":
+        # Chatfire 风格真异步生图（doubao-seedream 等）：独立分支，路径/载荷/终态判定都不同。
+        if kind == "image-gen" and _is_chatfire_async_image_model(
+                params.get("model") or params.get("model_name") or ""):
+            return await _submit_chatfire_async_image(uid, request_id, params)
         try:
             # 网关异步分支此前缺 request_log_put，导致外部/异步请求无留痕；此处补上（无 _gateway，无需掩码）。
             await cloudstore.request_log_put(
@@ -487,6 +491,96 @@ async def _run_sync_safe(uid: int, request_id: str, kind: str, path: str, params
         await _run_sync(uid, request_id, kind, path, params)
     except Exception:  # noqa: BLE001 —— 内部已写 failed 状态与原因，此处仅防未捕获告警
         logger.exception("同步任务后台执行异常 uid=%s req=%s path=%s", uid, request_id, path)
+
+
+# Chatfire 异步任务的失败态（文档未穷举，按常见命名 + 实测保守覆盖）。
+_CHATFIRE_ASYNC_FAILED = {"FAILED", "ERROR", "CANCELLED", "CANCELED", "TIMEOUT", "DELETED", "EXPIRED"}
+
+
+def _is_chatfire_async_image_model(model: str) -> bool:
+    """Chatfire 风格「真异步」生图模型（2026-09-20 接入，doubao-seedream 等）。
+
+    与 new-api 统一 tasks 端点的 async 不同：POST/GET 同路径 `async/v1/images/generations`、
+    裸 {model,prompt,image[]} 体、完成响应以 data[] 出现为终态（无 succeeded 状态字段）。
+    """
+    m = (model or "").strip().lower()
+    return any(m.startswith(p) for p in config.GATEWAY_ASYNC_IMAGE_MODELS)
+
+
+async def _submit_chatfire_async_image(uid: int, request_id: str, params: dict) -> dict:
+    """Chatfire 异步生图提交：POST {model,prompt,image[]} → 202 {task_id,status=QUEUED}。
+
+    ⚠️ 网关对该路径盲透传（不校验模型/渠道），提交 202 ≠ 模型可用；
+    真正的渠道路由校验发生在查询阶段（503 model_not_found → 前端轮询可见失败）。
+    只透传文档三字段；size 等扩展参数留存在 request_log.params 里不外发，避免上游拒收。
+    """
+    model = params.get("model") or params.get("model_name") or ""
+    await cloudstore.request_log_put(
+        uid, request_id, "image-gen", "gateway-async-image",
+        model, {**params}, status="submitted", mode="async")
+    body = {
+        "model": model,
+        "prompt": str(params.get("prompt") or ""),
+        "image": params.get("image") if isinstance(params.get("image"), list) else [],
+    }
+    try:
+        raw = await _gw_call(
+            "POST", config.GATEWAY_ASYNC_IMAGE_SUBMIT_PATH, uid,
+            json=body, client=_proxy_client())
+    except NewApiError:
+        await cloudstore.request_log_update(request_id, status="failed")
+        raise
+    task = _unwrap(raw)
+    if not isinstance(task, dict):
+        task = {}
+    task = _normalize_task(task)
+    task_id = task.get("task_id") or task.get("id")
+    await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
+    return _task_view(request_id, task_id, "image-gen", "async",
+                      str(task.get("status") or "processing"), task)
+
+
+async def _poll_chatfire_async_image(request_id: str, log: dict, uid: int) -> dict:
+    """Chatfire 异步生图轮询。
+
+    终态判定：响应出现非空 data[] 即完成（chatfire 完成响应**不带** status 字段）；
+    处理中为 202 {status:QUEUED|IN_PROGRESS,...}（无 data）；error 体或 FAILED 系状态为失败。
+    完成后复用 sync 管线归一化（data→images）+ 落 BFF cloud_media。
+    """
+    task_id = log["task_id"]
+    kind = log["kind"]
+    raw = await _gw_call(
+        "GET", f"{config.GATEWAY_ASYNC_IMAGE_SUBMIT_PATH}/{task_id}",
+        uid, client=_proxy_client())
+    body = raw if isinstance(raw, dict) else {}
+    if isinstance(body.get("data"), list):
+        # data 键出现即终态（处理中响应无 data 键）；空 data = 无产物失败
+        gw_req_id = _extract_gw_request_id(body)
+        result = _normalize_sync_result(body) if body["data"] else None
+        if result is not None and _iter_outputs(result):
+            task = {"result": result}
+            task = await _persist_outputs(task, task_id, uid, kind)
+            await cloudstore.request_log_update(
+                request_id, status="succeeded", gateway_request_id=gw_req_id,
+                result=task.get("result"))
+            return _task_view(request_id, task_id, kind, "async", "succeeded", task)
+        # 200 但 data 空/不可解析：绝不记 succeeded（同 _run_sync 的无产物防线）
+        err = _no_media_error(body)
+        await cloudstore.request_log_update(
+            request_id, status="failed", gateway_request_id=gw_req_id, result=err)
+        return _task_view(request_id, task_id, kind, "async", "failed", {"result": err})
+    gstatus = str(body.get("status") or "").upper()
+    if isinstance(body.get("error"), dict) or gstatus in _CHATFIRE_ASYNC_FAILED:
+        inner = body["error"] if isinstance(body.get("error"), dict) else {
+            "message": f"upstream task status: {gstatus or 'unknown'}",
+            "type": "gateway_async_error"}
+        # 统一包一层 {"error": ...}，对齐 _error_record 的落库形状（前端按 result.error 展示）
+        err = {"error": inner}
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return _task_view(request_id, task_id, kind, "async", "failed", {"result": err})
+    await cloudstore.request_log_update(request_id, status="processing")
+    return _task_view(request_id, task_id, kind, "async",
+                      str(body.get("status") or "processing").lower(), body)
 
 
 def _is_gemini_image_model(model: str) -> bool:
@@ -810,6 +904,10 @@ async def get_task(request_id: str, uid: int) -> dict:
     task_id = log["task_id"]
     if not task_id:
         return _task_view(request_id, None, kind, "async", status, {})
+
+    if (log.get("provider") or "gateway") == "gateway-async-image":
+        # Chatfire 风格异步生图：查询路径/终态判定与统一 tasks 端点不同。
+        return await _poll_chatfire_async_image(request_id, log, uid)
 
     if (log.get("provider") or "gateway") == "thirdparty":
         tp_status, urls = await _poll_thirdparty(kind, task_id)

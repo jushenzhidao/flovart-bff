@@ -62,3 +62,7 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
 ## 代码地图
 - 后端：`app/routers/{auth,keys,usage,console,billing,promo,chat,shares,platform_services,tasks}.py`；`app/user_keys.py`；`app/tasks.py`+`app/thirdparty/wavespeed.py`；`app/{db,oss,security,store,config,newapi_client,cloudstore}.py`
 - 前端：`FlovartAgentPanel.tsx` / `services/{browserAgentKernel,imageTask,aiGateway,hostedClient,historyCloudSync,cloudSync,routeMapping,productModelCatalog,promptBarPolicy,providerGenerationAdapter,workflowGeneration,workflowPromptPolicy}.ts` / `stores/useHostedStore.ts` / `hooks/useApiKeys.ts` / `utils/{storageNamespace,keyVault,modelRefs,platformModelGate}.ts` / `components/{SettingsPanel,PromptBar,ConfigManager/*,workflow/*}` / `tools/flovart/product-models.js`
+
+## 🔑 管理员 PAT 共存机制（2026-09-20 根治互踢；同日修正为读回方案）
+- **两 BFF 部署在不同服务器**（勿再假设同机）：401 自愈序列 = 重读本地凭据文件（同机多实例用）→ 锁内双检 → **读回恢复**（login 后 GET /api/user/self 读现行 access_token，不轮换不对端作废）→ 读回为空才最后轮换兜底。开关：`NEWAPI_ADMIN_PAT_READBACK`（默认 1）/ `NEWAPI_ADMIN_LOGIN_FALLBACK`。凭据文件只作本机缓存（/data/admin_cred.json），**无共享卷**。详见 `.workbuddy/memory/2026-09-20.md`。
+- 应急解「登录设备数达上限」死锁：`scripts/clear_sessions.py`（auth_version 方案，连带作废 PAT）。
