@@ -1,0 +1,128 @@
+# flovart-bff 容器编排 / 服务器直拉镜像版。
+#
+# 与仓库 docker-compose.yml（build 模式）的区别：
+#   - 不构建，直接引用 GHCR 镜像 ghcr.io/jushenzhidao/flovart-bff
+#   - 升级 = 只改下面 image 行的 tag（如 sha-a1b2c3d），.env 里不放镜像配置
+#   - 私有镜像需先在宿主机登录：echo <PAT> | docker login ghcr.io -u jushenzhidao --password-stdin
+#
+# 其余安全/运行语义与仓库生产 compose 完全一致。
+# 升级步骤：改 image tag → docker compose pull bff → docker compose up -d bff
+
+services:
+  bff:
+    # ⭐ 升级只改这一行：tag = GitHub Actions 产物 sha-<commit前7位>。
+    #   实际 tag 以 Actions 运行日志 / GHCR 包页面为准，生产钉 sha tag 别用 latest。
+    image: ghcr.io/jushenzhidao/flovart-bff:sha-5987645
+    # 容器名参数化：并存多实例时用 FLOVART_BFF_CONTAINER_NAME 区分。
+    container_name: ${FLOVART_BFF_CONTAINER_NAME:-flovart-bff}
+    restart: unless-stopped
+    # 只绑回环：生产 TLS 由宿主机 Nginx/Caddy 终止，防绕过反代的明文旁路。
+    # 端口变量刻意叫 FLOVART_BFF_PORT（不与 hewapi 的 BFF_PORT 同名）。
+    ports:
+      - "127.0.0.1:${FLOVART_BFF_PORT:-8300}:8000"
+    environment:
+      # ---- 必填：会话 Cookie 加密密钥（弱密钥 /readyz 直接 503）----
+      BFF_SECRET_KEY: ${BFF_SECRET_KEY:?BFF_SECRET_KEY 必须设置，用 openssl rand -hex 32 生成}
+      # ---- 必填：new-api 网关 ----
+      NEWAPI_BASE_URL: ${NEWAPI_BASE_URL:?NEWAPI_BASE_URL 必须设置，如 https://newapi.example.com}
+      NEWAPI_ADMIN_UID: ${NEWAPI_ADMIN_UID:?NEWAPI_ADMIN_UID 必须设置，本业务专属管理员账号的 uid}
+      # PAT 与管理员账密都与 hewapi 用同一个管理员账号：两边 .env 里保持相同的值。
+      # PAT 失效时自愈序列（读回恢复）需要账密做登录通道，两项都必须配置。
+      NEWAPI_ADMIN_PAT: ${NEWAPI_ADMIN_PAT:-}
+      NEWAPI_ADMIN_USERNAME: ${NEWAPI_ADMIN_USERNAME:?NEWAPI_ADMIN_USERNAME 必须设置（PAT 失效读回自愈通道）}
+      NEWAPI_ADMIN_PASSWORD: ${NEWAPI_ADMIN_PASSWORD:?NEWAPI_ADMIN_PASSWORD 必须设置（PAT 失效读回自愈通道）}
+      # ---- 运行模式（生产写死）----
+      BFF_MOCK_MODE: "0"
+      BFF_COOKIE_SECURE: "1"
+      BFF_COOKIE_SAMESITE: ${BFF_COOKIE_SAMESITE:-lax}
+      # ---- 积分与活动（运营策略，不想做活动显式设 0）----
+      BFF_POINTS_PER_CNY: ${BFF_POINTS_PER_CNY:-1000}
+      BFF_PROMO_SIGNUP_ENABLED: ${BFF_PROMO_SIGNUP_ENABLED:-1}
+      BFF_PROMO_SIGNUP_POINTS: ${BFF_PROMO_SIGNUP_POINTS:-2000}
+      BFF_PROMO_FIRST_TOPUP_ENABLED: ${BFF_PROMO_FIRST_TOPUP_ENABLED:-1}
+      BFF_PROMO_FIRST_TOPUP_RATE: ${BFF_PROMO_FIRST_TOPUP_RATE:-1.0}
+      # ---- 品牌 ----
+      BFF_BRAND_NAME: ${BFF_BRAND_NAME:-oneArt}
+      BFF_BRAND_ICP: ${BFF_BRAND_ICP:-}
+      BFF_BRAND_CONTACT: ${BFF_BRAND_CONTACT:-}
+      BFF_API_BASE_URL: ${BFF_API_BASE_URL:-}
+      # ---- 聊天默认模型 ----
+      BFF_CHAT_DEFAULT_MODEL: ${BFF_CHAT_DEFAULT_MODEL:-}
+      BFF_CHAT_VISION_MODEL: ${BFF_CHAT_VISION_MODEL:-}
+      # ---- 第三方：WaveSpeed（多角度等）----
+      WAVESPEED_API_KEY: ${WAVESPEED_API_KEY:-}
+      WAVESPEED_BASE_URL: ${WAVESPEED_BASE_URL:-https://api.wavespeed.ai/api}
+      WAVESPEED_MULTIANGLE_MODEL: ${WAVESPEED_MULTIANGLE_MODEL:-wavespeed-ai/flux-kontext-dev-ultra-fast}
+      WAVESPEED_TIMEOUT: ${WAVESPEED_TIMEOUT:-300}
+      WAVESPEED_POLL_INTERVAL: ${WAVESPEED_POLL_INTERVAL:-2}
+      WAVESPEED_POLL_MAX: ${WAVESPEED_POLL_MAX:-120}
+      # ---- 云数据库（留空回落 SQLite /data/flovart_cloud.db）----
+      POSTGRES_DSN: ${POSTGRES_DSN:-}
+      POSTGRES_DB: ${POSTGRES_DB:-flovart}
+      # ---- 对象存储（OSS_ENABLED=0 时媒体落 /data/media 本地卷）----
+      OSS_ENABLED: ${OSS_ENABLED:-0}
+      OSS_PROVIDER: ${OSS_PROVIDER:-cos}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-}
+      OSS_REGION: ${OSS_REGION:-ap-guangzhou}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+      OSS_ACCESS_KEY: ${OSS_ACCESS_KEY:-}
+      OSS_SECRET_KEY: ${OSS_SECRET_KEY:-}
+      OSS_PREFIX: ${OSS_PREFIX:-flovart}
+      OSS_ADDRESSING_STYLE: ${OSS_ADDRESSING_STYLE:-auto}
+      OSS_PRESIGN_TTL: ${OSS_PRESIGN_TTL:-3600}
+      OSS_ENFORCE_QUOTA: ${OSS_ENFORCE_QUOTA:-1}
+      OSS_QUOTA_BYTES: ${OSS_QUOTA_BYTES:-2147483648}
+      # ---- 反代信任来源：反代在宿主机时填 docker 网桥网段，不能填 * ----
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
+      # ---- 可观测性（Logfire，留空即关闭）----
+      LOGFIRE_TOKEN: ${LOGFIRE_TOKEN:-}
+      LOGFIRE_ENVIRONMENT: ${LOGFIRE_ENVIRONMENT:-}
+      # ---- 服务标识（Logfire service_name，勿写死成别的业务名）----
+      BFF_SERVICE_NAME: flovart-bff
+      # ---- 可写数据目录（必须指到卷，根文件系统只读）----
+      BFF_DATA_DIR: /data
+      # 管理员 PAT 本地缓存 + 注册赠送幂等账本，都在 /data 卷。
+      # PAT 401 自愈（读回恢复）会把现行 PAT 落盘到这里，重启免重复登录。
+      BFF_ADMIN_CRED_FILE: /data/admin_cred.json
+      BFF_SIGNUP_STATE_FILE: /data/signup_bonus.json
+    # 卷内容：admin_cred.json（管理员 PAT 缓存）、user_keys.json（用户密钥密文）、
+    # signup_bonus.json（注册赠送幂等账本）、flovart_cloud.db（回落 SQLite）、
+    # media/（回落本地媒体目录）。
+    # ⚠️ 丢了这个卷：所有用户的云端数据与媒体不可见、注册赠送资格被重置（可重复领）。
+    # 卷名与 hewapi 的 `bff-data` 显式区分，且用绝对 name 避免被 project 前缀影响。
+    volumes:
+      - flovart-bff-data:/data
+    healthcheck:
+      # 编排层探针查 /readyz（含配置校验），比镜像内置的 /healthz 更严格。
+      # 用 python 而非 curl：镜像刻意没装 curl（少一个依赖、构建不依赖 apt 源）。
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # 根文件系统只读：状态全在 /data 卷。tmpfs 给 64m（PSD/多图层上传 spool，
+    # 比 hewapi 的 16m 大；tmpfs 计入 memory 限额，大文件场景同步调大 memory）。
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+volumes:
+  flovart-bff-data:
+    # 显式绝对名，不带 project 前缀 —— 与 hewapi 的 bff-data 一眼可区分，
+    # 也不会因为将来改 project name 导致「数据卷凭空消失」。
+    name: flovart-bff-data

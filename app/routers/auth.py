@@ -85,10 +85,13 @@ async def login(body: LoginBody, request: Request, response: Response):
     except NewApiError as e:
         if e.status_code == 429:      # 上游限流，原样透传含等待时长的提示
             return fail(e.message, 429)
+        # 只在文案确属密码错误时才改写；其余上游 400（如「需要安全验证」=网关
+        # 开了人机验证/Turnstile，服务端 BFF 无法过验证码）必须原样透传，
+        # 否则真实故障会被吞成「密码错误」假象（2026-09-18~20 登录血案根因之一）。
         msg = e.message
-        if "password" in msg.lower() or "用户名或密码" in msg or e.status_code == 400:
-            msg = "用户名或密码错误"
-        return fail(msg, 401 if e.status_code in (400, 401) else e.status_code)
+        if "password" in msg.lower() or "用户名或密码" in msg:
+            return fail("用户名或密码错误", 401)
+        return fail(msg, e.status_code)
     role = int((info.get("user") or {}).get("role") or 0)
     set_session(response, {"uid": info["uid"], "username": info["username"],
                            "pat": info["pat"], "role": role})

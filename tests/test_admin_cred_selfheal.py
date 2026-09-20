@@ -176,7 +176,8 @@ def test_admin_request_401_rotates_and_persists(monkeypatch):
     monkeypatch.setattr(config, "NEWAPI_ADMIN_PAT", "stale-env-pat")
     monkeypatch.setattr(config, "NEWAPI_ADMIN_UID", 1)
 
-    async def fake_request(method, path, *, headers, json=None, params=None, client=None):
+    async def fake_request(method, path, *, headers, json=None, params=None, client=None,
+                           client_ip=None):
         auth = headers.get("Authorization", "")
         if path == "/api/user/login":
             return {"data": {"user": {"id": 1}, "access_token": "at",

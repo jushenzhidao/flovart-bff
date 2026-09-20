@@ -300,14 +300,13 @@ async def _admin_login() -> None:
     """
     uid, access_token, session = await _admin_session_login()
     try:
-        pat_body = await request("GET", "/api/user/token",
-                                 headers=user_headers(access_token, uid))
+        pat = await _mint_access_token(access_token, uid, config.NEWAPI_ADMIN_PASSWORD)
     finally:
         try:
             await _release_session(access_token, uid, session)
         except Exception:  # noqa: BLE001
             pass
-    _admin_cache["pat"] = pat_body["data"]
+    _admin_cache["pat"] = pat
     _admin_cache["uid"] = uid
     # ⭐ 强制落盘：新 PAT 是凭据文件的最新事实，env 直供模式也必须写（同机其他
     #   实例 401 时重读文件即可自愈）。跨机同步靠读回恢复（见 _self_heal_admin_cred）。
@@ -496,11 +495,50 @@ def _data_of(body: Any) -> dict:
 
 
 # ---------- 认证（用户态）----------
+async def _mint_access_token(session_token: str, uid: int, password: str, *,
+                             client_ip: str | None = None) -> str:
+    """换取账号的系统访问令牌（PAT），兼容新旧网关。
+
+    ⭐ new-api v1.0.0-rc.37 起引入「安全验证 proof」（middleware/secure_verification.go）：
+    GET /api/user/token（scope=access_token.generate）**无条件**要求 X-Security-Proof 头，
+    缺失即 403「需要安全验证」。无 2FA/Passkey 的账号唯一可用方式是 **password**：
+    先 POST /api/verify（密码换一次性 proof），再带 proof 换 PAT。
+    proof 与登录会话绑定（SessionID），必须在同一会话内先消费、后归还会话。
+
+    旧版网关没有 /api/verify（未知路由兜底成 SPA HTML → 502），此时跳过 proof
+    直接换——旧网关本来就不拦。除 404/502 外的验证失败（如密码校验不过）绝不重试，
+    原样抛给调用方（该端点有失败计数，重试会锁号）。
+    """
+    headers = user_headers(session_token, uid)
+    proof = ""
+    try:
+        body = await request("POST", "/api/verify", headers=headers,
+                             json={"method": "password",
+                                   "scope": "access_token.generate",
+                                   "password": password},
+                             client_ip=client_ip)
+        proof = (body.get("data") or {}).get("proof_token") or ""
+        if not proof:
+            logger.warning("verify returned empty proof_token; minting without proof")
+    except NewApiError as e:
+        if e.status_code in (404, 502):
+            logger.info("gateway has no /api/verify (pre-rc.37), minting without proof")
+        else:
+            raise
+    if proof:
+        headers = {**headers, "X-Security-Proof": proof}
+    pat_body = await request("GET", "/api/user/token", headers=headers,
+                             client_ip=client_ip)
+    return pat_body["data"]
+
+
 async def login(username: str, password: str, client_ip: str | None = None) -> dict:
     """密码登录 → 换 PAT → **立刻归还会话**。返回 {uid, username, pat, user}。
 
     归还会话是硬性要求（见模块 docstring）：BFF 只需要 PAT、不用会话，
     不归还的话同一账号登满 50 次就永久 409。
+    ⚠️ rc.37 起 data.access_token 是 15 分钟短效会话 JWT（非持久 PAT），
+    只能用作 proof/换 token 的临时凭证，不可当 PAT 存。
     """
     body = await request("POST", "/api/user/login", headers={},
                          json={"username": username, "password": password},
@@ -509,9 +547,7 @@ async def login(username: str, password: str, client_ip: str | None = None) -> d
     access_token = data["access_token"]
     user = data["user"]
     uid = user["id"]
-    pat_body = await request("GET", "/api/user/token",
-                             headers=user_headers(access_token, uid))
-    pat = pat_body["data"]
+    pat = await _mint_access_token(access_token, uid, password, client_ip=client_ip)
     await _release_session(access_token, uid, data.get("session") or {})
     return {"uid": uid, "username": user["username"], "pat": pat, "user": user}
 
