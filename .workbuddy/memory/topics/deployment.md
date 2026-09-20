@@ -485,3 +485,10 @@ OCI 标签 `org.opencontainers.image.revision=1d8fb3e6d1fd...` 与本地 HEAD �
 3. hewapi 不动（继续 uid=1）→ 互踢根治
 4. new-api .env：USER_SESSION_ISSUANCE_LIMIT=10000 防呆
 5. 🔴 纪律：机器账号密码只存服务器 .env，绝不进浏览器/登录表单
+
+## PostgreSQL 内置服务（2026-09-20 晚，两份 compose 同步落地）
+- **格式基准切换**：以后部署文件一律以服务器格式为基准（飞哥明令）——服务器用 `deploy/compose.server.yml`（直拉镜像版，image tag 写死在文件里）+ 新格式 `.env`（无 FLOVART_BFF_IMAGE/APP_VERSION/VCS_REF/PIP_INDEX_URL/PYTHON_IMAGE）。根目录 docker-compose.yml（build 模式）仅本地/备用。
+- 两份 compose 均已内置 postgres 服务：postgres:16-alpine、container_name=flovart-pg、绝对名卷 flovart-pgdata、**无 ports**（仅 compose 内网）、pg_isready 健康检查；bff 加 depends_on service_healthy；环境变量 POSTGRES_HOST/PORT/USER/PASSWORD/DB（PASSWORD `:?` 必填，DSN 留空走分项拼装，config.py:179 支持）。
+- .env.server（本地底稿）已重写为服务器新格式，真实值与现网逐值对齐；deploy/env.server.example / env.server.test 云数据库段同步为「只填 POSTGRES_PASSWORD」。
+- 服务器启用：同步 compose.server.yml → .env 确认 POSTGRES_PASSWORD → `docker compose pull && docker compose up -d` → 验证 `docker compose ps` 双 healthy + `docker logs flovart-bff | grep -i postgres`（连接池就绪）。BFF 启动自动建表/补列。
+- ⚠️ 存量 SQLite（flovart-bff-data 卷里 flovart_cloud.db）不会自动进 PG，搬迁脚本待拍板。

@@ -7,12 +7,16 @@
 #
 # 其余安全/运行语义与仓库生产 compose 完全一致。
 # 升级步骤：改 image tag → docker compose pull bff → docker compose up -d bff
+#
+# 2026-09-20 起内置 postgres 服务（flovart-pg）：元数据不再回落 SQLite。
+# 首次启用：.env 填 POSTGRES_PASSWORD（openssl rand -hex 16）→ docker compose up -d
+# 启动时 BFF 自动建表/补列，零手工 SQL。备份 = 备 flovart-pgdata 卷。
 
 services:
   bff:
     # ⭐ 升级只改这一行：tag = GitHub Actions 产物 sha-<commit前7位>。
     #   实际 tag 以 Actions 运行日志 / GHCR 包页面为准，生产钉 sha tag 别用 latest。
-    image: ghcr.io/jushenzhidao/flovart-bff:sha-5987645
+    image: ghcr.io/jushenzhidao/flovart-bff:sha-71cbf31
     # 容器名参数化：并存多实例时用 FLOVART_BFF_CONTAINER_NAME 区分。
     container_name: ${FLOVART_BFF_CONTAINER_NAME:-flovart-bff}
     restart: unless-stopped
@@ -56,8 +60,15 @@ services:
       WAVESPEED_TIMEOUT: ${WAVESPEED_TIMEOUT:-300}
       WAVESPEED_POLL_INTERVAL: ${WAVESPEED_POLL_INTERVAL:-2}
       WAVESPEED_POLL_MAX: ${WAVESPEED_POLL_MAX:-120}
-      # ---- 云数据库（留空回落 SQLite /data/flovart_cloud.db）----
+      # ---- 云数据库：compose 内置 postgres 服务（flovart-pg）----
+      # POSTGRES_PASSWORD 必填（openssl rand -hex 16）；DSN 留空走分项拼装，
+      # 分项有默认值（服务名 postgres / 5432 / flovart / flovart），一般不用动。
+      # 启动时 BFF 自动建表/补列；留空 POSTGRES_PASSWORD 时 compose 直接报错拒绝启动。
       POSTGRES_DSN: ${POSTGRES_DSN:-}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-flovart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置，用 openssl rand -hex 16 生成}
       POSTGRES_DB: ${POSTGRES_DB:-flovart}
       # ---- 对象存储（OSS_ENABLED=0 时媒体落 /data/media 本地卷）----
       OSS_ENABLED: ${OSS_ENABLED:-0}
@@ -92,6 +103,13 @@ services:
     # 卷名与 hewapi 的 `bff-data` 显式区分，且用绝对 name 避免被 project 前缀影响。
     volumes:
       - flovart-bff-data:/data
+
+    # 等 PG 真正可接受连接（pg_isready 通过）再启动 BFF：
+    # 否则冷启时 BFF 先起、PG 还没就绪，首建表/首请求会撞连接拒绝。
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     healthcheck:
       # 编排层探针查 /readyz（含配置校验），比镜像内置的 /healthz 更严格。
       # 用 python 而非 curl：镜像刻意没装 curl（少一个依赖、构建不依赖 apt 源）。
@@ -121,8 +139,41 @@ services:
           cpus: "1.0"
           memory: 1G
 
+  # ---- 元数据 PostgreSQL（flovart-bff 专属，2026-09-20 新增）----
+  # 刻意不发布端口（无 ports 段）：PG 只在 compose 内部网络可达，公网/宿主机
+  # 都连不进来。进库看数据：docker compose exec postgres psql -U flovart -d flovart
+  # 数据落独立卷 flovart-pgdata（绝对名，与 hewapi 及本服务 bff-data 一眼区分）。
+  postgres:
+    image: postgres:16-alpine
+    container_name: flovart-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-flovart}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置，用 openssl rand -hex 16 生成}
+      POSTGRES_DB: ${POSTGRES_DB:-flovart}
+    volumes:
+      - flovart-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flovart} -d ${POSTGRES_DB:-flovart}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
 volumes:
   flovart-bff-data:
     # 显式绝对名，不带 project 前缀 —— 与 hewapi 的 bff-data 一眼可区分，
     # 也不会因为将来改 project name 导致「数据卷凭空消失」。
     name: flovart-bff-data
+  flovart-pgdata:
+    name: flovart-pgdata

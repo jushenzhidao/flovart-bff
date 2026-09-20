@@ -24,8 +24,12 @@ logger = logging.getLogger("bff")
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    # 启动：数据目录就绪 + 管理员凭证预检（只读日志，不阻塞启动）
+    # 启动：数据目录就绪 + PG 连接池 + 管理员凭证预检（只读日志，不阻塞启动）
     store.ensure_data_dir()
+    # ⚠️ 必须在首个数据访问之前：USE_PG=True 时 cloudstore 全靠 db.pool()，
+    # 不 init 就是 None → 云端文档/媒体/请求日志接口全 500，表也不会建。
+    # （2026-09-20 实锤：此前 lifespan 漏调，生产一直跑 SQLite 才没暴露。）
+    await db.init_pool()
     if config.NEWAPI_BASE_URL_IS_DEFAULT:
         logger.warning("NEWAPI_BASE_URL 未配置，使用默认 %s（请确认这是目标网关）",
                        config.NEWAPI_BASE_URL)
@@ -53,6 +57,7 @@ async def _lifespan(_app: FastAPI):
         await ws.close()  # 归还 WaveSpeed 直连 httpx 连接池
     except Exception:  # noqa: BLE001
         pass
+    await db.close_pool()  # 归还 PG 连接池（docs/storage-architecture.md 语义）
 
 
 app = FastAPI(title=config.SERVICE_NAME, docs_url=None, redoc_url=None, lifespan=_lifespan)
