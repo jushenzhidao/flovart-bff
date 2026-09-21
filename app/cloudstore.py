@@ -193,13 +193,14 @@ class PgMeta(_Meta):
 
     async def media_bytes_used(self, uid):
         pool = await self._c()
-        return await pool.fetchval("SELECT COALESCE(SUM(size),0) FROM cloud_media WHERE uid=$1", uid) or 0
+        return await pool.fetchval(
+            "SELECT COALESCE(SUM(size),0) FROM cloud_media WHERE uid=$1 AND deleted_at IS NULL", uid) or 0
 
     async def overview(self, uid):
         pool = await self._c()
         doc_count = await pool.fetchval("SELECT COUNT(*) FROM cloud_docs WHERE uid=$1", uid)
         m = await pool.fetchrow(
-            "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS t FROM cloud_media WHERE uid=$1", uid)
+            "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS t FROM cloud_media WHERE uid=$1 AND deleted_at IS NULL", uid)
         return {"doc_count": doc_count, "media_count": m["n"], "bytes_used": m["t"],
                 "quota_bytes": config.OSS_QUOTA_BYTES, "media_limit_bytes": MAX_MEDIA_BYTES}
 
@@ -558,7 +559,8 @@ class LocalMeta(_Meta):
         def _():
             conn = self._connect()
             return conn.execute(
-                "SELECT COALESCE(SUM(size),0) FROM cloud_media WHERE uid=?", (uid,)).fetchone()[0]
+                "SELECT COALESCE(SUM(size),0) FROM cloud_media WHERE uid=? AND deleted_at IS NULL",
+                (uid,)).fetchone()[0]
         return await asyncio.to_thread(_)
 
     async def overview(self, uid):
@@ -567,7 +569,7 @@ class LocalMeta(_Meta):
             doc_count = conn.execute(
                 "SELECT COUNT(*) FROM cloud_docs WHERE uid=?", (uid,)).fetchone()[0]
             m = conn.execute(
-                "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS t FROM cloud_media WHERE uid=?",
+                "SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS t FROM cloud_media WHERE uid=? AND deleted_at IS NULL",
                 (uid,)).fetchone()
             return {"doc_count": doc_count, "media_count": m["n"], "bytes_used": m["t"],
                     "quota_bytes": config.OSS_QUOTA_BYTES, "media_limit_bytes": MAX_MEDIA_BYTES}

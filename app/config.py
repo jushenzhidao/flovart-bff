@@ -172,7 +172,7 @@ OSS_PREFIX: str = os.getenv("OSS_PREFIX", "flovart").strip()     # 对象键前�
 OSS_ADDRESSING_STYLE: str = os.getenv("OSS_ADDRESSING_STYLE", "auto").strip()
 OSS_PRESIGN_TTL: int = _int("OSS_PRESIGN_TTL", 3600)             # 前端读取 presigned URL 有效期（秒）
 OSS_ENFORCE_QUOTA: bool = _bool("OSS_ENFORCE_QUOTA", True)
-OSS_QUOTA_BYTES: int = _int("OSS_QUOTA_BYTES", 2 * 1024 * 1024 * 1024)  # 每用户配额（0=不限）
+OSS_QUOTA_BYTES: int = _int("OSS_QUOTA_BYTES", 5 * 1024 * 1024 * 1024)  # 每用户配额（0=不限）
 
 # ---------- PostgreSQL（元数据/索引层）----------
 # 结构化元数据（KV 文档 + 媒体索引 + 配额）落 PostgreSQL，替代本地 SQLite（多副本可共享）。

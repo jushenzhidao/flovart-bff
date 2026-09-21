@@ -82,7 +82,7 @@ services:
       OSS_ADDRESSING_STYLE: ${OSS_ADDRESSING_STYLE:-auto}
       OSS_PRESIGN_TTL: ${OSS_PRESIGN_TTL:-3600}
       OSS_ENFORCE_QUOTA: ${OSS_ENFORCE_QUOTA:-1}
-      OSS_QUOTA_BYTES: ${OSS_QUOTA_BYTES:-2147483648}
+      OSS_QUOTA_BYTES: ${OSS_QUOTA_BYTES:-5368709120}
       # ---- 反代信任来源：反代在宿主机时填 docker 网桥网段，不能填 * ----
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
       # ---- 可观测性（Logfire，留空即关闭）----
