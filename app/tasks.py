@@ -112,6 +112,19 @@ TASK_TYPES: "dict[str, dict]" = {
     "video-gen": {"provider": "gateway", "mode": "async", "async_path": config.GATEWAY_VIDEO_TASKS_PATH},
 }
 
+
+def resolve_split_model(params: dict) -> str:
+    """split-layers 的模型语义值 → 真实模型 id。
+
+    前端只发 model:'pro'（语义值），真实模型名永远不进前端、由 BFF 在此映射。
+    本函数是**唯一映射点**：router 的管理员闸门与 _submit_thirdparty 提交共用，
+    防止两处判断漂移。其余/缺省值一律回默认 qwen 模型（普通用户通道）。
+    """
+    raw = str(params.get("model") or "").strip().lower()
+    if raw in ("pro", "seedream", "seedream-pro"):
+        return config.WAVESPEED_SPLIT_MODEL_PRO
+    return config.WAVESPEED_SPLIT_MODEL
+
 # 代理只需快速转发（提交/查询/取消都应立即返回），用较长但非无限的超时。
 _PROXY_CLIENT: "httpx.AsyncClient | None" = None
 # 同步调用网关（可能较长）的独立 client，超时更长。
@@ -596,8 +609,22 @@ def _is_gemini_image_model(model: str) -> bool:
     return m.startswith("gemini") and "image" in m
 
 
+def _guess_url_mime(url: str) -> str:
+    """从 URL 路径扩展名猜 mime（presigned URL 的 query 不参与）。"""
+    path = (url or "").split("?", 1)[0].lower()
+    ext = path.rsplit(".", 1)[-1] if "." in path.rsplit("/", 1)[-1] else ""
+    return {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp",
+            "heic": "image/heic", "heif": "image/heif"}.get(ext, "image/png")
+
+
 async def _gemini_inline_parts(images: Any) -> list:
-    """把 OpenAI 风格 image[]（data URL / http URL）转成 Gemini inlineData parts。"""
+    """把 OpenAI 风格 image[]（data URL / http URL）转成 Gemini parts。
+
+    - data URL → inlineData（base64）
+    - 公网 http(s) URL → fileData.fileUri 直传（Google 官方支持 public/signed URL，
+      省去 BFF 下载+base64 双重开销；实测前先走 fileData，若上游不支持再兜底下载转 inline）。
+    """
     parts: list = []
     for href in images if isinstance(images, list) else []:
         if not isinstance(href, str) or not href.strip():
@@ -609,17 +636,10 @@ async def _gemini_inline_parts(images: Any) -> list:
                 "mimeType": m.group(1) or "image/png", "data": m.group(2)}})
             continue
         if href.startswith(("http://", "https://")):
-            # 用户链路理论恒为 data URL（前端 materialize）；http 兜底下载转 inline
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as cli:
-                    resp = await cli.get(href)
-                    resp.raise_for_status()
-                mime = (resp.headers.get("content-type") or "image/png").split(";")[0]
-                parts.append({"inlineData": {
-                    "mimeType": mime or "image/png",
-                    "data": base64.b64encode(resp.content).decode()}})
-            except Exception:  # noqa: BLE001 —— 单张参考图失败不拖死整个请求
-                logger.warning("gemini 参考图下载失败，已跳过: %s", href[:80])
+            # Gemini API 支持公网/签名 URL（fileData.fileUri），上游自行拉取，
+            # 避免 BFF 中转下载与 base64 膨胀（70MB 请求体血案同源）。
+            parts.append({"fileData": {
+                "fileUri": href, "mimeType": _guess_url_mime(href)}})
     return parts
 
 
@@ -854,11 +874,12 @@ async def _submit_thirdparty(uid: int, request_id: str, kind: str, spec: dict, p
                     num_images=int(params.get("num_images", 1)),
                 )
             elif kind == "split-layers":
-                model = params.get("model") or config.WAVESPEED_SPLIT_MODEL
+                model = resolve_split_model(params)
                 tp_task_id = await ws.submit_split_layers(
                     uid, source,
                     num_layers=int(params.get("num_layers", 4)),
                     prompt=params.get("prompt", ""), model=model,
+                    resolution=params.get("resolution"),
                 )
             else:
                 raise ValueError(f"unsupported thirdparty kind: {kind}")

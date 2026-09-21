@@ -48,9 +48,17 @@ def ping() -> "tuple[bool, str]":
     try:
         get_client().head_bucket(Bucket=config.OSS_BUCKET)
         return True, "ok"
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code")
-        return False, f"bucket 不可访问({code})"
+    except ClientError:
+        # ⚠️ 部分网关/反代拦截 HEAD 方法（实测 cn.s3ai.cn：GET/PUT 放行、HEAD 一律 403）。
+        # 降级用 list_objects_v2（GET 语义）探测桶可达性，不因 HEAD 被拦而误判不可用。
+        try:
+            get_client().list_objects_v2(Bucket=config.OSS_BUCKET, MaxKeys=1)
+            return True, "ok(head 被网关拦截，list 降级探测通过)"
+        except ClientError as e2:
+            code = e2.response.get("Error", {}).get("Code")
+            return False, f"bucket 不可访问({code})"
+        except Exception as e2:  # noqa: BLE001
+            return False, f"OSS 连接失败: {e2}"
     except Exception as e:  # noqa: BLE001
         return False, f"OSS 连接失败: {e}"
 

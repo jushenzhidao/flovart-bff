@@ -81,8 +81,12 @@ services:
       OSS_PREFIX: ${OSS_PREFIX:-flovart}
       OSS_ADDRESSING_STYLE: ${OSS_ADDRESSING_STYLE:-auto}
       OSS_PRESIGN_TTL: ${OSS_PRESIGN_TTL:-3600}
-      OSS_ENFORCE_QUOTA: ${OSS_ENFORCE_QUOTA:-1}
+      # ⭐ 2026-09-21：默认不限用户配额（ENFORCE=0），磁盘增长靠定期清理控制
+      #    （OSS_RETENTION_DAYS，0=关闭清理）。应急保险丝：.env 配 ENFORCE=1 + QUOTA 启用。
+      OSS_ENFORCE_QUOTA: ${OSS_ENFORCE_QUOTA:-0}
       OSS_QUOTA_BYTES: ${OSS_QUOTA_BYTES:-5368709120}
+      OSS_RETENTION_DAYS: ${OSS_RETENTION_DAYS:-90}
+      OSS_CLEANUP_INTERVAL_HOURS: ${OSS_CLEANUP_INTERVAL_HOURS:-24}
       # ---- 反代信任来源：反代在宿主机时填 docker 网桥网段，不能填 * ----
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
       # ---- 可观测性（Logfire，留空即关闭）----

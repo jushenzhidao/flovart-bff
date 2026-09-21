@@ -5,6 +5,7 @@ app/routers/{auth,keys,usage,console}.py，公共件在 app/{config,security,
 newapi_client,store,promo}.py —— 参考 hewapi-bff 的单文件分节骨架，按域拆开。
 """
 import contextlib
+import asyncio
 import logging
 import os
 
@@ -20,6 +21,21 @@ from .routers import (auth, billing, cloud, console, convert, keys, platform_ser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("bff")
+
+
+async def _media_cleanup_loop():
+    """后台媒体清理循环（见 lifespan 内注释）。任何异常只记日志，下轮再试。"""
+    await asyncio.sleep(300)  # 首轮延迟：探针稳定 + 避开启动高峰
+    while True:
+        try:
+            result = await cloudstore.cleanup_expired_media(
+                config.OSS_RETENTION_DAYS, config.OSS_CLEANUP_BATCH)
+            # skipped=清理关闭/无过期行 都别刷屏；有删除动作才 INFO。
+            if result.get("deleted"):
+                logger.info("媒体定期清理：%s", result)
+        except Exception:  # noqa: BLE001 —— 清理失败绝不影响业务
+            logger.exception("媒体定期清理失败")
+        await asyncio.sleep(max(1, config.OSS_CLEANUP_INTERVAL_HOURS) * 3600)
 
 
 @contextlib.asynccontextmanager
@@ -45,9 +61,20 @@ async def _lifespan(_app: FastAPI):
             logger.warning("启动清扫：%s 条超时 submitted 请求标记为 failed（服务重启丢任务）", swept)
     except Exception:  # noqa: BLE001 —— 清扫失败不阻塞启动
         logger.exception("启动清扫 stale submitted 失败")
+    # 媒体定期清理（2026-09-21 飞哥拍板「去配额上限、上清理机制」）：
+    # created_at 超过 OSS_RETENTION_DAYS 的媒体按批删除（字节+索引），磁盘不再随
+    # 时间无界增长。首轮延迟 5 分钟（避开启动高峰 + 让探针先稳定），此后每
+    # OSS_CLEANUP_INTERVAL_HOURS 跑一次。单 worker（架构铁律），不会多实例重复跑。
+    cleanup_task = None
+    if config.OSS_RETENTION_DAYS > 0:
+        cleanup_task = asyncio.create_task(_media_cleanup_loop())
     # 图片任务（同步/异步双模式）：BFF 不跑 worker；异步透传网关、同步阻塞直出后落盘，
     # 每次提交写一条请求日志（落 PG，见 app/tasks.py）。只需归还 httpx 连接池。
     yield
+    if cleanup_task:
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
     await tasks.close()  # 归还网关代理 httpx 连接池
     await chat.close()  # 归还聊天代理 httpx 连接池
     await na.close()  # 归还 httpx 连接池

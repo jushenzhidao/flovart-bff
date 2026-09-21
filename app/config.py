@@ -171,8 +171,17 @@ OSS_SECRET_KEY: str = os.getenv("OSS_SECRET_KEY", "").strip()
 OSS_PREFIX: str = os.getenv("OSS_PREFIX", "flovart").strip()     # 对象键前缀（同桶多环境隔离）
 OSS_ADDRESSING_STYLE: str = os.getenv("OSS_ADDRESSING_STYLE", "auto").strip()
 OSS_PRESIGN_TTL: int = _int("OSS_PRESIGN_TTL", 3600)             # 前端读取 presigned URL 有效期（秒）
-OSS_ENFORCE_QUOTA: bool = _bool("OSS_ENFORCE_QUOTA", True)
-OSS_QUOTA_BYTES: int = _int("OSS_QUOTA_BYTES", 5 * 1024 * 1024 * 1024)  # 每用户配额（0=不限）
+# ⭐ 2026-09-21 飞哥拍板：**默认不限配额，靠清理机制控制磁盘增长**。
+#    OSS_ENFORCE_QUOTA 仅作为应急保险丝保留（要启用才在 .env 里配 OSS_ENFORCE_QUOTA=1
+#    并给 OSS_QUOTA_BYTES），避免磁盘被单用户塞满殃及同机 PG/其他服务。
+OSS_ENFORCE_QUOTA: bool = _bool("OSS_ENFORCE_QUOTA", False)
+OSS_QUOTA_BYTES: int = _int("OSS_QUOTA_BYTES", 5 * 1024 * 1024 * 1024)  # 每用户配额（0=不限，仅 ENFORCE=1 时生效）
+# 媒体自动清理：created_at 超过 RETENTION_DAYS 的媒体行（含字节对象）定期删除。
+# 0=关闭清理。取舍：一刀切按时间过期、不追溯引用——被清理的媒体在项目/历史里
+# 走既有的 recoverable shell（「媒体文件不存在，请重新选择文件」）。
+OSS_RETENTION_DAYS: int = _int("OSS_RETENTION_DAYS", 90)
+OSS_CLEANUP_INTERVAL_HOURS: int = _int("OSS_CLEANUP_INTERVAL_HOURS", 24)   # 后台循环周期
+OSS_CLEANUP_BATCH: int = _int("OSS_CLEANUP_BATCH", 500)                    # 单轮最多删多少条，防长事务
 
 # ---------- PostgreSQL（元数据/索引层）----------
 # 结构化元数据（KV 文档 + 媒体索引 + 配额）落 PostgreSQL，替代本地 SQLite（多副本可共享）。
@@ -342,6 +351,14 @@ WAVESPEED_MULTIANGLE_MODEL: str = os.getenv(
     "WAVESPEED_MULTIANGLE_MODEL", "wavespeed-ai/flux-kontext-max/multi").strip()
 WAVESPEED_SPLIT_MODEL: str = os.getenv(
     "WAVESPEED_SPLIT_MODEL", "wavespeed-ai/qwen-image/layered").strip()
+# 分层 Pro 模型（2026-09-21 接入，仅管理员可用）：字节 Seedream V5.0 Pro Layer Decomposition。
+# 前端只发语义值 model:'pro'，BFF 在此映射真实模型 id —— 模型名永远不进前端。
+# 参数形态与 qwen 不同：不吃 num_layers，吃 prompt/resolution/output_format（必须 png 保透明）。
+# 价格 $0.765/次(1k/1.5k)、$1.53(2k)，约为 qwen 的 8~15 倍 —— 这是「仅管理员可见」的主因。
+WAVESPEED_SPLIT_MODEL_PRO: str = os.getenv(
+    "WAVESPEED_SPLIT_MODEL_PRO", "bytedance/seedream-v5.0-pro/layer-decomposition").strip()
+WAVESPEED_SPLIT_PRO_RESOLUTION: str = os.getenv(
+    "WAVESPEED_SPLIT_PRO_RESOLUTION", "1k").strip()  # 1k | 1.5k | 2k
 WAVESPEED_TIMEOUT: int = _int("WAVESPEED_TIMEOUT", 300)            # 单次提交/轮询 HTTP 超时（秒）
 WAVESPEED_POLL_INTERVAL: int = _int("WAVESPEED_POLL_INTERVAL", 2)  # 轮询间隔（秒）
 WAVESPEED_POLL_MAX: int = _int("WAVESPEED_POLL_MAX", 120)          # 最大轮询次数（≈ MAX*INTERVAL 秒）

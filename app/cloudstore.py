@@ -70,6 +70,14 @@ class _Meta:
     async def media_index_delete(self, uid, key) -> bool:
         raise NotImplementedError
 
+    async def media_list_expired(self, cutoff: datetime, limit: int) -> list:
+        """created_at 早于 cutoff 的媒体行（全局、不分 uid），供定期清理用。
+
+        返回 [{uid, media_key, size, created_at}]；不做软删过滤——软删行（blob
+        早已真删）只剩索引行，一并硬删做幂等清扫。
+        """
+        raise NotImplementedError
+
     async def media_bytes_used(self, uid) -> int:
         raise NotImplementedError
 
@@ -190,6 +198,15 @@ class PgMeta(_Meta):
         pool = await self._c()
         row = await pool.execute("DELETE FROM cloud_media WHERE uid=$1 AND media_key=$2", uid, key)
         return int(row.split()[1]) > 0
+
+    async def media_list_expired(self, cutoff, limit):
+        pool = await self._c()
+        rows = await pool.fetch(
+            "SELECT uid, media_key, COALESCE(size,0) AS size, created_at "
+            "FROM cloud_media WHERE created_at < $1 ORDER BY created_at LIMIT $2",
+            cutoff, limit)
+        return [{"uid": r["uid"], "media_key": r["media_key"], "size": r["size"],
+                 "created_at": _iso(r["created_at"])} for r in rows]
 
     async def media_bytes_used(self, uid):
         pool = await self._c()
@@ -555,6 +572,18 @@ class LocalMeta(_Meta):
             return cur.rowcount > 0
         return await asyncio.to_thread(_)
 
+    async def media_list_expired(self, cutoff, limit):
+        # SQLite 存 ISO 字符串（_utcnow 同款格式），字典序 == 时间序，直接字符串比较。
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT uid, media_key, COALESCE(size,0) AS size, created_at "
+                "FROM cloud_media WHERE created_at < ? ORDER BY created_at LIMIT ?",
+                (cutoff.isoformat(timespec="seconds"), limit)).fetchall()
+            return [{"uid": r["uid"], "media_key": r["media_key"], "size": r["size"],
+                     "created_at": r["created_at"]} for r in rows]
+        return await asyncio.to_thread(_)
+
     async def media_bytes_used(self, uid):
         def _():
             conn = self._connect()
@@ -898,8 +927,40 @@ class LocalBlob(_Blob):
 # ===========================================================================
 # 初始化：根据配置选后端
 # ===========================================================================
+class HybridBlob(_Blob):
+    """OSS 为主、本地磁盘为回退的混合字节后端（2026-09-21 历史媒体 404 修复）。
+
+    背景：单机环境先以 LocalBlob 运行积累了存量媒体（data/media/<uid>/<key前2位>/<key>），
+    之后开启 OSS_ENABLED 切到 OssBlob —— BLOB 是模块级单例，切换后 media_get 只查
+    OSS 桶，存量对象不在桶里 → 全部 404（前端「媒体文件读取失败，请重新选择文件」、
+    @ 素材节点无缩略图）。生产环境全量搬迁后同样无害（回退 miss 而已）。
+
+    策略：写入只进 OSS（新对象统一落桶）；读取先 OSS、miss 落本地磁盘；删除两边各试
+    一次（任一成功即成功）。
+    """
+
+    def __init__(self, primary: _Blob, fallback: _Blob):
+        self.primary = primary
+        self.fallback = fallback
+
+    async def put(self, uid, key, blob, mime, kind):
+        await self.primary.put(uid, key, blob, mime, kind)
+
+    async def get(self, uid, key):
+        info = await self.primary.get(uid, key)
+        if info is not None:
+            return info
+        return await self.fallback.get(uid, key)
+
+    async def delete(self, uid, key):
+        ok1 = await self.primary.delete(uid, key)
+        ok2 = await self.fallback.delete(uid, key)
+        return bool(ok1 or ok2)
+
+
 META: _Meta = PgMeta() if config.USE_PG else LocalMeta()
-BLOB: _Blob = OssBlob() if config.OSS_ENABLED else LocalBlob()
+BLOB: _Blob = (HybridBlob(OssBlob(), LocalBlob())
+               if config.OSS_ENABLED else LocalBlob())
 
 
 # ===========================================================================
@@ -962,6 +1023,39 @@ async def media_delete(uid: int, key: str) -> bool:
         except Exception as e:  # noqa: BLE001
             logger.warning("删除媒体字节失败 key=%s: %s", key, e)
     return ok
+
+
+async def cleanup_expired_media(retention_days: int, limit: int = 500,
+                                dry_run: bool = False) -> dict:
+    """定期清理：删除 created_at 早于 retention_days 的媒体（字节 + 索引）。
+
+    2026-09-21 飞哥拍板「去配额上限、上清理机制」后的磁盘控制手段：
+    - 一刀切按 created_at 过期，**不追溯是否仍被项目/历史引用**——被清掉的媒体
+      在项目节点/历史卡片里走既有的 recoverable shell（媒体缺失可重新选择）。
+    - 单轮最多 limit 条（防长事务/长循环），删完返回统计；跑失败不影响业务。
+    - 软删行（历史遗留）一并硬删：其 blob 早已删除，BLOB.delete 返回 False 无妨。
+    """
+    if retention_days <= 0:
+        return {"skipped": True, "reason": "OSS_RETENTION_DAYS<=0"}
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    rows = await META.media_list_expired(cutoff, max(1, int(limit)))
+    total_bytes = sum(r["size"] or 0 for r in rows)
+    if dry_run:
+        return {"dry_run": True, "expired": len(rows), "bytes": total_bytes,
+                "retention_days": retention_days}
+    deleted, freed, errors = 0, 0, 0
+    for row in rows:
+        uid, key = row["uid"], row["media_key"]
+        try:
+            await BLOB.delete(uid, key)
+        except Exception as e:  # noqa: BLE001 —— 字节删除失败仍删索引，避免无限重试死循环
+            logger.warning("清理媒体字节失败 uid=%s key=%s: %s", uid, key, e)
+            errors += 1
+        if await META.media_index_delete(uid, key):
+            deleted += 1
+            freed += row["size"] or 0
+    return {"deleted": deleted, "bytes": freed, "errors": errors,
+            "scanned": len(rows), "retention_days": retention_days}
 
 
 async def storage_overview(uid: int) -> dict:

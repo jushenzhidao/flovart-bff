@@ -318,3 +318,22 @@ async def console_request_detail(request_id: str,
     row["result"] = _strip_b64(row.get("result"))
     row["payload"] = _strip_b64(row.get("payload"))
     return ok(row)
+
+
+# ---------- 媒体清理 ----------
+@router.get("/api/console/oss/cleanup")
+async def console_cleanup_preview(days: int = 0,
+                                  _s: dict = Depends(require_admin)):
+    """dry-run：统计将有多少媒体被清理（按 OSS_RETENTION_DAYS，可用 days 覆盖预览）。"""
+    result = await cloudstore.cleanup_expired_media(
+        days or config.OSS_RETENTION_DAYS, config.OSS_CLEANUP_BATCH, dry_run=True)
+    return ok(result)
+
+
+@router.post("/api/console/oss/cleanup")
+async def console_cleanup_run(days: int = 0,
+                              _s: dict = Depends(require_admin)):
+    """立即执行一轮清理（默认按 OSS_RETENTION_DAYS；days 可临时覆盖本次阈值）。"""
+    result = await cloudstore.cleanup_expired_media(
+        days or config.OSS_RETENTION_DAYS, config.OSS_CLEANUP_BATCH, dry_run=False)
+    return ok(result)

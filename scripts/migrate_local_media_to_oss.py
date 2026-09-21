@@ -54,7 +54,9 @@ async def main(dry_run: bool) -> int:
                       s3={"addressing_style": config.OSS_ADDRESSING_STYLE or "auto"}),
     )
     try:
-        s3.head_bucket(Bucket=config.OSS_BUCKET)
+        # ⚠️ 不要用 head_bucket：部分网关/反代拦截 HEAD 方法（实测 cn.s3ai.cn：GET/PUT
+        # 放行、HEAD 一律 403）。list_objects_v2 是 GET 语义，探测桶可达性不受影响。
+        s3.list_objects_v2(Bucket=config.OSS_BUCKET, MaxKeys=1)
     except EndpointConnectionError:
         print(f"❌ OSS 连不通：{config.OSS_ENDPOINT}")
         return 2
@@ -120,9 +122,11 @@ async def main(dry_run: bool) -> int:
 
 
 def _exists(s3, key: str) -> bool:
+    # ⚠️ 不要用 head_object：网关拦 HEAD（403 会被误判为「不存在」→ 全量重传）。
+    # 用 list_objects_v2 精确前缀判存在（media key 含唯一随机段，MaxKeys=1 即精确匹配）。
     try:
-        s3.head_object(Bucket=config.OSS_BUCKET, Key=key)
-        return True
+        r = s3.list_objects_v2(Bucket=config.OSS_BUCKET, Prefix=key, MaxKeys=1)
+        return any(o["Key"] == key for o in r.get("Contents", []))
     except ClientError:
         return False
 

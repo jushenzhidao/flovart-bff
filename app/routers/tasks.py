@@ -22,10 +22,10 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .. import cloudstore, platform_catalog, tasks
+from .. import cloudstore, config, platform_catalog, tasks
 from ..platform_catalog import ModelSuspendedError
 from ..resp import ok
-from ..security import require_session
+from ..security import is_admin, require_session
 
 logger = logging.getLogger("bff.tasks_router")
 
@@ -43,6 +43,13 @@ async def create_task(body: SubmitBody, session: dict = Depends(require_session)
         raise HTTPException(status_code=400, detail=f"不支持的任务类型: {body.type}")
     if not isinstance(body.params, dict):
         raise HTTPException(status_code=400, detail="params 必须是对象")
+    # ⭐ Pro 分层管理员闸门（飞哥 2026-09-21）：Seedream V5.0 Pro Layer Decomposition
+    #    单价 $0.765+，约为 qwen 分层的 8~15 倍，先只对管理员开放内测。
+    #    前端只是不显示（治「看见」），准入判定必须放服务端（治「能不能调」）。
+    #    语义值 model:'pro' 由 tasks.resolve_split_model 统一映射，勿在此重复判断模型名。
+    if body.type == "split-layers" and not is_admin(session):
+        if tasks.resolve_split_model(body.params) == config.WAVESPEED_SPLIT_MODEL_PRO:
+            raise HTTPException(status_code=403, detail="Pro 分层模型仅管理员可用")
     # ⭐ 平台下架闸门（飞哥 2026-09-16）：模型被管理员下架/删除后，**即使调用方
     #    本地还缓存着那条平台服务影子条目**（没刷新页面），也必须在这里被拦掉。
     #    前端拉取只能治「显示」，治不了「能不能调」—— 准入判定只能放服务端。

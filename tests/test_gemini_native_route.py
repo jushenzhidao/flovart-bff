@@ -53,25 +53,23 @@ def test_gemini_inline_parts_from_data_urls():
     ]
 
 
-def test_gemini_inline_parts_http_failure_skipped(monkeypatch):
-    """http 参考图下载失败只跳过该张，不拖死整个请求。"""
-    import httpx
-
-    class _Boom:
-        async def __aenter__(self):
-            raise httpx.ConnectError("boom")
-
-        async def __aexit__(self, *a):
-            return False
-
-    monkeypatch.setattr(httpx, "AsyncClient", lambda timeout: _Boom())
+def test_gemini_inline_parts_http_url_becomes_file_data():
+    """公网 http(s) 参考图 → fileData.fileUri 直传（Gemini 官方支持公网/签名 URL）。"""
 
     async def main():
         return await tasks._gemini_inline_parts(
-            ["https://example.com/a.png", "data:image/png;base64,KEEP"])
+            ["https://example.com/a.png?X-Amz-Signature=x",
+             "https://example.com/photo.jpg",
+             "data:image/png;base64,KEEP"])
 
     parts = asyncio.run(main())
-    assert parts == [{"inlineData": {"mimeType": "image/png", "data": "KEEP"}}]
+    assert parts == [
+        {"fileData": {"fileUri": "https://example.com/a.png?X-Amz-Signature=x",
+                      "mimeType": "image/png"}},
+        {"fileData": {"fileUri": "https://example.com/photo.jpg",
+                      "mimeType": "image/jpeg"}},
+        {"inlineData": {"mimeType": "image/png", "data": "KEEP"}},
+    ]
 
 
 # ---------------------------------------------------------------------------

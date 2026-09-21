@@ -177,22 +177,39 @@ async def submit_multi_angle(uid: int, source_media_key: str, *, rotate=0, tilt=
     return str(pred_id)
 
 
+def build_split_layers_body(model: str, src_url: str, *, num_layers=4,
+                            prompt="", resolution=None) -> "dict[str, Any]":
+    """按模型构造分层提交体（纯函数，便于单测覆盖两种参数形态）。"""
+    if "layer-decomposition" in model or "seedream" in model:
+        # Seedream V5.0 Pro Layer Decomposition：不吃 num_layers；
+        # ⚠️ output_format 必须 png（默认 jpeg 会丢透明通道）。
+        body: "dict[str, Any]" = {
+            "image": src_url,
+            "resolution": (resolution or config.WAVESPEED_SPLIT_PRO_RESOLUTION or "1k").lower(),
+            "output_format": "png",
+        }
+    else:
+        # qwen-image/layered：num_layers（2~8）控制层数
+        body = {"image": src_url, "num_layers": int(num_layers)}
+    if prompt:
+        body["prompt"] = prompt
+    return body
+
+
 async def submit_split_layers(uid: int, source_media_key: str, *, num_layers=4,
-                              prompt="", model=None) -> str:
+                              prompt="", model=None, resolution=None) -> str:
     """提交分层（图层分解）任务，返回 WaveSpeed prediction id。
 
-    模型：WAVESPEED_SPLIT_MODEL（默认 wavespeed-ai/qwen-image/layered）。
-    把单图拆成多张 RGBA 透明层；num_layers 控制层数（2~8），prompt 可选引导语义分组。
+    双模型按 model 分支（2026-09-21 接入 Seedream Pro 分层，仅管理员）：
+    - 默认 wavespeed-ai/qwen-image/layered：num_layers（2~8）控制层数，prompt 可选引导语义分组。
+    - bytedance/seedream-v5.0-pro/layer-decomposition：prompt 直接描述要拆的层/分组
+      （不传则模型自动识别元素）；resolution 1k/1.5k/2k。
     源图复用 _resolve_source_url（本地存储自动上传换公网 URL）。
     """
     src_url = await _resolve_source_url(uid, source_media_key)
     model = model or config.WAVESPEED_SPLIT_MODEL
-    body: "dict[str, Any]" = {
-        "image": src_url,
-        "num_layers": int(num_layers),
-    }
-    if prompt:
-        body["prompt"] = prompt
+    body = build_split_layers_body(model, src_url, num_layers=num_layers,
+                                   prompt=prompt, resolution=resolution)
     resp = await _client().post(f"/v3/{model}", json=body)
     if resp.status_code >= 400:
         logger.error("WaveSpeed split submit failed %s: %s", resp.status_code, resp.text[:500])
