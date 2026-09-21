@@ -91,6 +91,17 @@ def head_object_meta(key: str) -> "dict | None":
     try:
         return get_client().head_object(Bucket=config.OSS_BUCKET, Key=key)
     except ClientError:
+        # 部分网关/CDN（nginx 反代等）会拦截 HEAD 方法（403），GET 却放行。
+        # 降级：list_objects_v2 精确判存在（S3 对精确前缀是索引查询，零下载）。
+        # 307 架构下 mime/size 由 OSS 对 presigned URL 的最终 GET 响应提供，此处只需存在性。
+        try:
+            r = get_client().list_objects_v2(Bucket=config.OSS_BUCKET, Prefix=key, MaxKeys=1)
+            for o in r.get("Contents", []):
+                if o["Key"] == key:
+                    return {"ContentLength": int(o.get("Size", 0)),
+                            "ContentType": "application/octet-stream"}
+        except ClientError:
+            pass
         return None
 
 
