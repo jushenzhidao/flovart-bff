@@ -1091,6 +1091,9 @@ def strip_b64(obj, _max: int = 256):
         return out
     if isinstance(obj, list):
         return [strip_b64(x, _max) for x in obj]
+    # 任意键名下的裸 data-uri（如 image[] 里的 data:image/png;base64,...）也剥掉
+    if isinstance(obj, str) and obj.startswith("data:") and len(obj) > _max:
+        return f"<data-uri:{len(obj)} chars>"
     return obj
 
 

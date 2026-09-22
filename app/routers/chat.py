@@ -92,8 +92,15 @@ async def chat_completions(request: Request, session: dict = Depends(require_ses
     model = payload.get("model") or config.CHAT_DEFAULT_MODEL
     # 引用图片时强制走视觉模型：纯文本模型（如 deepseek-v4-flash）无法处理 image_url，
     # 必须由网关视觉模型（gpt-4.1-mini 等）处理。仅当配置了视觉模型且消息确实含图才覆盖。
+    # ⭐ 2026-09-21：视觉模型本身被平台下架/撤回时回退用户请求的模型（否则含图消息
+    #    全部 409 硬失败——视觉模型是 env 配置，平台目录变更后容易失步）。
     if config.CHAT_VISION_MODEL and _messages_have_image(payload.get("messages")):
-        model = config.CHAT_VISION_MODEL
+        try:
+            await platform_catalog.assert_model_available(config.CHAT_VISION_MODEL)
+            model = config.CHAT_VISION_MODEL
+        except ModelSuspendedError:
+            logger.warning("视觉模型 %s 已被平台下架/撤回，回退请求模型 %s",
+                           config.CHAT_VISION_MODEL, model)
     if not model:
         return JSONResponse(
             status_code=400,
