@@ -43,7 +43,8 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
 - **多业务隔离**：每业务必须用**独立** new-api 管理员账号(uid)，严禁共用（PAT 账号级、每次重签作废旧值 → 互踢 401 雪崩）
 - ⚠️ **同一业务多实例并行（蓝绿/灰度切换）同样会互踢**：旧进程（如宝塔 Python 项目管理器跑在 8300）+ 新容器（如 8310）**共用同一个 `NEWAPI_ADMIN_UID`** 时，任一边触发 `_admin_login()`（`newapi_client.py:141`，内部 `GET /api/user/token` **重新生成 PAT 并作废旧值**）就会作废对方 → 对方 401 → 也去重登 → 循环。
   缓解：`.env` 配**有效**的 `NEWAPI_ADMIN_PAT`，两边启动时 `_load_admin_cred()` 都直接用它、都不走登录 → 相安无事；**一旦该 PAT 失效即入循环**（日志刷 `admin PAT rejected, re-login to rotate`、高频登录逼近 new-api 50 会话上限 → 409 → BFF 返 503）。
-  **根治：切换窗口内先停旧进程，或给新实例配独立管理员账号。** 
+  **根治：切换窗口内先停旧进程，或给新实例配独立管理员账号。**
+  🔴 **2026-09-22 升级**：flovart/hewapi/明判三应用共用 uid=1，且上游 `/api/user/self` **不返回** access_token → 读回恢复必失效 → 401 自愈最后一步必然轮换互踢。已加**轮换冷静期熔断** `NEWAPI_ADMIN_ROTATE_COOLDOWN`（默认 900s，期内拒绝再轮换转 503 人工）。共用期间建议三家都设 `NEWAPI_ADMIN_LOGIN_FALLBACK=0` + .env 配有效 PAT；根治仍是独立账号。 
 - ⚠️ `.env` 的 `NEWAPI_ADMIN_PAT` 是易失效一次性快照（点控制台「系统访问令牌」即作废，预期行为）→ **不要让飞哥维护 PAT**；PAT 401 自动回落账密 `_admin_login` 重签。失效只需改 `NEWAPI_ADMIN_PASSWORD`（同账号）
 - ⭐ **网关 rc.37 安全验证 proof**（2026-09-20 全链适配完成）：rc.37 起 `GET /api/user/token` 无条件要求 `X-Security-Proof` 头，缺失 403「需要安全验证」→ `_parse_response` 包成 400 → 曾被 auth.py 改写成假 401「密码错误」（已修，透传原文案）。两仓均已接入 `_mint_access_token()`：`POST /api/verify {method:"password", scope:"access_token.generate"}` 换 proof → 带头换 PAT，旧网关 404/502 自动降级。⚠️ rc.37 `/api/user/self` **不再返回 access_token → 读回自愈失效**，PAT 失效只能走轮换兜底（会作废对端）→ 两台 BFF 共用管理号仍需避免，中期各配独立管理号。网关 MySQL=宝塔宿主机 3396（DSN 走 host-gateway IP，宿主机连 127.0.0.1 会拒），会话上限已抬 ACTIVE=200/ISSUANCE=10000。
 - 出口 quota→points（`config.quota_to_points*`），裸 quota 不外泄；单 worker

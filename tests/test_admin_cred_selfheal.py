@@ -12,6 +12,7 @@ PAT）→ 两边互相作废对方 PAT → 乒乓循环 → 50 会话/100 签发
 import asyncio
 import json
 import os
+import time
 
 import pytest
 
@@ -29,9 +30,12 @@ def _reset_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "NEWAPI_ADMIN_USERNAME", "admin")
     monkeypatch.setattr(config, "NEWAPI_ADMIN_PASSWORD", "pw")
     monkeypatch.setattr(config, "NEWAPI_ADMIN_LOGIN_FALLBACK", True)
+    monkeypatch.setattr(config, "NEWAPI_ADMIN_ROTATE_COOLDOWN", 900)
+    nc._LAST_ADMIN_ROTATE[0] = 0.0
     yield
     nc._admin_cache["pat"] = None
     nc._admin_cache["uid"] = None
+    nc._LAST_ADMIN_ROTATE[0] = 0.0
 
 
 def _write_cred(path, pat, uid=1):
@@ -147,8 +151,150 @@ def test_self_heal_concurrent_401s_login_only_once(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 4) admin_request 全链路：401 → 采纳共享凭据 → 用新 PAT 重试成功
+# 3.5) 轮换冷静期熔断（2026-09-22 三应用共用 uid=1 互踢血案）
 # ---------------------------------------------------------------------------
+def test_cooldown_blocks_second_rotation(monkeypatch):
+    """冷静期内已轮换过仍 401 → 拒绝再轮换、抛 503（防三应用乒乓烧额度）。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 60  # 60s 前刚轮换过，冷静期 900s
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    with pytest.raises(nc.NewApiError) as ei:
+        asyncio.run(nc._self_heal_admin_cred())
+    assert ei.value.status_code == 503
+    assert login_calls == []
+
+
+def test_cooldown_expired_allows_rotation(monkeypatch):
+    """冷静期过后再次 401 → 允许兜底轮换（自愈能力不丢，只是限频）。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 901  # 恰好超出 900s 冷静期
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+        nc._admin_cache["pat"] = "freshly-rotated"
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred())
+    assert login_calls == [1]
+    assert nc._admin_cache["pat"] == "freshly-rotated"
+
+
+def test_cooldown_disabled_allows_immediate_rotation(monkeypatch):
+    """NEWAPI_ADMIN_ROTATE_COOLDOWN=0（单应用独占账号）→ 行为与旧版一致。"""
+    monkeypatch.setattr(config, "NEWAPI_ADMIN_ROTATE_COOLDOWN", 0)
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    nc._LAST_ADMIN_ROTATE[0] = time.monotonic()  # 刚轮换过也不拦
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+        nc._admin_cache["pat"] = "freshly-rotated"
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred())
+    assert login_calls == [1]
+
+
+def test_cooldown_not_triggered_by_file_adoption(monkeypatch):
+    """冷静期内但对端已落盘新值 → 采纳文件即可，不触发熔断也不 login。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 10
+    _write_cred(config.ADMIN_CRED_FILE, "peer-rotated-pat", 1)
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred())
+    assert nc._admin_cache["pat"] == "peer-rotated-pat"
+    assert login_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 3.6) 401 语义分流（2026-09-22）：账号状态类 401 绝不轮换（互踢点火源之一）
+# ---------------------------------------------------------------------------
+def test_auth_code_helper_parses_detail():
+    e = nc.NewApiError("x", 401, detail="upstream_auth_code=AUTH_USER_DISABLED")
+    assert nc._auth_code_from_error(e) == "AUTH_USER_DISABLED"
+    assert nc._auth_code_from_error(nc.NewApiError("x", 401)) == ""
+    assert nc._auth_code_from_error(nc.NewApiError("x", 401, detail="乱写")) == ""
+
+
+def test_no_rotate_code_rejects_rotation(monkeypatch):
+    """上游明确说 401 是账号状态问题（封禁等）→ 第 0 步即 503，绝不 login/轮换。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    _write_cred(config.ADMIN_CRED_FILE, "peer-rotated-pat", 1)  # 连文件采纳也不该做
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    with pytest.raises(nc.NewApiError) as ei:
+        asyncio.run(nc._self_heal_admin_cred("AUTH_USER_DISABLED"))
+    assert ei.value.status_code == 503
+    assert login_calls == []
+    assert nc._admin_cache["pat"] == "stale-pat"  # 缓存未被改动
+
+
+def test_token_invalid_code_still_rotates(monkeypatch):
+    """AUTH_UNAUTHORIZED（令牌值真的错了）→ 不受分流影响，正常走自愈兜底轮换。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+        nc._admin_cache["pat"] = "freshly-rotated"
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred("AUTH_UNAUTHORIZED"))
+    assert login_calls == [1]
+    assert nc._admin_cache["pat"] == "freshly-rotated"
+
+
+def test_unknown_code_keeps_legacy_behavior(monkeypatch):
+    """旧版上游 401 无结构化 code → 维持旧行为（尝试自愈），由冷静期限频兜底。"""
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+        nc._admin_cache["pat"] = "freshly-rotated"
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred(""))
+    assert login_calls == [1]
+
+
+def test_admin_request_401_account_disabled_no_rotation(monkeypatch):
+    """全链路：401 body 带 AUTH_USER_DISABLED → admin_request 抛 503，全程未轮换。"""
+    nc._admin_cache.update(pat="stale-env-pat", uid=1)
+    monkeypatch.setattr(config, "NEWAPI_ADMIN_PAT", "stale-env-pat")
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+
+    async def fake_request(method, path, *, headers, json=None, params=None, client=None,
+                           client_ip=None):
+        raise nc.NewApiError("unauthorized", 401, detail="upstream_auth_code=AUTH_USER_DISABLED")
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    monkeypatch.setattr(nc, "request", fake_request)
+    with pytest.raises(nc.NewApiError) as ei:
+        asyncio.run(nc.admin_request("GET", "/api/user/self"))
+    assert ei.value.status_code == 503
+    assert login_calls == []
+
+
+
 def test_admin_request_401_recovers_from_shared_file(monkeypatch):
     """模拟：env PAT 失效，但对端 BFF 已轮换并落盘 —— 不 login、直接用新 PAT 重试。"""
     nc._admin_cache.update(pat="stale-env-pat", uid=1)

@@ -38,6 +38,8 @@ import asyncio
 import json as _json
 import logging
 import os
+import re
+import time
 from typing import Any, Optional
 
 import httpx
@@ -179,6 +181,26 @@ def _reload_admin_cred() -> bool:
 # 兜底轮换单飞锁：并发 401 时只放一个协程去 login，其余等锁后先重读文件（双检）。
 # asyncio.Lock 自 3.10 起不再绑定事件循环，模块级懒创建安全。
 _LOGIN_LOCK: "asyncio.Lock | None" = None
+# 🔴 最近一次兜底轮换的 monotonic 时间戳（2026-09-22 三应用共用 uid=1 互踢熔断）。
+#    跨机 + 读回失效场景下，A/B/C 谁轮换谁踢别人 → 无限乒乓烧穿会话/签发额度。
+#    冷静期内拒绝再次轮换（见 _self_heal_admin_cred），把乒乓压成有界抖动。
+_LAST_ADMIN_ROTATE: list = [0.0]
+# 🔴 「401 但不是令牌值错」的上游鉴权码（new-api dashboard 链路，2026-09-22 语义分流）。
+#    这些 401 的根因是账号状态（被封禁/用户信息非法/会话被吊销），轮换 PAT 救不了，
+#    只会白踢共用账号的其他应用（互踢点火源之一）。命中即拒绝自愈轮换、503 转人工。
+#    AUTH_UNAUTHORIZED / AUTH_TOKEN_EXPIRED（令牌值问题）不在内 —— 正常轮换。
+#    未知码/旧版上游无 code → 维持旧行为（尝试自愈），由冷静期兜底限频。
+NO_ROTATE_AUTH_CODES = frozenset({
+    "AUTH_USER_DISABLED",     # 账号被封禁
+    "AUTH_USER_INVALID",      # 用户信息非法
+    "AUTH_SESSION_REVOKED",   # 登录会话被吊销（非 PAT 值问题）
+})
+
+
+def _auth_code_from_error(e: "NewApiError") -> str:
+    """从 401 错误 detail 里提取上游结构化鉴权码（upstream_auth_code=AUTH_*），无则空串。"""
+    m = re.search(r"upstream_auth_code=([A-Z_]+)", getattr(e, "detail", "") or "")
+    return m.group(1) if m else ""
 
 
 def _login_lock() -> "asyncio.Lock":
@@ -188,9 +210,12 @@ def _login_lock() -> "asyncio.Lock":
     return _LOGIN_LOCK
 
 
-async def _self_heal_admin_cred() -> None:
+async def _self_heal_admin_cred(reject_code: str = "") -> None:
     """PAT 401 后的自愈序列（多应用共存根治，2026-09-20；跨机版见 READBACK）：
 
+    0. 🔴 语义分流（2026-09-22）：上游 401 带结构化 code 且明确指向**账号状态**问题
+       （封禁/用户信息非法/会话吊销）时，轮换 PAT 救不了、只会白踢共用账号的其他
+       应用 → 直接拒绝自愈、503 转人工（互踢点火源之一，见 NO_ROTATE_AUTH_CODES）。
     1. 重读凭据文件 —— 同机多实例（蓝绿/灰度）场景对端可能已轮换并落盘，直接采纳即可；
     2. 文件无新值 → 锁内再查（等锁期间同进程其他协程可能已治愈）；
     3. ⭐ 读回恢复（NEWAPI_ADMIN_PAT_READBACK=1，默认开，跨服务器部署的关键）：
@@ -199,7 +224,18 @@ async def _self_heal_admin_cred() -> None:
        从根上消灭「轮换乒乓」（乒乓只在同账号跨机场景，共享文件帮不上忙）；
     4. 读回失败（账号压根没设过 access_token）才最后兜底轮换
       （NEWAPI_ADMIN_LOGIN_FALLBACK=0 可彻底禁用 3/4 步转人工）。
+    3.5. 🔴 轮换冷静期（NEWAPI_ADMIN_ROTATE_COOLDOWN，默认 900s，2026-09-22 三应用
+      共用 uid=1 血案）：读回失效的上游（/api/user/self 不回 access_token）+ 跨机
+      无共享文件时，A/B/C 谁兜底轮换谁踢别人 → 无限乒乓。冷静期内已轮换过仍 401
+      → 拒绝再轮换、503 转人工，把乒乓压成「每实例每窗口至多一次」。
     """
+    # 第 0 步：账号状态类 401 —— 轮换救不了，绝不轮换（否则白踢共用账号的其他应用）
+    if reject_code in NO_ROTATE_AUTH_CODES:
+        logger.error(
+            "admin 401 code=%s 指向账号状态问题而非 PAT 失效，拒绝自愈轮换"
+            "（轮换不会修复且会作废共用该账号的其他应用 PAT）——"
+            "请到 new-api 后台核对该管理员账号状态/会话", reject_code)
+        raise NewApiError("管理员账号状态异常（非凭证失效），请稍后重试或联系管理员", 503)
     pat_before = _admin_cache["pat"]
     if _reload_admin_cred():
         return
@@ -222,6 +258,20 @@ async def _self_heal_admin_cred() -> None:
                     return
             except NewApiError as e:
                 logger.warning("admin PAT readback failed: %s", e.message)
+        # 第 3.5 步：轮换冷静期熔断（2026-09-22 三应用共用 uid=1 互踢血案）。
+        #   读回已失败 + 冷静期内本进程轮换过 → 此刻再轮换几乎必然踢掉共用同
+        #   一账号的对端，触发乒乓。宁可 503 转人工也不烧互踢循环。
+        if config.NEWAPI_ADMIN_ROTATE_COOLDOWN > 0:
+            since = time.monotonic() - _LAST_ADMIN_ROTATE[0]
+            if since < config.NEWAPI_ADMIN_ROTATE_COOLDOWN:
+                logger.error(
+                    "admin PAT 401 且读回/凭据文件均无法自愈，但 %.0fs 前刚兜底轮换过"
+                    "（冷静期 %ds 内拒绝再轮换）。大概率是多应用共用管理员账号互踢："
+                    "继续轮换只会作废对端 PAT 形成乒乓。请人工处理——① 给每个业务"
+                    "配独立 new-api 管理员账号（根治）；或 ② 在 new-api 后台取当前"
+                    "有效 access_token 更新各实例 NEWAPI_ADMIN_PAT 后重启。",
+                    since, config.NEWAPI_ADMIN_ROTATE_COOLDOWN)
+                raise NewApiError("服务暂时不可用，请稍后重试或联系客服", 503)
         # 第 4 步：最后兜底——真轮换（会作废其他机器/对端的 PAT）
         await _admin_login()
 
@@ -311,6 +361,8 @@ async def _admin_login() -> None:
     # ⭐ 强制落盘：新 PAT 是凭据文件的最新事实，env 直供模式也必须写（同机其他
     #   实例 401 时重读文件即可自愈）。跨机同步靠读回恢复（见 _self_heal_admin_cred）。
     _save_admin_cred(force=True)
+    # 盖轮换时间戳（冷静期熔断用）：冷启无凭证的首次轮换同样会踢对端，一并计入。
+    _LAST_ADMIN_ROTATE[0] = time.monotonic()
 
 
 async def admin_request(method: str, path: str, *, json: Any = None,
@@ -335,8 +387,11 @@ async def admin_request(method: str, path: str, *, json: Any = None,
         # PAT 被外部轮换掉了（官方前端点一次「系统访问令牌」就会作废旧值）。
         # ⭐ 2026-09-20 根治互踢：先重读共享凭据文件自愈，实在不行才锁内兜底轮换 ——
         #   绝不盲目 login（盲目轮换会作废对端 PAT，两边乒乓直到会话/额度双爆）。
-        logger.warning("admin PAT rejected (401), self-healing cred")
-        await _self_heal_admin_cred()
+        # ⭐ 2026-09-22 语义分流：上游 401 code 指向账号状态问题（非令牌值错）时
+        #   直接拒绝轮换转人工 —— 这是「PAT 明明好好的却被当作旧了」的点火源之一。
+        auth_code = _auth_code_from_error(e)
+        logger.warning("admin PAT rejected (401), self-healing cred (auth_code=%s)", auth_code)
+        await _self_heal_admin_cred(auth_code)
         return await request(method, path, json=json, params=params,
                              headers=user_headers(_admin_cache["pat"], _admin_cache["uid"]),
                              client=client)
@@ -365,9 +420,11 @@ async def request_as_user(method: str, path: str, uid: int, *, json: Any = None,
     except NewApiError as e:
         if e.status_code != 401:
             raise
-        # 同 admin_request：先共享凭据自愈，再锁内兜底轮换（多应用共存根治）。
-        logger.warning("admin PAT rejected (401) in request_as_user, self-healing cred")
-        await _self_heal_admin_cred()
+        # 同 admin_request：先共享凭据自愈，再锁内兜底轮换（多应用共存根治）；
+        # 账号状态类 401（auth_code 命中 NO_ROTATE_AUTH_CODES）拒绝轮换转人工。
+        auth_code = _auth_code_from_error(e)
+        logger.warning("admin PAT rejected (401) in request_as_user, self-healing cred (auth_code=%s)", auth_code)
+        await _self_heal_admin_cred(auth_code)
         return await request(method, path, json=json, params=params,
                              headers=user_headers(_admin_cache["pat"], int(uid)),
                              client=client)
@@ -402,9 +459,17 @@ def _parse_response(resp: "httpx.Response", method: str, target: str) -> Any:
         # - 打外部网关（target 是完整 http(s) URL，如 https://api.chatfire.cn/v1/...）→ 是【该服务的
         #   API Key 无效】，跟 BFF 登录态毫无关系。此前一律回「凭证已失效，请重新登录」，
         #   用户被误导去找登录问题（飞哥 2026-09-11 反馈普通用户生图失败即此情形）。
+        # 上游 401 带结构化鉴权码（new-api dashboard 链路：AUTH_UNAUTHORIZED/
+        # AUTH_TOKEN_EXPIRED/AUTH_USER_DISABLED/AUTH_SESSION_REVOKED/AUTH_USER_INVALID）。
+        # 带出去给 admin 401 处理链判断「是不是 PAT 值真的错了」——只有令牌值问题才值得轮换。
+        try:
+            code = str(resp.json().get("code") or "")
+        except ValueError:
+            code = ""
         if target.startswith(("http://", "https://")):
-            raise NewApiError("AI 服务的 API Key 无效或无权限，请在「AI 服务设置」中检查该服务的 Key", 401)
-        raise NewApiError("凭证已失效，请重新登录", 401)
+            raise NewApiError("AI 服务的 API Key 无效或无权限，请在「AI 服务设置」中检查该服务的 Key", 401,
+                              detail=f"upstream_auth_code={code}")
+        raise NewApiError("凭证已失效，请重新登录", 401, detail=f"upstream_auth_code={code}")
     if resp.status_code == 409:
         try:
             code = resp.json().get("code", "")
