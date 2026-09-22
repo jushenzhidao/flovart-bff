@@ -181,10 +181,14 @@ def _reload_admin_cred() -> bool:
 # 兜底轮换单飞锁：并发 401 时只放一个协程去 login，其余等锁后先重读文件（双检）。
 # asyncio.Lock 自 3.10 起不再绑定事件循环，模块级懒创建安全。
 _LOGIN_LOCK: "asyncio.Lock | None" = None
-# 🔴 最近一次兜底轮换的 monotonic 时间戳（2026-09-22 三应用共用 uid=1 互踢熔断）。
+# 最近一次兜底轮换的 monotonic 时间戳（2026-09-22 三应用共用 uid=1 互踢熔断）。
 #    跨机 + 读回失效场景下，A/B/C 谁轮换谁踢别人 → 无限乒乓烧穿会话/签发额度。
 #    冷静期内拒绝再次轮换（见 _self_heal_admin_cred），把乒乓压成有界抖动。
-_LAST_ADMIN_ROTATE: list = [0.0]
+#    ⚠️ 必须用 None 表示「本进程从未轮换过」：monotonic() 是系统开机以来的秒数，
+#    新拉起的容器/全新 CI runner 上该值可能只有几十秒 —— 若初始化成 0.0，
+#    `monotonic() - 0.0` 会被误判成「刚轮换过」，进程启动头一个冷静期内
+#    的 401 全部被错误熔断（2026-09-22 CI 全红 + 重启后 15 分钟不可自愈的真凶）。
+_LAST_ADMIN_ROTATE: "float | None" = None
 # 🔴 「401 但不是令牌值错」的上游鉴权码（new-api dashboard 链路，2026-09-22 语义分流）。
 #    这些 401 的根因是账号状态（被封禁/用户信息非法/会话被吊销），轮换 PAT 救不了，
 #    只会白踢共用账号的其他应用（互踢点火源之一）。命中即拒绝自愈轮换、503 转人工。
@@ -261,8 +265,9 @@ async def _self_heal_admin_cred(reject_code: str = "") -> None:
         # 第 3.5 步：轮换冷静期熔断（2026-09-22 三应用共用 uid=1 互踢血案）。
         #   读回已失败 + 冷静期内本进程轮换过 → 此刻再轮换几乎必然踢掉共用同
         #   一账号的对端，触发乒乓。宁可 503 转人工也不烧互踢循环。
-        if config.NEWAPI_ADMIN_ROTATE_COOLDOWN > 0:
-            since = time.monotonic() - _LAST_ADMIN_ROTATE[0]
+        last_rotate = _LAST_ADMIN_ROTATE
+        if config.NEWAPI_ADMIN_ROTATE_COOLDOWN > 0 and last_rotate is not None:
+            since = time.monotonic() - last_rotate
             if since < config.NEWAPI_ADMIN_ROTATE_COOLDOWN:
                 logger.error(
                     "admin PAT 401 且读回/凭据文件均无法自愈，但 %.0fs 前刚兜底轮换过"
@@ -362,7 +367,7 @@ async def _admin_login() -> None:
     #   实例 401 时重读文件即可自愈）。跨机同步靠读回恢复（见 _self_heal_admin_cred）。
     _save_admin_cred(force=True)
     # 盖轮换时间戳（冷静期熔断用）：冷启无凭证的首次轮换同样会踢对端，一并计入。
-    _LAST_ADMIN_ROTATE[0] = time.monotonic()
+    _LAST_ADMIN_ROTATE = time.monotonic()
 
 
 async def admin_request(method: str, path: str, *, json: Any = None,

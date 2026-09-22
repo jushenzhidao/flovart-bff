@@ -31,11 +31,11 @@ def _reset_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "NEWAPI_ADMIN_PASSWORD", "pw")
     monkeypatch.setattr(config, "NEWAPI_ADMIN_LOGIN_FALLBACK", True)
     monkeypatch.setattr(config, "NEWAPI_ADMIN_ROTATE_COOLDOWN", 900)
-    nc._LAST_ADMIN_ROTATE[0] = 0.0
+    nc._LAST_ADMIN_ROTATE = None
     yield
     nc._admin_cache["pat"] = None
     nc._admin_cache["uid"] = None
-    nc._LAST_ADMIN_ROTATE[0] = 0.0
+    nc._LAST_ADMIN_ROTATE = None
 
 
 def _write_cred(path, pat, uid=1):
@@ -156,7 +156,7 @@ def test_self_heal_concurrent_401s_login_only_once(monkeypatch):
 def test_cooldown_blocks_second_rotation(monkeypatch):
     """冷静期内已轮换过仍 401 → 拒绝再轮换、抛 503（防三应用乒乓烧额度）。"""
     nc._admin_cache.update(pat="stale-pat", uid=1)
-    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 60  # 60s 前刚轮换过，冷静期 900s
+    nc._LAST_ADMIN_ROTATE = time.monotonic() - 60  # 60s 前刚轮换过，冷静期 900s
     login_calls: list = []
 
     async def fake_login():
@@ -172,7 +172,7 @@ def test_cooldown_blocks_second_rotation(monkeypatch):
 def test_cooldown_expired_allows_rotation(monkeypatch):
     """冷静期过后再次 401 → 允许兜底轮换（自愈能力不丢，只是限频）。"""
     nc._admin_cache.update(pat="stale-pat", uid=1)
-    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 901  # 恰好超出 900s 冷静期
+    nc._LAST_ADMIN_ROTATE = time.monotonic() - 901  # 恰好超出 900s 冷静期
     login_calls: list = []
 
     async def fake_login():
@@ -189,7 +189,7 @@ def test_cooldown_disabled_allows_immediate_rotation(monkeypatch):
     """NEWAPI_ADMIN_ROTATE_COOLDOWN=0（单应用独占账号）→ 行为与旧版一致。"""
     monkeypatch.setattr(config, "NEWAPI_ADMIN_ROTATE_COOLDOWN", 0)
     nc._admin_cache.update(pat="stale-pat", uid=1)
-    nc._LAST_ADMIN_ROTATE[0] = time.monotonic()  # 刚轮换过也不拦
+    nc._LAST_ADMIN_ROTATE = time.monotonic()  # 刚轮换过也不拦
     login_calls: list = []
 
     async def fake_login():
@@ -204,7 +204,7 @@ def test_cooldown_disabled_allows_immediate_rotation(monkeypatch):
 def test_cooldown_not_triggered_by_file_adoption(monkeypatch):
     """冷静期内但对端已落盘新值 → 采纳文件即可，不触发熔断也不 login。"""
     nc._admin_cache.update(pat="stale-pat", uid=1)
-    nc._LAST_ADMIN_ROTATE[0] = time.monotonic() - 10
+    nc._LAST_ADMIN_ROTATE = time.monotonic() - 10
     _write_cred(config.ADMIN_CRED_FILE, "peer-rotated-pat", 1)
     login_calls: list = []
 
@@ -215,6 +215,27 @@ def test_cooldown_not_triggered_by_file_adoption(monkeypatch):
     asyncio.run(nc._self_heal_admin_cred())
     assert nc._admin_cache["pat"] == "peer-rotated-pat"
     assert login_calls == []
+
+
+def test_fresh_process_never_rotated_not_blocked(monkeypatch):
+    """全新进程从未轮换过（_LAST_ADMIN_ROTATE=None）→ 不熔断，正常兜底轮换。
+
+    回归 CI 血案（2026-09-22）：旧实现初始化成 0.0，`monotonic() - 0.0` 在
+    开机几十秒的全新 runner/容器上被误判成「47s 前刚轮换过」→ 全部用例被
+    熔断 503。None 哨兵 + 本用例双重防回归。
+    """
+    nc._admin_cache.update(pat="stale-pat", uid=1)
+    assert nc._LAST_ADMIN_ROTATE is None  # fixture 保证：从未轮换
+    login_calls: list = []
+
+    async def fake_login():
+        login_calls.append(1)
+        nc._admin_cache["pat"] = "freshly-rotated"
+
+    monkeypatch.setattr(nc, "_admin_login", fake_login)
+    asyncio.run(nc._self_heal_admin_cred())
+    assert login_calls == [1]
+    assert nc._admin_cache["pat"] == "freshly-rotated"
 
 
 # ---------------------------------------------------------------------------
