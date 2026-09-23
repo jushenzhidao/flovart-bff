@@ -37,6 +37,8 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
 
 ## 架构铁律
 - 登录=BFF 独立注册；注册=管理员影子建 new-api 号+赠送+自动登录（口令只换 PAT，不存密码）
+- ⭐ **生图镜像路由（方案 B，2026-09-23）**：`POST /api/{async/}v1/images/generations` + `GET /api/{async/}v1/images/generations/{req_id}`，路径即语义（优先级高于 params.mode，冲突 warning），响应体=任务协议，仅 image-gen，旧 /api/tasks 保留。前端开关 `USE_MIRROR_IMAGE_ROUTES`（imageTask.ts）。视频镜像待复制同模式。
+- ⚠️ **BFF_COOKIE_SECURE 默认 true**：httpx 脚本直连 http://8300 登录后 cookie 不回发 → 401（浏览器 localhost 豁免）。脚本冒烟须手动带 Cookie 头（参考 `scripts/smoke_mirror_image.py`）
 - 会话=AES-256-GCM 加密 Cookie（`app/security.py`，服务端零存储，勿改回仅签名）
 - 云端=PostgreSQL(asyncpg)+OSS/COS/S3；本机兜底 `USE_PG=False`→LocalMeta(SQLite)+LocalBlob。**cloudstore 改动须同时实现 Pg/Local 两套**
 - new-api 双头 `Authorization:Bearer <PAT>` + `New-Api-User:<uid>`；登录即 DELETE sessions/{sid} 归还（50 上限硬拒绝）
