@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .. import config, cloudstore, image_model_modes, newapi_client as na, promo
 from ..resp import fail, ok
 from ..security import require_admin
+from ..timeutil import iso_to_cn
 
 router = APIRouter()
 
@@ -305,6 +306,9 @@ async def console_requests(username: str = "", uid: int = 0, kind: str = "",
     names = await _uid_username_map({it["uid"] for it in items})
     for it in items:
         it["username"] = names.get(it["uid"], "")
+        # UTC ISO 原串肉眼读不了（微秒+零时区），补东八区友好格式（原字段保留不动）
+        it["created_at_cn"] = iso_to_cn(it.get("created_at"))
+        it["updated_at_cn"] = iso_to_cn(it.get("updated_at"))
     return ok({"items": items, "total": total, "limit": limit, "offset": offset})
 
 
@@ -317,6 +321,8 @@ async def console_request_detail(request_id: str,
         return fail("请求记录不存在", 404)
     row["result"] = _strip_b64(row.get("result"))
     row["payload"] = _strip_b64(row.get("payload"))
+    row["created_at_cn"] = iso_to_cn(row.get("created_at"))
+    row["updated_at_cn"] = iso_to_cn(row.get("updated_at"))
     return ok(row)
 
 

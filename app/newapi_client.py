@@ -506,10 +506,17 @@ def _parse_response(resp: "httpx.Response", method: str, target: str) -> Any:
             "上游响应无法解析为 JSON: method=%s target=%s status=%s content_type=%s body_preview=%r",
             method, target, resp.status_code, content_type, text,
         )
-        # 网关把未知路由兜底成前端 SPA（text/html）——说明该后端端点根本没实现/路径拼错，
-        # 不是偶发上游异常。给前端一个能直接看懂的提示，避免被「上游返回异常」误导。
+        # 网关返回 text/html 分两种情况，按状态码区分，避免误导排障方向：
+        # - 404/200 HTML：未知路由被兜底成前端 SPA → 端点没实现/路径拼错（配置问题，不会自愈）；
+        # - 502/503/504 HTML：nginx 网关页 → 上游进程挂了/重启中（瞬时故障，稍后自愈）。
         preview = f"status={resp.status_code} content_type={content_type} body_preview={text[:300]}"
         if "text/html" in content_type:
+            if resp.status_code in (502, 503, 504):
+                raise NewApiError(
+                    f"网关暂时不可用（{target} 返回 {resp.status_code} 网关错误页），"
+                    f"请稍后重试；若持续报错请检查网关服务状态。",
+                    502, detail=preview,
+                )
             raise NewApiError(
                 f"网关未实现该图片端点（{target} 返回了前端页面而非 JSON）。"
                 f"请确认网关已落地图片接口，或核对同步/异步端点路径配置。",

@@ -53,7 +53,9 @@
         "gateway_request_id": "gw-xxx",
         "mode": "sync",
         "created_at": "2026-09-18T10:00:00",
-        "updated_at": "2026-09-18T10:00:05"
+        "updated_at": "2026-09-18T10:00:05",
+        "created_at_cn": "2026-09-18 18:00:00",
+        "updated_at_cn": "2026-09-18 18:00:05"
       }
     ]
   }
@@ -65,6 +67,7 @@
 - 列表是**摘要行**，不含 payload/result 大字段，要看详情走接口 2。
 - `username` 由 BFF 批量向 new-api 反查回填；上游限流时降级为空串，**不会 500**。
 - `status=failed` + `mode=blocked` = 被平台下架闸门拦截的请求（result 里有 `code=MODEL_SUSPENDED` 与原因）。
+- **时间字段读法**：`created_at`/`updated_at` 是 UTC ISO 原串（带微秒，机器用）；`created_at_cn`/`updated_at_cn` 是东八区 `YYYY-MM-DD HH:MM:SS` 可读格式，**看几点直接读 `_cn` 列**。
 
 ---
 
@@ -104,6 +107,56 @@
 ---
 
 ## 快捷用法
+
+### 典型排障：用户反馈「无法使用」（两步定位）
+
+**第 1 步：查该用户最近 10 条失败请求**（拿到 request_id 和失败概况）
+
+浏览器 F12 控制台（管理员登录测试站后）：
+
+```js
+// 某用户最近 10 条失败请求（console.table 只显示关键列，时间直接读北京时间列）
+fetch('/api/console/requests?username=wangsicong123456&status=failed&limit=10')
+  .then(r => r.json())
+  .then(d => console.table(d.data.items.map(it => ({
+    时间: it.created_at_cn, 用户: it.username, 类型: it.kind,
+    模型: it.model, 状态: it.status, request_id: it.request_id,
+  }))))
+```
+
+curl（先登录拿 Cookie）：
+
+```bash
+curl -c c.txt -X POST https://flovart.oneapis.cn/api/user/login \
+  -H 'Content-Type: application/json' -d '{"username":"管理员","password":"***"}'
+curl -b c.txt 'https://flovart.oneapis.cn/api/console/requests?username=wangsicong123456&status=failed&limit=10'
+```
+
+要点：
+
+- `status=failed` + `limit=10` 就是「最近 10 条失败」；列表按 `created_at` 倒序，**第一条就是最近一次失败**；
+- 摘要行里先看三列：`model`（是不是特定模型才失败）、`created_at`（失败是集中在一个时间窗还是持续）、`task_id` / `gateway_request_id`（留作对账）；
+- 如果**一条失败都查不到但用户说用不了** → 问题不在生图/聊天链路，转向查登录/会话（看容器 stdout 日志）。
+
+**第 2 步：拿 request_id 查具体请求的详细日志**（看真实报错）
+
+```js
+// 用第 1 步列表里的 request_id 逐条查详情
+fetch('/api/console/requests/<request_id>').then(r => r.json()).then(console.log)
+```
+
+```bash
+curl -b c.txt 'https://flovart.oneapis.cn/api/console/requests/<request_id>'
+```
+
+详情里排障看哪里：
+
+| 位置 | 看什么 |
+|---|---|
+| `result.error.detail` | **底层真实原因**（httpx 异常原文 / 上游非 JSON 响应预览），排障主要看这个；`result.error.message` 只是给用户的通用文案 |
+| `result`（succeeded 时） | 产物信息；`upstream_empty_result: true` = 上游 200 但没返回图（常见于渠道模型名配置不对） |
+| `payload` | 提交时的完整入参（提示词、参考图数量等），用于复现 |
+| `mode=blocked` | 被 `code=MODEL_SUSPENDED` 平台下架闸门拦截，属预期拦截不是故障 |
 
 ### 浏览器 F12（管理员登录测试站后，控制台直接跑）
 

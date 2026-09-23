@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from .. import cloudstore
 from ..resp import ok
 from ..security import require_session
+from ..timeutil import iso_to_cn
 
 router = APIRouter()
 
@@ -106,6 +107,10 @@ async def history_records(
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
     data = await cloudstore.request_log_history(_uid(session), limit, offset, kind or "")
+    # 补东八区可读时间（原 UTC ISO 字段保留不动）
+    for it in (data.get("items") or []):
+        it["created_at_cn"] = iso_to_cn(it.get("created_at"))
+        it["updated_at_cn"] = iso_to_cn(it.get("updated_at"))
     return ok(data)
 
 
