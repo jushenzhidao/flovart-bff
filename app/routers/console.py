@@ -11,7 +11,7 @@ import re
 from fastapi import APIRouter, Body, Depends
 from pydantic import BaseModel, Field
 
-from .. import config, cloudstore, image_model_modes, newapi_client as na, promo
+from .. import config, cloudstore, image_model_modes, newapi_client as na, promo, upstream_profiles
 from ..resp import fail, ok
 from ..security import require_admin
 from ..timeutil import iso_to_cn
@@ -256,6 +256,64 @@ async def console_set_image_model_mode(body: ImageModelModeBody,
     """设置某图片模型的同步/异步模式。生图时 BFF 按 params.model 查此项覆盖全局默认。"""
     image_model_modes.set_mode(body.model, body.mode)
     return ok({"model": body.model, "mode": body.mode})
+
+
+# ---------- 上游能力开关（baidu/wenxin 等，运行时可配） ----------
+
+class UpstreamProfileBody(BaseModel):
+    kind: str = Field(..., description="能力 kind，见 GET /api/console/upstream-profiles")
+    value: str = Field(..., description="'baidu'=启用该上游 | 'off'=关闭（回退原通道）")
+
+
+@router.get("/api/console/upstream-profiles")
+async def console_upstream_profiles(_s: dict = Depends(require_admin)):
+    """上游能力开关清单：全部已注册能力 + 生效状态 + 元信息。
+
+    生效规则 = 管理台覆盖（data/upstream_profiles.json）> env PROFILE_<KIND> 默认。
+    开关即时生效（每次提交时读取），无需重启。
+    """
+    return ok({
+        "items": upstream_profiles.capability_views(),
+        "overrides": upstream_profiles.get_overrides(),
+    })
+
+
+@router.put("/api/console/upstream-profiles")
+async def console_set_upstream_profile(body: UpstreamProfileBody,
+                                       _s: dict = Depends(require_admin)):
+    """设置某能力的上游开关（即时生效，不落 env、无需重启）。"""
+    try:
+        upstream_profiles.set_override(body.kind, body.value)
+    except ValueError as e:
+        return fail(str(e), 400)
+    return ok({"kind": body.kind, "value": body.value})
+
+
+# ---------- 计费模式（飞哥 2026-09-28）----------
+class PlatformKeyModeBody(BaseModel):
+    mode: str = Field(..., description="'shared'=平台共享 Key（用户不真实扣费） | "
+                                       "'user'=用户自有 Key（真实扣用户配额）")
+
+
+@router.get("/api/console/platform-key-mode")
+async def console_platform_key_mode(_s: dict = Depends(require_admin)):
+    """当前计费模式（shared/user），见 platform_services 模块内说明。"""
+    from .platform_services import get_key_mode
+
+    return ok({"mode": await get_key_mode()})
+
+
+@router.put("/api/console/platform-key-mode")
+async def console_set_platform_key_mode(body: PlatformKeyModeBody,
+                                        _s: dict = Depends(require_admin)):
+    """切换计费模式（即时生效：下次 GET /api/platform/services 即按新模式下发）。"""
+    from .platform_services import set_key_mode
+
+    try:
+        await set_key_mode(body.mode.strip().lower())
+    except ValueError as e:
+        return fail(str(e), 400)
+    return ok({"mode": body.mode.strip().lower()}, "计费模式已更新")
 
 
 # ---------- 用户请求日志（管理员视角）----------

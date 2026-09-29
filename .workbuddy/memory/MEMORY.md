@@ -43,6 +43,7 @@ Flovart「在线创作站」FastAPI BFF：登录 / 持久化 / new-api 代理。
 - 云端=PostgreSQL(asyncpg)+OSS/COS/S3；本机兜底 `USE_PG=False`→LocalMeta(SQLite)+LocalBlob。**cloudstore 改动须同时实现 Pg/Local 两套**
 - new-api 双头 `Authorization:Bearer <PAT>` + `New-Api-User:<uid>`；登录即 DELETE sessions/{sid} 归还（50 上限硬拒绝）
 - **多业务隔离**：每业务必须用**独立** new-api 管理员账号(uid)，严禁共用（PAT 账号级、每次重签作废旧值 → 互踢 401 雪崩）
+- **计费模式开关（2026-09-28）**：管理台「计费模式」`shared`（默认，共享管理员 Key，用户不真实扣费）↔ `user`（真实扣费：GET /api/platform/services 把条目 key 换成调用者自己的平台 Key + 网关基址；管理员会话不替换防回读污染；失败剥 key 绝不回退管理员 key）。console GET/PUT `/api/console/platform-key-mode`，云端覆盖 > env `PLATFORM_KEY_MODE`，即时生效
 - ⚠️ **同一业务多实例并行（蓝绿/灰度切换）同样会互踢**：旧进程（如宝塔 Python 项目管理器跑在 8300）+ 新容器（如 8310）**共用同一个 `NEWAPI_ADMIN_UID`** 时，任一边触发 `_admin_login()`（`newapi_client.py:141`，内部 `GET /api/user/token` **重新生成 PAT 并作废旧值**）就会作废对方 → 对方 401 → 也去重登 → 循环。
   缓解：`.env` 配**有效**的 `NEWAPI_ADMIN_PAT`，两边启动时 `_load_admin_cred()` 都直接用它、都不走登录 → 相安无事；**一旦该 PAT 失效即入循环**（日志刷 `admin PAT rejected, re-login to rotate`、高频登录逼近 new-api 50 会话上限 → 409 → BFF 返 503）。
   **根治：切换窗口内先停旧进程，或给新实例配独立管理员账号。**

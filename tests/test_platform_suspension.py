@@ -276,7 +276,7 @@ def test_legacy_entry_without_suspended_is_published(store):
 def _submit(body, monkeypatch):
     calls = []
 
-    async def fake_submit(uid, kind, params):
+    async def fake_submit(uid, kind, params, pat=None):
         calls.append((uid, kind, params))
         return {"id": "req-1", "status": "processing"}
 

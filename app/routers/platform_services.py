@@ -197,8 +197,91 @@ async def _read_raw() -> dict:
     }
 
 
+# ---------- 计费模式（飞哥 2026-09-28）----------
+#
+# shared（默认）= 平台共享 Key：条目下发管理员配置的 key/baseUrl（选 B 语义），
+#                 真实调用走平台侧凭证，用户不真实扣费。
+# user         = 用户自有 Key（真实扣费）：条目下发的 key 替换为【调用者自己】的
+#                平台 Key（keys._ensure_token_plain，与 /api/me/ensure-key 同源），
+#                baseUrl 替换为网关基址 —— 调用扣用户自己账号配额，没配额就调不通。
+#
+# 存储独立用一份 cloud_docs（同 uid=0/scope='platform'，doc_key='config'），
+# 不塞进 services 文档：避免与管理员发布服务的乐观锁 revision 互相干扰。
+_KEY_MODE_DOC = "config"
+_KEY_MODES = ("shared", "user")
+
+
+async def get_key_mode() -> str:
+    """生效计费模式：云端覆盖 > config.PLATFORM_KEY_MODE（env 初始默认）。"""
+    try:
+        doc = await cloudstore.doc_get(PLATFORM_UID, PLATFORM_SCOPE, _KEY_MODE_DOC)
+    except Exception:  # noqa: BLE001 —— 存储抖动时回落 env 默认，别让服务列表 500
+        return config.PLATFORM_KEY_MODE
+    mode = ((doc or {}).get("payload") or {}).get("keyMode")
+    return mode if mode in _KEY_MODES else config.PLATFORM_KEY_MODE
+
+
+async def set_key_mode(mode: str) -> None:
+    if mode not in _KEY_MODES:
+        raise ValueError("keyMode 只能是 shared 或 user")
+    doc = await cloudstore.doc_get(PLATFORM_UID, PLATFORM_SCOPE, _KEY_MODE_DOC)
+    payload = dict((doc or {}).get("payload") or {})
+    payload["keyMode"] = mode
+    await cloudstore.doc_put(PLATFORM_UID, PLATFORM_SCOPE, _KEY_MODE_DOC, payload)
+
+
+async def _apply_user_billing(items: list[dict], session: dict) -> list[dict]:
+    """user 计费模式：把每个上架条目的 key/baseUrl 替换成调用者自己的凭证。
+
+    - key ← 用户自己的平台 Key（keys._ensure_token_plain：用户 sk-，扣用户配额；
+      与平台 Key 池 /api/me/ensure-key 完全同源，PAT 失效自动降级管理员代保证，
+      但代保证出来的仍是【该用户名下】的 token，计费照样落该用户）。
+    - baseUrl ← 网关基址（new-api）：任何使用 baseUrl 的调用路径（含旧前端
+      _gateway 直连）都落在 new-api 上按用户配额计费，不再直连第三方。
+    - 拿不到用户 Key（new-api 不可达等）→ 剥 key（keyPresent=False）：前端调用
+      得到明确的「缺 API Key」错误 —— **宁可失败也绝不静默回退管理员 key**，
+      否则真实扣费模式下会漏费。
+    - ⭐ 管理员会话**不替换**：管理端（下架/重新上架/发布）会回读条目再 PUT，
+      若替换会把管理员个人 key 存进共享配置造成污染。管理员自己调用走
+      new-api 时本来就用自己的账号，无需替换。
+    - 下架条目已经剥过凭据（_redact），保持原样。
+    """
+    from ..security import is_admin
+
+    if is_admin(session):
+        return items
+    live = [it for it in items if not it.get("suspended")]
+    if not live:
+        return items
+    user_key = None
+    try:
+        from .keys import _ensure_token_plain
+
+        info = await _ensure_token_plain(session)
+        user_key = str(info.get("key") or "")
+    except Exception as e:  # noqa: BLE001 —— 降级为剥 key，绝不回退管理员 key
+        logger.warning("user 计费模式获取用户平台 Key 失败 uid=%s: %s",
+                       session.get("uid"), e)
+    out: list[dict] = []
+    for it in items:
+        if it.get("suspended"):
+            out.append(it)
+            continue
+        it = dict(it)
+        if user_key:
+            it["key"] = user_key
+            it["baseUrl"] = config.API_BASE_URL
+            it["keyPresent"] = True
+        else:
+            it.pop("key", None)
+            it.pop("baseUrl", None)
+            it["keyPresent"] = False
+        out.append(it)
+    return out
+
+
 @router.get("/api/platform/services")
-async def list_platform_services(_s: dict = Depends(require_session)):
+async def list_platform_services(session: dict = Depends(require_session)):
     """所有登录用户可读：平台共享的 AI 服务列表（见模块头说明）。
 
     普通用户拿到的条目用于「注入自己的 keyVault + 正常调用」，但**不提供
@@ -207,12 +290,21 @@ async def list_platform_services(_s: dict = Depends(require_session)):
     ⭐ 2026-09-16：**下架条目也下发**（`suspended: true`，凭据已剥除）。
     管理员需要看到它们才能「重新上架」，而那不需要再开一个管理员专属接口；
     用户侧由前端过滤，不进入模型选择器。
+
+    ⭐ 2026-09-28 计费模式（keyMode=user 时）：上架条目的 key/baseUrl 按调用者
+    替换为用户自己的平台 Key + 网关基址（见 _apply_user_billing），实现真实
+    扣用户配额；管理员会话与下架条目不替换。响应带 `keyMode` 供前端展示。
     """
     state = await _read_raw()
+    key_mode = await get_key_mode()
+    items = [_redact(s) for s in state["services"]]
+    if key_mode == "user":
+        items = await _apply_user_billing(items, session)
     return ok({
-        "items": [_redact(s) for s in state["services"]],
+        "items": items,
         "revision": state["revision"],
         "updated_at": state["updated_at"],
+        "keyMode": key_mode,
         # 网关基址（= new-api 的 /v1）：用户用自己的 sk- 打这里。
         # 前端 `platformGatewayBaseUrl` 优先读它，缺失时回落站点 config。
         "gatewayBaseUrl": config.API_BASE_URL,

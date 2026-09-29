@@ -51,7 +51,7 @@ def test_blocked_task_logged_as_failed(monkeypatch):
     async def fake_gate(model):
         raise ModelSuspendedError("m1")
 
-    async def fake_submit(uid, kind, params):  # pragma: no cover —— 不应被走到
+    async def fake_submit(uid, kind, params, pat=None):  # pragma: no cover —— 不应被走到
         raise AssertionError("submit 不应被执行")
 
     monkeypatch.setattr(tasks_router.platform_catalog, "assert_model_available", fake_gate)
@@ -77,7 +77,7 @@ def test_byok_gateway_not_blocked_nor_logged(monkeypatch):
     spy = _LogSpy(monkeypatch)
     submits = []
 
-    async def fake_submit(uid, kind, params):
+    async def fake_submit(uid, kind, params, pat=None):
         submits.append(uid)
         return {"id": "r", "status": "processing"}
 

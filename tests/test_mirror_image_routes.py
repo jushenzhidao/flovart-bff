@@ -30,7 +30,7 @@ def catalog_open(monkeypatch):
 def _mirror_submit(app, path, params):
     captured: dict = {}
 
-    async def fake_submit(uid, kind, params_):
+    async def fake_submit(uid, kind, params_, pat=None):
         captured["uid"] = uid
         captured["kind"] = kind
         captured["params"] = params_
@@ -138,7 +138,7 @@ def test_mirror_poll_equivalent_to_tasks_poll(monkeypatch):
 
     view = {"id": "req-9", "status": "succeeded", "result": {"images": [{"url": "u"}]}}
 
-    async def fake_get(request_id, uid):
+    async def fake_get(request_id, uid, pat=None):
         assert (request_id, uid) == ("req-9", 7)
         return view
 
@@ -163,7 +163,7 @@ def test_legacy_tasks_submit_untouched():
 
     calls: list[dict] = []
 
-    async def fake_submit(uid, kind, params):
+    async def fake_submit(uid, kind, params, pat=None):
         calls.append({"uid": uid, "kind": kind, "params": params})
         return {"id": "req-1", "kind": kind, "status": "processing"}
 

@@ -221,6 +221,19 @@ BRAND_CONTACT: str = os.getenv("BFF_BRAND_CONTACT", "").strip()  # 客服联系�
 # 创作站前端直连 new-api 时展示/注入的 API 地址（{base}/v1 OpenAI 兼容端点）
 API_BASE_URL: str = os.getenv("BFF_API_BASE_URL", NEWAPI_BASE_URL.rstrip("/") + "/v1")
 
+# ---------- 平台 Key 计费模式（飞哥 2026-09-28）----------
+# GET /api/platform/services 下发条目时 key/baseUrl 用谁的：
+#   shared（默认，现状）= 下发管理员配置的共享 key —— 真实调用走平台侧凭证，
+#     用户不真实扣费（成本平台担）。
+#   user = 真实扣费：上架条目下发的 key 替换为【调用者自己】的平台 Key
+#     （与 /api/me/ensure-key 同源的用户 sk-），baseUrl 替换为网关基址，
+#     调用扣用户自己账号配额 —— 用户没配额就调不通，充值后才可用。
+# 管理台可在 /api/console/platform-key-mode 动态切换（云端覆盖 > env 初始默认），
+# 切换即时生效（每次 GET 都读），无需重启。仅 env 演示：PLATFORM_KEY_MODE=user
+PLATFORM_KEY_MODE: str = (
+    "user" if os.getenv("PLATFORM_KEY_MODE", "").strip().lower() == "user" else "shared"
+)
+
 APP_VERSION: str = os.getenv("BFF_VERSION", "dev")
 
 # ---------- 可观测性（Logfire，留空即关闭）----------
@@ -296,6 +309,29 @@ GATEWAY_SYNC_MASK_PATH: str = os.getenv("GATEWAY_SYNC_MASK_PATH", "v1/images/gen
 GATEWAY_SYNC_ANNOTATE_PATH: str = os.getenv("GATEWAY_SYNC_ANNOTATE_PATH", "v1/images/generations").strip().strip("/")
 GATEWAY_SYNC_RELIGHT_PATH: str = os.getenv("GATEWAY_SYNC_RELIGHT_PATH", "v1/images/generations").strip().strip("/")
 GATEWAY_SYNC_EDIT_PATH: str = os.getenv("GATEWAY_SYNC_EDIT_PATH", "v1/images/generations").strip().strip("/")
+# ⭐ 2026-09-24 新增（baidu-wenxin 接入，规格书 §5.3）：上游能力档案开关，按能力粒度
+#   控制「flovart params → wenxin:* 上游 body」的适配是否生效。
+#   语法：PROFILE_<KIND大写下划线>=off|baidu；默认全 off —— off 时 adapt() 原样返回
+#   params（逐字节等价，既有链路零影响，回归红线）。示例：PROFILE_REMOVE_BACKGROUND=baidu
+UPSTREAM_PROFILES: dict[str, str] = {
+    k.removeprefix("PROFILE_").lower().replace("_", "-"): v.strip().lower()
+    for k, v in os.environ.items()
+    if k.startswith("PROFILE_") and v.strip().lower() in ("off", "baidu")
+}
+# wenxin 新增能力的 sync 端点（与既有能力同构：统一 v1/images/generations，
+# 靠 body.model=wenxin:* 区分；保留 env 覆盖口便于将来拆独立端点）。
+GATEWAY_SYNC_DEWATERMARK_PATH: str = os.getenv("GATEWAY_SYNC_DEWATERMARK_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_REMOVETEXT_PATH: str = os.getenv("GATEWAY_SYNC_REMOVETEXT_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_ERASE_PATH: str = os.getenv("GATEWAY_SYNC_ERASE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_BEAUTY_PATH: str = os.getenv("GATEWAY_SYNC_BEAUTY_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_FILTER_PATH: str = os.getenv("GATEWAY_SYNC_FILTER_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_RESTORE_PATH: str = os.getenv("GATEWAY_SYNC_RESTORE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_SKETCH_PATH: str = os.getenv("GATEWAY_SYNC_SKETCH_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_TEXTREPLACE_PATH: str = os.getenv("GATEWAY_SYNC_TEXTREPLACE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_BGREPLACE_PATH: str = os.getenv("GATEWAY_SYNC_BGREPLACE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_RESTYLE_PATH: str = os.getenv("GATEWAY_SYNC_RESTYLE_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_REDRAW_PATH: str = os.getenv("GATEWAY_SYNC_REDRAW_PATH", "v1/images/generations").strip().strip("/")
+GATEWAY_SYNC_SIMILAR_PATH: str = os.getenv("GATEWAY_SYNC_SIMILAR_PATH", "v1/images/generations").strip().strip("/")
 # image-gen 的提交模式。
 #
 # ⭐⭐ 2026-09-15 实测改为默认 **sync**（此前默认 async，导致用户生图必失败）：

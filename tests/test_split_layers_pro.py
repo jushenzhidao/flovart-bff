@@ -75,7 +75,7 @@ def test_split_layers_pro_allowed_for_admin(monkeypatch):
 
     captured = {}
 
-    async def fake_submit(uid, kind, params):
+    async def fake_submit(uid, kind, params, pat=None):
         captured.update(uid=uid, kind=kind, params=params)
         return {"id": "req-1", "status": "processing"}
 
@@ -95,7 +95,7 @@ def test_split_layers_default_model_no_gate(monkeypatch):
 
     captured = {}
 
-    async def fake_submit(uid, kind, params):
+    async def fake_submit(uid, kind, params, pat=None):
         captured.update(uid=uid, kind=kind, params=params)
         return {"id": "req-2", "status": "processing"}
 

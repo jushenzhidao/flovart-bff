@@ -41,7 +41,7 @@ router = APIRouter()
 
 
 class SubmitBody(BaseModel):
-    type: str = Field(..., description="image-gen | upscale | remove-background | split-layers | outpaint | mask | annotate | relight | edit | video-gen")
+    type: str = Field(..., description="image-gen | upscale | remove-background | split-layers | outpaint | mask | annotate | relight | edit | video-gen | dewatermark | removetext | erase | beauty | filter | restore | sketch | textreplace | bgreplace | restyle | redraw | similar")
     params: dict[str, Any] = Field(default_factory=dict, description="各 type 请求体，原样透传网关")
 
 
@@ -129,7 +129,10 @@ async def _create_task_common(
                                session.get("uid"), model_name, log_err)
             raise
     # BFF 按 type 的 mode 分流（async 透传网关 tasks / sync 阻塞直出），并记录请求日志。
-    task = await tasks.submit(int(session["uid"]), body.type, params)
+    # pat 透传：sk- 缺失/轮换时优先用用户 PAT 自建（token 归属用户本人，计费正确；
+    # 2026-09-24 计费错账修复——管理员代建的 sk- 会被 new-api 挂到管理员名下）。
+    task = await tasks.submit(int(session["uid"]), body.type, params,
+                              pat=session.get("pat"))
     return ok(task)
 
 
@@ -157,20 +160,20 @@ async def create_task_mirror_async(body: SubmitBody, session: dict = Depends(req
             summary="生图异步轮询（镜像路由，等价 GET /api/tasks/{request_id}）")
 async def get_task_mirror(request_id: str, session: dict = Depends(require_session)):
     # id 即提交时返回的 request_id；网关按 New-Api-User 隔离，越权/不存在返回 404。
-    task = await tasks.get_task(request_id, int(session["uid"]))
+    task = await tasks.get_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(task)
 
 
 @router.get("/api/tasks/{request_id}")
 async def get_task(request_id: str, session: dict = Depends(require_session)):
     # id 即提交时返回的 request_id；网关按 New-Api-User 隔离，越权/不存在返回 404。
-    task = await tasks.get_task(request_id, int(session["uid"]))
+    task = await tasks.get_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(task)
 
 
 @router.delete("/api/tasks/{request_id}")
 async def cancel_task(request_id: str, session: dict = Depends(require_session)):
-    result = await tasks.cancel_task(request_id, int(session["uid"]))
+    result = await tasks.cancel_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(result)
 
 

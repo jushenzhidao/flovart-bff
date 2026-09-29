@@ -49,7 +49,7 @@ def _install_fakes(monkeypatch, captured, gw_raw):
         logs.setdefault(request_id, {}).update(fields)
         return logs[request_id]
 
-    async def fake_gw(method, path, uid, *, json=None, params=None, client=None):
+    async def fake_gw(method, path, uid, *, json=None, params=None, client=None, pat=None):
         captured["method"] = method
         captured["path"] = path
         captured["json"] = json
@@ -263,3 +263,54 @@ def test_poll_queued_processing(monkeypatch):
     monkeypatch.setattr(cloudstore, "request_log_update", fake_update)
     view = asyncio.run(tasks._poll_chatfire_async_image("req-p7", _poll_log(), 7))
     assert view["status"] == "queued"
+
+
+# ---------------------------------------------------------------------------
+# 蒙版编辑：mask 并入 image[] + prompt 补蒙版语义（2026-09-28 实锤此前 mask 被丢）
+# ---------------------------------------------------------------------------
+def test_submit_chatfire_async_mask_appended(monkeypatch):
+    captured: dict = {}
+    gw_raw = {"task_id": "t-mask", "status": "QUEUED", "created_at": 1,
+              "scheduled_at": 0, "replayed": False}
+    _install_fakes(monkeypatch, captured, gw_raw)
+
+    asyncio.run(tasks._submit_chatfire_async_image(
+        7, "req-cf-mask",
+        {"model": "gpt-image-2", "prompt": "清除遮罩区域内的所有内容",
+         "image": ["data:image/png;base64,AAAA"],
+         "mask": "data:image/png;base64,BBBB"}))
+
+    assert captured["json"]["image"] == ["data:image/png;base64,AAAA",
+                                         "data:image/png;base64,BBBB"]
+    # 原提示词已含「遮罩」→ 不重复追加蒙版说明
+    assert captured["json"]["prompt"] == "清除遮罩区域内的所有内容"
+
+
+def test_submit_chatfire_async_mask_adds_hint_when_prompt_lacks_it(monkeypatch):
+    captured: dict = {}
+    gw_raw = {"task_id": "t-mask2", "status": "QUEUED", "created_at": 1,
+              "scheduled_at": 0, "replayed": False}
+    _install_fakes(monkeypatch, captured, gw_raw)
+
+    asyncio.run(tasks._submit_chatfire_async_image(
+        7, "req-cf-mask2",
+        {"model": "gpt-image-2", "prompt": "",
+         "image": ["data:image/png;base64,AAAA"],
+         "mask": "data:image/png;base64,BBBB"}))
+
+    assert captured["json"]["image"][1] == "data:image/png;base64,BBBB"
+    assert "蒙版" in captured["json"]["prompt"]
+
+
+def test_submit_chatfire_async_no_mask_unchanged(monkeypatch):
+    captured: dict = {}
+    gw_raw = {"task_id": "t-nomask", "status": "QUEUED", "created_at": 1,
+              "scheduled_at": 0, "replayed": False}
+    _install_fakes(monkeypatch, captured, gw_raw)
+
+    asyncio.run(tasks._submit_chatfire_async_image(
+        7, "req-cf-nomask",
+        {"model": "gpt-image-2", "prompt": "p", "image": ["data:image/png;base64,AAAA"]}))
+
+    assert captured["json"]["image"] == ["data:image/png;base64,AAAA"]
+    assert captured["json"]["prompt"] == "p"

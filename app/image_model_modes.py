@@ -19,6 +19,7 @@ _IMAGE_KEYS = (
     "stable-diffusion", "sd-", "sd3", "imagen", "midjourney", "wan",
     "kolors", "cogview", "dall", "gemini",
     "layer", "upscale", "remove-bg", "matting",
+    "wenxin",  # 2026-09-24：baidu wenxin 系（wenxin:matting 等 16 个，全图进图出 sync）
 )
 
 

@@ -53,23 +53,31 @@ def test_gemini_inline_parts_from_data_urls():
     ]
 
 
-def test_gemini_inline_parts_http_url_becomes_file_data():
-    """公网 http(s) 参考图 → fileData.fileUri 直传（Gemini 官方支持公网/签名 URL）。"""
+def test_gemini_inline_parts_http_url_downloads_to_inline(monkeypatch):
+    """http(s) 参考图 → BFF 下载转 inlineData（rix 渠道不支持 fileData.fileUri）。"""
+    import base64 as _b64
+    import httpx
+
+    # 最小 PNG（1x1 红点）
+    tiny_png = _b64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=tiny_png,
+                              headers={"content-type": "image/png"})
+
+    fake_dl = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(tasks, "_dl_client", lambda: fake_dl)
 
     async def main():
         return await tasks._gemini_inline_parts(
             ["https://example.com/a.png?X-Amz-Signature=x",
-             "https://example.com/photo.jpg",
              "data:image/png;base64,KEEP"])
 
     parts = asyncio.run(main())
-    assert parts == [
-        {"fileData": {"fileUri": "https://example.com/a.png?X-Amz-Signature=x",
-                      "mimeType": "image/png"}},
-        {"fileData": {"fileUri": "https://example.com/photo.jpg",
-                      "mimeType": "image/jpeg"}},
-        {"inlineData": {"mimeType": "image/png", "data": "KEEP"}},
-    ]
+    assert parts[0]["inlineData"]["mimeType"] == "image/png"
+    assert _b64.b64decode(parts[0]["inlineData"]["data"]) == tiny_png
+    assert parts[1] == {"inlineData": {"mimeType": "image/png", "data": "KEEP"}}
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +119,7 @@ def _install_fakes(monkeypatch, captured, gw_raw):
         logs.setdefault(request_id, {}).update(fields)
         return logs[request_id]
 
-    async def fake_gw(method, path, uid, *, json=None, params=None, client=None):
+    async def fake_gw(method, path, uid, *, json=None, params=None, client=None, pat=None):
         captured["path"] = path
         captured["json"] = json
         return gw_raw
@@ -168,7 +176,7 @@ def test_run_sync_gemini_error_still_recorded(monkeypatch):
     captured: dict = {}
     logs = _install_fakes(monkeypatch, captured, {"candidates": []})
 
-    async def boom(method, path, uid, *, json=None, params=None, client=None):
+    async def boom(method, path, uid, *, json=None, params=None, client=None, pat=None):
         captured["path"] = path
         raise NewApiError("上游服务暂时不可用，请稍后重试", 502)
 
@@ -181,3 +189,78 @@ def test_run_sync_gemini_error_still_recorded(monkeypatch):
     assert captured["path"] == "v1beta/models/gemini-3-pro-image-preview:generateContent"
     assert logs["req-gem-2"]["status"] == "failed"
     assert logs["req-gem-2"]["result"]["error"]["status"] == 502
+
+
+# ---------------------------------------------------------------------------
+# _no_media_error：上游 200 带 {error:{...}} 时必须透传真实原因（2026-09-26 uid=188）
+# ---------------------------------------------------------------------------
+
+def test_no_media_error_passes_through_upstream_error_body():
+    from app.tasks import _no_media_error
+    raw = {"error": {"code": "SAFETY_BLOCK", "message": "content blocked by provider"}}
+    err = _no_media_error(raw)
+    assert err["error"]["message"] == "content blocked by provider"
+    assert err["error"]["code"] == "SAFETY_BLOCK"
+    assert err["error"]["type"] == "upstream_error"
+
+
+def test_no_media_error_fallback_without_error_key():
+    from app.tasks import _no_media_error
+    raw = {"created": 1, "usage": {"prompt_tokens": 5, "completion_tokens": 0}}
+    err = _no_media_error(raw)
+    assert err["error"]["type"] == "upstream_empty_result"
+    assert err["error"]["usage"] == {"prompt_tokens": 5, "completion_tokens": 0}
+
+
+# ---------------------------------------------------------------------------
+# gemini 内联图片服务端压缩（2026-09-26：12MB 原图裸传 → 上游 200+error 无产物）
+# ---------------------------------------------------------------------------
+
+def _noise_png_bytes(w=1400, h=1400):
+    import io as _io
+    import os as _os
+    from PIL import Image as _Image
+    img = _Image.effect_noise((w, h), 64).convert("RGB")
+    buf = _io.BytesIO()
+    img.save(buf, "PNG", optimize=False)
+    return buf.getvalue()
+
+
+def test_shrink_gemini_inline_passes_small_image_through():
+    import base64 as _b64
+    from app.tasks import _shrink_gemini_inline
+    raw = _noise_png_bytes(400, 400)
+    out, mime = _shrink_gemini_inline(_b64.b64encode(raw).decode(), "image/png")
+    assert out == _b64.b64encode(raw).decode() and mime == "image/png"
+
+
+def test_shrink_gemini_inline_downscales_large_image():
+    import base64 as _b64
+    import io as _io
+    from PIL import Image as _Image
+    from app.tasks import _shrink_gemini_inline, _GEMINI_INLINE_MAX_SIDE
+    raw = _noise_png_bytes(3000, 3000)  # 噪声 PNG 远超 4MB
+    out, mime = _shrink_gemini_inline(_b64.b64encode(raw).decode(), "image/png")
+    assert mime == "image/jpeg"
+    img = _Image.open(_io.BytesIO(_b64.b64decode(out)))
+    assert max(img.size) <= _GEMINI_INLINE_MAX_SIDE
+    assert len(_b64.b64decode(out)) < len(raw) // 2
+
+
+def test_shrink_gemini_inline_garbage_passes_through():
+    from app.tasks import _shrink_gemini_inline
+    garbage = "bm90LWFuLWltYWdl"  # not-an-image 的 base64
+    out, mime = _shrink_gemini_inline(garbage, "image/png")
+    assert out == garbage and mime == "image/png"
+
+
+def test_gemini_inline_parts_shrinks_oversize_image():
+    import asyncio as _aio
+    import base64 as _b64
+    from app.tasks import _gemini_inline_parts
+    raw = _noise_png_bytes(3000, 3000)
+    parts = _aio.run(_gemini_inline_parts(["data:image/png;base64," + _b64.b64encode(raw).decode()]))
+    assert len(parts) == 1
+    inline = parts[0]["inlineData"]
+    assert inline["mimeType"] == "image/jpeg"
+    assert len(inline["data"]) < len(_b64.b64encode(raw))
