@@ -18,7 +18,7 @@ import logging
 
 from fastapi import APIRouter, Depends
 
-from .. import config, newapi_client as na
+from .. import config, newapi_client as na, teams
 from ..resp import ok
 from ..security import require_session
 
@@ -43,7 +43,11 @@ async def my_points(session: dict = Depends(require_session)):
       raw_quota / raw_used_quota  裸 quota，仅后台对账用，前端请展示 points
     """
     uid = session["uid"]
-    data = await na.admin_get_user(uid)
+    # 团队成员（飞哥 2026-10-09）：余额展示读主账号池（共享额度池语义）——
+    # 消费实际仍由 new-api 扣子账号自身 quota，池的补给走 teams.ensure_member_quota
+    # 低水位划转；这里只是让子账号看到「团队还有多少钱」而不是自己被划剩的水位。
+    owner_uid = await teams.pool_uid_for(uid)
+    data = await na.admin_get_user(owner_uid if owner_uid else uid)
     # new-api 用户对象：quota=剩余，used_quota=已用；个别版本叫 remain_quota。
     quota = data.get("quota")
     if quota is None:
@@ -55,4 +59,6 @@ async def my_points(session: dict = Depends(require_session)):
         "unit": config.POINTS_UNIT_NAME,
         "raw_quota": quota,
         "raw_used_quota": used,
+        "team_pool": bool(owner_uid),
+        "team_owner_uid": owner_uid,
     })

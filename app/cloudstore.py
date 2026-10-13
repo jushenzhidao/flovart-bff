@@ -23,6 +23,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import asyncpg
+
 from . import config
 from . import db
 from . import oss
@@ -42,6 +44,16 @@ def _iso(dt) -> str:
     if isinstance(dt, datetime):
         return dt.isoformat()
     return str(dt)
+
+
+def _json_load(text, default=None):
+    """JSON 容错解析：坏数据/空串返回 default 而不是炸掉查询。"""
+    if not text:
+        return default if default is not None else {}
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return default if default is not None else {}
 
 
 # ===========================================================================
@@ -121,6 +133,52 @@ class _Meta:
         raise NotImplementedError
 
     async def media_get_shared(self, key, viewer_uid) -> Optional[dict]:
+        raise NotImplementedError
+
+    # ---- 团队（工作室主子账号，飞哥 2026-10-09 拍板）----
+    async def team_create(self, team_id, owner_uid, name) -> dict:
+        raise NotImplementedError
+
+    async def team_get(self, team_id) -> Optional[dict]:
+        raise NotImplementedError
+
+    async def team_get_by_owner(self, owner_uid) -> Optional[dict]:
+        """兼容入口：owner 名下最早创建的一个团队；多团队语义请用 team_list_by_owner。"""
+        raise NotImplementedError
+
+    async def team_list_by_owner(self, owner_uid) -> list:
+        """owner 名下全部团队（按创建时间升序）。一个主账号可建多个团队分组。"""
+        raise NotImplementedError
+
+    async def team_get_by_member(self, uid) -> Optional[dict]:
+        """返回该用户所在团队（含 owner_uid/name/team_id）；非成员返回 None。"""
+        raise NotImplementedError
+
+    async def team_delete(self, team_id) -> bool:
+        """解散团队（连带清理成员行）。"""
+        raise NotImplementedError
+
+    async def team_member_add(self, team_id, uid) -> bool:
+        """uid 已在任意团队（含本团队）返回 False（UNIQUE 冲突）。"""
+        raise NotImplementedError
+
+    async def team_member_remove(self, team_id, uid) -> bool:
+        raise NotImplementedError
+
+    async def team_members(self, team_id) -> list:
+        """返回 [{uid, monthly_limit_points, monthly_topup_points, created_at}]，按加入时间升序。"""
+        raise NotImplementedError
+
+    async def team_member_get(self, uid) -> Optional[dict]:
+        """按 uid 取成员行（含限额与当月划转计数）；非成员返回 None。"""
+        raise NotImplementedError
+
+    async def team_member_set_limit(self, team_id, uid, limit) -> bool:
+        """设置成员月度划转限额（积分，0=不限）。成员不存在返回 False。"""
+        raise NotImplementedError
+
+    async def team_member_add_topup(self, team_id, uid, points, month) -> dict:
+        """划转计数累加：period_month != month 先重置再累加（自然月滚动）。返回累加后 {period_month, monthly_topup_points}。"""
         raise NotImplementedError
 
 
@@ -325,6 +383,67 @@ class PgMeta(_Meta):
             stale, hours)
         return int(tag.split()[-1]) if tag and tag.startswith("UPDATE") else 0
 
+    # ---- 行为埋点（2026-10-13 飞哥拍板自建：用户行为分析，非 Logfire 运维观测）----
+    async def events_insert(self, items):
+        """批量插入行为事件。item: {uid?, client_id, session_id, event, props(dict), path, ua}。"""
+        if not items:
+            return
+        pool = await self._c()
+        await pool.executemany(
+            """INSERT INTO cloud_events(uid, client_id, session_id, event, props_json, path, ua)
+               VALUES($1,$2,$3,$4,$5,$6,$7)""",
+            [(it.get("uid"), it.get("client_id") or "", it.get("session_id") or "",
+              it["event"], json.dumps(it.get("props") or {}, ensure_ascii=False, separators=(",", ":")),
+              it.get("path") or "", it.get("ua") or "") for it in items])
+
+    async def events_summary(self, days: int):
+        """按事件名聚合近 N 天计数（倒序）。"""
+        pool = await self._c()
+        rows = await pool.fetch(
+            """SELECT event, COUNT(*) AS n FROM cloud_events
+               WHERE created_at >= now() - make_interval(days => $1)
+               GROUP BY event ORDER BY n DESC""", days)
+        return [{"event": r["event"], "count": int(r["n"])} for r in rows]
+
+    async def events_daily(self, days: int):
+        """近 N 天每日事件总量（日期升序，报表画趋势用）。"""
+        pool = await self._c()
+        rows = await pool.fetch(
+            """SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, COUNT(*) AS n
+               FROM cloud_events
+               WHERE created_at >= now() - make_interval(days => $1)
+               GROUP BY 1 ORDER BY 1""", days)
+        return [{"day": r["day"], "count": int(r["n"])} for r in rows]
+
+    async def events_recent(self, limit, event="", uid=None):
+        pool = await self._c()
+        clauses, args = [], []
+        if event:
+            clauses.append("event=$" + str(len(args) + 1))
+            args.append(event)
+        if uid is not None:
+            clauses.append("uid=$" + str(len(args) + 1))
+            args.append(uid)
+        clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = await pool.fetch(
+            f"""SELECT id, uid, client_id, session_id, event, props_json, path, created_at
+                FROM cloud_events {clause}
+                ORDER BY created_at DESC LIMIT ${len(args) + 1}""",
+            *args, limit)
+        return [{"id": r["id"], "uid": r["uid"], "client_id": r["client_id"],
+                 "session_id": r["session_id"], "event": r["event"],
+                 "props": _json_load(r["props_json"]), "path": r["path"],
+                 "created_at": _iso(r["created_at"])} for r in rows]
+
+    async def events_active_clients(self, days: int):
+        """近 N 天活跃客户端数（client_id 去重）与活跃用户数（uid 去重）。"""
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """SELECT COUNT(DISTINCT client_id) AS clients,
+                      COUNT(DISTINCT uid) FILTER (WHERE uid IS NOT NULL) AS users
+               FROM cloud_events WHERE created_at >= now() - make_interval(days => $1)""", days)
+        return {"clients": int(row["clients"]), "users": int(row["users"])}
+
     # ---- 素材共享：A 点对点 ----
     async def share_put_batch(self, owner_uid, target_uid, perm, name_map, keys):
         pool = await self._c()
@@ -402,6 +521,122 @@ class PgMeta(_Meta):
                 "mime": row["mime"] or blob.get("mime") or "application/octet-stream",
                 "size": row["size"] or blob.get("size") or 0}
 
+    # ---- 团队 ----
+    async def team_create(self, team_id, owner_uid, name) -> dict:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """INSERT INTO cloud_teams(id, owner_uid, name) VALUES($1,$2,$3)
+               RETURNING id, owner_uid, name, created_at""",
+            team_id, owner_uid, name or "")
+        return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                "name": row["name"], "created_at": _iso(row["created_at"])}
+
+    async def team_get(self, team_id) -> Optional[dict]:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            "SELECT id, owner_uid, name, created_at FROM cloud_teams WHERE id=$1", team_id)
+        if not row:
+            return None
+        return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                "name": row["name"], "created_at": _iso(row["created_at"])}
+
+    async def team_get_by_owner(self, owner_uid) -> Optional[dict]:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            "SELECT id, owner_uid, name, created_at FROM cloud_teams "
+            "WHERE owner_uid=$1 ORDER BY created_at LIMIT 1", owner_uid)
+        if not row:
+            return None
+        return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                "name": row["name"], "created_at": _iso(row["created_at"])}
+
+    async def team_list_by_owner(self, owner_uid) -> list:
+        pool = await self._c()
+        rows = await pool.fetch(
+            "SELECT id, owner_uid, name, created_at FROM cloud_teams "
+            "WHERE owner_uid=$1 ORDER BY created_at", owner_uid)
+        return [{"team_id": r["id"], "owner_uid": r["owner_uid"],
+                 "name": r["name"], "created_at": _iso(r["created_at"])} for r in rows]
+
+    async def team_get_by_member(self, uid) -> Optional[dict]:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """SELECT t.id, t.owner_uid, t.name, t.created_at
+               FROM cloud_team_members m JOIN cloud_teams t ON t.id = m.team_id
+               WHERE m.uid = $1""", uid)
+        if not row:
+            return None
+        return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                "name": row["name"], "created_at": _iso(row["created_at"])}
+
+    async def team_delete(self, team_id) -> bool:
+        pool = await self._c()
+        n = await pool.fetchval("DELETE FROM cloud_teams WHERE id=$1 RETURNING 1", team_id)
+        if not n:
+            return False
+        await pool.execute("DELETE FROM cloud_team_members WHERE team_id=$1", team_id)
+        return True
+
+    async def team_member_add(self, team_id, uid) -> bool:
+        pool = await self._c()
+        try:
+            await pool.execute(
+                "INSERT INTO cloud_team_members(team_id, uid) VALUES($1,$2)", team_id, uid)
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
+
+    async def team_member_remove(self, team_id, uid) -> bool:
+        pool = await self._c()
+        n = await pool.fetchval(
+            "DELETE FROM cloud_team_members WHERE team_id=$1 AND uid=$2 RETURNING 1",
+            team_id, uid)
+        return bool(n)
+
+    async def team_members(self, team_id) -> list:
+        pool = await self._c()
+        rows = await pool.fetch(
+            "SELECT uid, monthly_limit_points, monthly_topup_points, created_at "
+            "FROM cloud_team_members WHERE team_id=$1 ORDER BY created_at", team_id)
+        return [{"uid": r["uid"], "monthly_limit_points": r["monthly_limit_points"],
+                 "monthly_topup_points": r["monthly_topup_points"],
+                 "created_at": _iso(r["created_at"])} for r in rows]
+
+    async def team_member_get(self, uid) -> Optional[dict]:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            "SELECT team_id, uid, monthly_limit_points, period_month, monthly_topup_points, created_at "
+            "FROM cloud_team_members WHERE uid=$1", uid)
+        if not row:
+            return None
+        return {"team_id": row["team_id"], "uid": row["uid"],
+                "monthly_limit_points": row["monthly_limit_points"],
+                "period_month": row["period_month"],
+                "monthly_topup_points": row["monthly_topup_points"],
+                "created_at": _iso(row["created_at"])}
+
+    async def team_member_set_limit(self, team_id, uid, limit) -> bool:
+        pool = await self._c()
+        n = await pool.fetchval(
+            "UPDATE cloud_team_members SET monthly_limit_points=$3 "
+            "WHERE team_id=$1 AND uid=$2 RETURNING 1", team_id, uid, int(limit))
+        return bool(n)
+
+    async def team_member_add_topup(self, team_id, uid, points, month) -> dict:
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """INSERT INTO cloud_team_members(team_id, uid, period_month, monthly_topup_points)
+               VALUES($1,$2,$3,$4)
+               ON CONFLICT (team_id, uid) DO UPDATE SET
+                 period_month   = $3,
+                 monthly_topup_points = CASE WHEN cloud_team_members.period_month = $3
+                                             THEN cloud_team_members.monthly_topup_points + $4
+                                             ELSE $4 END
+               RETURNING period_month, monthly_topup_points""",
+            team_id, uid, month, int(points))
+        return {"period_month": row["period_month"],
+                "monthly_topup_points": row["monthly_topup_points"]}
+
 
 def _pg_reqlog_row(row) -> dict:
     return {
@@ -474,6 +709,33 @@ class LocalMeta(_Meta):
                     UNIQUE (owner_uid, target_uid, media_key));
                 CREATE INDEX IF NOT EXISTS idx_shares_owner ON cloud_media_shares(owner_uid);
                 CREATE INDEX IF NOT EXISTS idx_shares_target ON cloud_media_shares(target_uid);
+                CREATE TABLE IF NOT EXISTS cloud_teams(
+                    id TEXT PRIMARY KEY,
+                    owner_uid INTEGER NOT NULL UNIQUE,
+                    name TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS cloud_team_members(
+                    team_id TEXT NOT NULL,
+                    uid INTEGER NOT NULL UNIQUE,
+                    monthly_limit_points INTEGER NOT NULL DEFAULT 0,
+                    period_month TEXT,
+                    monthly_topup_points INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (team_id, uid));
+                CREATE INDEX IF NOT EXISTS idx_team_members_team ON cloud_team_members(team_id);
+                CREATE TABLE IF NOT EXISTS cloud_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER,
+                    client_id TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    event TEXT NOT NULL,
+                    props_json TEXT NOT NULL DEFAULT '{}',
+                    path TEXT NOT NULL DEFAULT '',
+                    ua TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_events_event_created ON cloud_events(event, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_uid_created ON cloud_events(uid, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_created ON cloud_events(created_at DESC);
             """)
             # 存量库补列：CREATE TABLE IF NOT EXISTS 不会给旧表加新列（血缘列 2026-09-20）
             existing = {r[1] for r in conn.execute("PRAGMA table_info(cloud_media)").fetchall()}
@@ -484,6 +746,31 @@ class LocalMeta(_Meta):
                     conn.execute(f"ALTER TABLE cloud_media ADD COLUMN {col} {ddl}")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cloud_media_src ON cloud_media(source_request_id)")
+            # 团队成员表补列（存量库升级，2026-10-09 月度限额）
+            tm_cols = {r[1] for r in conn.execute("PRAGMA table_info(cloud_team_members)").fetchall()}
+            for col, ddl in (("monthly_limit_points", "INTEGER NOT NULL DEFAULT 0"),
+                             ("period_month", "TEXT"),
+                             ("monthly_topup_points", "INTEGER NOT NULL DEFAULT 0")):
+                if col not in tm_cols:
+                    conn.execute(f"ALTER TABLE cloud_team_members ADD COLUMN {col} {ddl}")
+            # 多团队升级（2026-10-09：owner 可建多队分组）：存量库 owner_uid 带 UNIQUE，
+            # SQLite 无法直接去约束 → 重建表搬数据。
+            team_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='cloud_teams'"
+            ).fetchone()
+            if team_sql and "UNIQUE" in (team_sql[0] or "").upper():
+                conn.executescript("""
+                    CREATE TABLE cloud_teams_new(
+                        id TEXT PRIMARY KEY,
+                        owner_uid INTEGER NOT NULL,
+                        name TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL);
+                    INSERT INTO cloud_teams_new(id, owner_uid, name, created_at)
+                        SELECT id, owner_uid, name, created_at FROM cloud_teams;
+                    DROP TABLE cloud_teams;
+                    ALTER TABLE cloud_teams_new RENAME TO cloud_teams;
+                    CREATE INDEX IF NOT EXISTS idx_teams_owner ON cloud_teams(owner_uid);
+                """)
             conn.commit()
             self._local.conn = conn
         return conn
@@ -730,6 +1017,77 @@ class LocalMeta(_Meta):
             return n
         return await asyncio.to_thread(_)
 
+    # ---- 行为埋点（LocalMeta 兜底，与 PgMeta 同契约）----
+    async def events_insert(self, items):
+        if not items:
+            return
+        def _():
+            conn = self._connect()
+            now = _utcnow()
+            conn.executemany(
+                """INSERT INTO cloud_events(uid, client_id, session_id, event, props_json, path, ua, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                [(it.get("uid"), it.get("client_id") or "", it.get("session_id") or "",
+                  it["event"], json.dumps(it.get("props") or {}, ensure_ascii=False, separators=(",", ":")),
+                  it.get("path") or "", it.get("ua") or "", now) for it in items])
+            conn.commit()
+        return await asyncio.to_thread(_)
+
+    async def events_summary(self, days: int):
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                """SELECT event, COUNT(*) AS n FROM cloud_events
+                   WHERE created_at >= ?
+                   GROUP BY event ORDER BY n DESC""",
+                ((datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),)).fetchall()
+            return [{"event": r["event"], "count": int(r["n"])} for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def events_daily(self, days: int):
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                """SELECT substr(created_at, 1, 10) AS day, COUNT(*) AS n FROM cloud_events
+                   WHERE created_at >= ?
+                   GROUP BY 1 ORDER BY 1""",
+                ((datetime.now(timezone.utc) - timedelta(days=days)).isoformat(),)).fetchall()
+            return [{"day": r["day"], "count": int(r["n"])} for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def events_recent(self, limit, event="", uid=None):
+        def _():
+            conn = self._connect()
+            where, args = [], []
+            if event:
+                where.append("event=?"); args.append(event)
+            if uid is not None:
+                where.append("uid=?"); args.append(uid)
+            clause = ("WHERE " + " AND ".join(where)) if where else ""
+            rows = conn.execute(
+                f"""SELECT id, uid, client_id, session_id, event, props_json, path, created_at
+                    FROM cloud_events {clause}
+                    ORDER BY created_at DESC LIMIT ?""",
+                args + [limit]).fetchall()
+            return [{"id": r["id"], "uid": r["uid"], "client_id": r["client_id"],
+                     "session_id": r["session_id"], "event": r["event"],
+                     "props": _json_load(r["props_json"]), "path": r["path"],
+                     "created_at": r["created_at"]} for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def events_active_clients(self, days: int):
+        def _():
+            conn = self._connect()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            clients = conn.execute(
+                "SELECT COUNT(DISTINCT client_id) FROM cloud_events WHERE created_at >= ?",
+                (cutoff,)).fetchone()[0]
+            users = conn.execute(
+                "SELECT COUNT(DISTINCT uid) FROM cloud_events WHERE created_at >= ? AND uid IS NOT NULL",
+                (cutoff,)).fetchone()[0]
+            return {"clients": int(clients), "users": int(users)}
+        return await asyncio.to_thread(_)
+
     # ---- 素材共享（LocalMeta 补齐：之前漏实现导致 SQLite 回退后端共享 500）----
     async def media_index_get_by_key(self, key):
         def _():
@@ -825,6 +1183,151 @@ class LocalMeta(_Meta):
                 "DELETE FROM cloud_media_shares WHERE id=? AND owner_uid=?", (share_id, owner_uid))
             conn.commit()
             return cur.rowcount > 0
+        return await asyncio.to_thread(_)
+
+    # ---- 团队 ----
+    async def team_create(self, team_id, owner_uid, name):
+        def _():
+            conn = self._connect()
+            now = _utcnow()
+            conn.execute(
+                "INSERT INTO cloud_teams(id, owner_uid, name, created_at) VALUES(?,?,?,?)",
+                (team_id, owner_uid, name or "", now))
+            conn.commit()
+            return {"team_id": team_id, "owner_uid": owner_uid,
+                    "name": name or "", "created_at": now}
+        return await asyncio.to_thread(_)
+
+    async def team_get(self, team_id):
+        def _():
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT id, owner_uid, name, created_at FROM cloud_teams WHERE id=?",
+                (team_id,)).fetchone()
+            return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                    "name": row["name"], "created_at": row["created_at"]} if row else None
+        return await asyncio.to_thread(_)
+
+    async def team_get_by_owner(self, owner_uid):
+        def _():
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT id, owner_uid, name, created_at FROM cloud_teams "
+                "WHERE owner_uid=? ORDER BY created_at LIMIT 1",
+                (owner_uid,)).fetchone()
+            return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                    "name": row["name"], "created_at": row["created_at"]} if row else None
+        return await asyncio.to_thread(_)
+
+    async def team_list_by_owner(self, owner_uid):
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT id, owner_uid, name, created_at FROM cloud_teams "
+                "WHERE owner_uid=? ORDER BY created_at",
+                (owner_uid,)).fetchall()
+            return [{"team_id": r["id"], "owner_uid": r["owner_uid"],
+                     "name": r["name"], "created_at": r["created_at"]} for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def team_get_by_member(self, uid):
+        def _():
+            conn = self._connect()
+            row = conn.execute(
+                """SELECT t.id, t.owner_uid, t.name, t.created_at
+                   FROM cloud_team_members m JOIN cloud_teams t ON t.id = m.team_id
+                   WHERE m.uid = ?""", (uid,)).fetchone()
+            return {"team_id": row["id"], "owner_uid": row["owner_uid"],
+                    "name": row["name"], "created_at": row["created_at"]} if row else None
+        return await asyncio.to_thread(_)
+
+    async def team_delete(self, team_id):
+        def _():
+            conn = self._connect()
+            cur = conn.execute("DELETE FROM cloud_teams WHERE id=?", (team_id,))
+            conn.execute("DELETE FROM cloud_team_members WHERE team_id=?", (team_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        return await asyncio.to_thread(_)
+
+    async def team_member_add(self, team_id, uid):
+        def _():
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "INSERT INTO cloud_team_members(team_id, uid, created_at) VALUES(?,?,?)",
+                    (team_id, uid, _utcnow()))
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                return False
+        return await asyncio.to_thread(_)
+
+    async def team_member_remove(self, team_id, uid):
+        def _():
+            conn = self._connect()
+            cur = conn.execute(
+                "DELETE FROM cloud_team_members WHERE team_id=? AND uid=?", (team_id, uid))
+            conn.commit()
+            return cur.rowcount > 0
+        return await asyncio.to_thread(_)
+
+    async def team_members(self, team_id):
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT uid, monthly_limit_points, monthly_topup_points, created_at "
+                "FROM cloud_team_members WHERE team_id=? ORDER BY created_at",
+                (team_id,)).fetchall()
+            return [{"uid": r["uid"], "monthly_limit_points": r["monthly_limit_points"],
+                     "monthly_topup_points": r["monthly_topup_points"],
+                     "created_at": r["created_at"]} for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def team_member_get(self, uid):
+        def _():
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT team_id, uid, monthly_limit_points, period_month, monthly_topup_points, created_at "
+                "FROM cloud_team_members WHERE uid=?", (uid,)).fetchone()
+            if not row:
+                return None
+            return {"team_id": row["team_id"], "uid": row["uid"],
+                    "monthly_limit_points": row["monthly_limit_points"],
+                    "period_month": row["period_month"],
+                    "monthly_topup_points": row["monthly_topup_points"],
+                    "created_at": row["created_at"]}
+        return await asyncio.to_thread(_)
+
+    async def team_member_set_limit(self, team_id, uid, limit):
+        def _():
+            conn = self._connect()
+            cur = conn.execute(
+                "UPDATE cloud_team_members SET monthly_limit_points=? WHERE team_id=? AND uid=?",
+                (int(limit), team_id, uid))
+            conn.commit()
+            return cur.rowcount > 0
+        return await asyncio.to_thread(_)
+
+    async def team_member_add_topup(self, team_id, uid, points, month):
+        def _():
+            conn = self._connect()
+            conn.execute(
+                """INSERT INTO cloud_team_members(team_id, uid, period_month, monthly_topup_points, created_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(team_id, uid) DO UPDATE SET
+                     period_month=excluded.period_month,
+                     monthly_topup_points=CASE WHEN cloud_team_members.period_month = excluded.period_month
+                                               THEN cloud_team_members.monthly_topup_points + excluded.monthly_topup_points
+                                               ELSE excluded.monthly_topup_points END""",
+                (team_id, uid, month, int(points), _utcnow()))
+            row = conn.execute(
+                "SELECT period_month, monthly_topup_points FROM cloud_team_members "
+                "WHERE team_id=? AND uid=?", (team_id, uid)).fetchone()
+            conn.commit()
+            return {"period_month": row["period_month"],
+                    "monthly_topup_points": row["monthly_topup_points"]}
         return await asyncio.to_thread(_)
 
 
@@ -1159,9 +1662,86 @@ async def share_delete(share_id, owner_uid) -> bool:
     return await META.share_delete(share_id, owner_uid)
 
 
+# ---------------- 行为埋点（用户行为分析，2026-10-13）----------------
+
+async def events_insert(items: list) -> None:
+    """批量落行为事件。item: {uid?, client_id, session_id, event, props(dict), path, ua}。"""
+    return await META.events_insert(items)
+
+
+async def events_summary(days: int = 30) -> list:
+    """按事件名聚合近 N 天计数，倒序。"""
+    return await META.events_summary(days)
+
+
+async def events_daily(days: int = 14) -> list:
+    """近 N 天每日事件总量，日期升序。"""
+    return await META.events_daily(days)
+
+
+async def events_recent(limit: int = 100, event: str = "", uid=None) -> list:
+    """最近事件列表（管理台报表），可按事件/用户过滤。"""
+    return await META.events_recent(limit, event, uid)
+
+
+async def events_active_clients(days: int = 7) -> dict:
+    """近 N 天活跃客户端/用户数。"""
+    return await META.events_active_clients(days)
+
+
 async def media_index_get_by_key(key) -> Optional[dict]:
     return await META.media_index_get_by_key(key)
 
 
 async def media_get_shared(key, viewer_uid) -> Optional[dict]:
     return await META.media_get_shared(key, viewer_uid)
+
+
+# ---------------- 团队（工作室主子账号）----------------
+
+async def team_create(team_id, owner_uid, name) -> dict:
+    return await META.team_create(team_id, owner_uid, name)
+
+
+async def team_get(team_id) -> Optional[dict]:
+    return await META.team_get(team_id)
+
+
+async def team_get_by_owner(owner_uid) -> Optional[dict]:
+    return await META.team_get_by_owner(owner_uid)
+
+
+async def team_list_by_owner(owner_uid) -> list:
+    return await META.team_list_by_owner(owner_uid)
+
+
+async def team_get_by_member(uid) -> Optional[dict]:
+    return await META.team_get_by_member(uid)
+
+
+async def team_delete(team_id) -> bool:
+    return await META.team_delete(team_id)
+
+
+async def team_member_add(team_id, uid) -> bool:
+    return await META.team_member_add(team_id, uid)
+
+
+async def team_member_remove(team_id, uid) -> bool:
+    return await META.team_member_remove(team_id, uid)
+
+
+async def team_members(team_id) -> list:
+    return await META.team_members(team_id)
+
+
+async def team_member_get(uid) -> Optional[dict]:
+    return await META.team_member_get(uid)
+
+
+async def team_member_set_limit(team_id, uid, limit) -> bool:
+    return await META.team_member_set_limit(team_id, uid, limit)
+
+
+async def team_member_add_topup(team_id, uid, points, month) -> dict:
+    return await META.team_member_add_topup(team_id, uid, points, month)

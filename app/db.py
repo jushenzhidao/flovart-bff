@@ -72,7 +72,45 @@ CREATE TABLE IF NOT EXISTS cloud_request_log(
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_uid_created ON cloud_request_log(uid, created_at DESC);
+CREATE TABLE IF NOT EXISTS cloud_teams(
+    id          TEXT PRIMARY KEY,
+    owner_uid   BIGINT NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_teams_owner ON cloud_teams(owner_uid);
+CREATE TABLE IF NOT EXISTS cloud_team_members(
+    team_id     TEXT NOT NULL,
+    uid         BIGINT NOT NULL UNIQUE,
+    monthly_limit_points INTEGER NOT NULL DEFAULT 0,
+    period_month TEXT,
+    monthly_topup_points INTEGER NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (team_id, uid)
+);
+CREATE INDEX IF NOT EXISTS idx_team_members_team ON cloud_team_members(team_id);
+CREATE TABLE IF NOT EXISTS cloud_events(
+    id          BIGSERIAL PRIMARY KEY,
+    uid         BIGINT,
+    client_id   TEXT NOT NULL DEFAULT '',
+    session_id  TEXT NOT NULL DEFAULT '',
+    event       TEXT NOT NULL,
+    props_json  TEXT NOT NULL DEFAULT '{}',
+    path        TEXT NOT NULL DEFAULT '',
+    ua          TEXT NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_events_event_created ON cloud_events(event, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_uid_created ON cloud_events(uid, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_created ON cloud_events(created_at DESC);
 """
+
+# 团队成员表补列（存量库升级；CREATE TABLE IF NOT EXISTS 不给旧表加新列）。
+TEAM_MEMBER_COLUMNS = (
+    ("monthly_limit_points", "INTEGER NOT NULL DEFAULT 0"),
+    ("period_month", "TEXT"),
+    ("monthly_topup_points", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 async def init_pool() -> None:
@@ -110,6 +148,15 @@ async def migrate() -> None:
                 f"ALTER TABLE cloud_media ADD COLUMN IF NOT EXISTS {col} {ddl}")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cloud_media_src ON cloud_media(source_request_id)")
+        # 团队成员表补列（2026-10-09 月度限额：0=不限；period_month/monthly_topup_points=当月划转计数）。
+        for col, ddl in TEAM_MEMBER_COLUMNS:
+            await conn.execute(
+                f"ALTER TABLE cloud_team_members ADD COLUMN IF NOT EXISTS {col} {ddl}")
+        # 多团队升级（2026-10-09：owner 可建多队分组）：存量库去掉 owner_uid 单值约束。
+        await conn.execute(
+            "ALTER TABLE cloud_teams DROP CONSTRAINT IF EXISTS cloud_teams_owner_uid_key")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_teams_owner ON cloud_teams(owner_uid)")
 
 
 async def close_pool() -> None:

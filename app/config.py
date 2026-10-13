@@ -118,6 +118,21 @@ QUOTA_PER_CNY: int = _int("BFF_QUOTA_PER_CNY", 500000)
 POINTS_PER_CNY: int = _int("BFF_POINTS_PER_CNY", 10000)
 POINTS_UNIT_NAME: str = os.getenv("BFF_POINTS_UNIT_NAME", "积分")
 
+# ---------- 团队（工作室主子账号，飞哥 2026-10-09 拍板）----------
+# 子账号消费仍由 new-api 扣自己 quota（网关语义零改动）；BFF 做「低水位自动划转」：
+# 子账号 quota 低于阈值 → 从主账号池划一块过去（管理员 API 两步非原子，失败记日志人工对账）。
+# 阈值/块额均以对外积分计（经 points_to_quota 换算）；块额设 0 可整体关闭划转。
+TEAM_TOPUP_THRESHOLD_POINTS: int = _int("BFF_TEAM_TOPUP_THRESHOLD_POINTS", 200)
+TEAM_TOPUP_CHUNK_POINTS: int = _int("BFF_TEAM_TOPUP_CHUNK_POINTS", 1000)
+
+# ---------- 行为埋点（自建事件流，飞哥 2026-10-13 拍板）----------
+# 上报端点 POST /api/events 允许匿名（登录/注册事件发生在登录前）；靠批量上限 + 滑窗限速防刷。
+# BFF_EVENTS_ENABLED=false 一键关闭（上报端点直接丢弃，返回 202 不让前端重试堆积）。
+EVENTS_ENABLED: bool = _bool("BFF_EVENTS_ENABLED", True)
+EVENTS_BATCH_MAX: int = _int("BFF_EVENTS_BATCH_MAX", 50)
+EVENTS_RATE_PER_MIN: int = _int("BFF_EVENTS_RATE_PER_MIN", 120)  # 每 client 每分钟事件上限
+EVENTS_MAX_PROPS_BYTES: int = _int("BFF_EVENTS_MAX_PROPS_BYTES", 2048)  # 单条 props 上限
+
 
 def quota_to_points(quota) -> int:
     """内部 quota → 对外积分（向下取整，绝不虚报余额）。用于余额、聚合。"""

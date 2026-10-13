@@ -530,6 +530,13 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
     # 旧版前端无魔数嗅探时原样提交 → gpt-image / gemini 均按前缀解码失败。
     # 在所有通道分流之前统一修正，不依赖前端版本。
     params = _fix_params_image_mime(params)
+    # ⭐ 能力开关适配（2026-09-29 接通——此前 adapt() 写了但从没被调用，管理台开关翻了也不生效）：
+    # 开关关闭 → adapt 原样返回 params（逐字节等价，回归红线）；开关打开 → model 换 wenxin:*。
+    # 两条命中路径：① kind 本身是能力名（dewatermark/upscale/…）；② 前端编辑类收敛到
+    # image-gen 时以 variant 携带能力语义（mask/outpaint/edit…），variant 命中档案同样适配。
+    adapt_kind = kind if kind in upstream_profiles.PROFILES else str(params.get("variant") or "")
+    if adapt_kind:
+        params = upstream_profiles.adapt(adapt_kind, params)
     request_id = uuid.uuid4().hex
     provider = spec.get("provider", "gateway")
 
@@ -648,6 +655,17 @@ _TOOL_TASK_PROMPTS = {
     "split-layers": "将这张图片拆分为多个图层：前景主体与背景分离，分别输出各图层",
     "outpaint": "向四周扩展这张图片的画面，新生成区域与原图风格、光照、透视自然衔接",
     "enhance": "增强这张图片的画质：提升清晰度、修复噪点与压缩痕迹，内容保持不变",
+    # 2026-09-29 对齐竞品「智能图像处理」三件套（水印去除/切边矫正/去屏幕纹）
+    "dewatermark": "去除这张图片中的水印、logo 与文字痕迹，根据周围画面内容自然修复被覆盖区域，不留残影",
+    "deskew": "矫正这张图片的拍摄透视与倾斜（如文档、屏幕、纸质的边缘变形），自动裁齐边缘并增强清晰度，内容保持不变",
+    "demoire": "去除这张图片中翻拍屏幕产生的摩尔纹与波纹条纹干扰，恢复干净自然的图像细节，色彩与内容保持不变",
+    # 2026-10-08 竞品对标 P0 三件套（背景替换/文字去除/人像美颜）
+    "bgreplace": "保持画面主体完全不变，将背景替换为干净自然的实体场景背景，主体边缘自然融合，光照、阴影、透视与色调匹配新背景",
+    "removetext": "去除这张图片中的所有文字、标语、字幕与日期戳，根据周围画面内容自然填补被覆盖区域，不留残影，其余内容保持完全不变",
+    "beauty": "对这张人像进行自然的美颜处理：淡化皮肤瑕疵、均匀肤色、适度提升气色与质感，严禁改变五官形态、脸型与个人特征，不过度磨皮",
+    # 2026-10-08 竞品对标 P1：换天空 / 黑白上色
+    "sky": "将这张图片中的天空区域替换为晴朗自然的天空效果，天空与地面交界边缘自然过渡，画面整体光照与色调和新天空协调匹配，地面主体与前景内容保持完全不变",
+    "colorize": "为这张黑白照片智能上色：还原自然真实的色彩，符合真实材质与光照，色调自然不过度鲜艳，照片内容、构图与细节保持完全不变",
 }
 
 
@@ -1092,6 +1110,11 @@ async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params
     api_key = gw.get("api_key") or ""
     if not base_url or not api_key:
         raise ValueError("external gateway 需要 base_url 与 api_key")
+    # ⭐ video-gen 分支（2026-10-08）：视频是「任务端点提交 + 轮询」语义，与同步图片
+    #    完全不同（此前误入下方 sync_path 兜底 → 拼出 v1/images/generations 畸形 URL
+    #    → 返回网关前端 HTML → 502，飞哥实测 minimax 视频必失败的真根因）。
+    if kind == "video-gen":
+        return await _run_external_video(uid, request_id, params)
     # ⚠️ 兜底值必须带 `v1/` 前缀（2026-09-15 修复）：external 网关同样是
     #    new-api 兼容层，OpenAI 端点全挂在 `/v1/*`；漏掉前缀会打到不存在的
     #    `{base}/images/generations` → nginx 兜底返回前端 SPA 的 HTML → 502。
@@ -1174,6 +1197,297 @@ async def _external_call_and_record(uid: int, request_id: str, kind: str,
         request_id, status="succeeded", task_id=request_id,
         gateway_request_id=gw_req_id, result=task.get("result"))
     logger.info("外部网关调用成功 uid=%s req=%s url=%s", uid, request_id, url)
+
+
+# ---------------------------------------------------------------------------
+# 外部网关 video-gen 分支（2026-10-08）：任务端点提交 + 后台轮询
+# ---------------------------------------------------------------------------
+# 视频终态词表（各 adaptor 命名不统一，按常见命名 + 保守覆盖）。
+_EXTERNAL_VIDEO_SUCCEEDED = {"succeeded", "success", "completed", "complete", "finished", "done"}
+_EXTERNAL_VIDEO_FAILED = {
+    "failed", "error", "cancelled", "canceled", "timeout", "expired", "deleted", "not_found",
+}
+# 轮询节奏：首测 5s 起，逐步放大到 15s；总上限 15 分钟（视频生成常规 1-6 分钟）。
+_EXTERNAL_VIDEO_POLL_TIMEOUT = 900
+_EXTERNAL_VIDEO_POLL_MAX_ERRORS = 6  # 连续网络错误容忍上限（网关抖动），超过判失败
+
+
+def _external_video_body(params: dict) -> dict:
+    """把前端 video-gen params 组装成网关视频任务端点的提交 body。
+
+    ⚠️ 两点协议对齐（均为实测结论，勿凭文档改回）：
+    ① 网关 video-router 要求**顶层 model** —— {"type":kind,"params":...} 包装体
+       会被报 `Model name not specified`（topics/gateway.md 2026-09-15 实测）；
+    ② 上游渠道任务插件（aivideomaker 等）吃火山协议 content[]（飞哥 2026-10-08
+       curl 实证：model + content[] + ratio/duration/resolution 提交成功）。
+    故组装规则：
+      - prompt          → content[0] = {"type":"text","text":...}
+      - first_frame_url → content[1] = {"type":"image_url","image_url":{"url":...},"role":"first_frame"}
+      - last_frame_url  → content[n] = {"type":"image_url","image_url":{"url":...},"role":"last_frame"}
+        （2026-10-13 P0 参数透传：first-last-frame 模式的第二张图此前被整体丢弃）
+      - aspect_ratio    → 补一份上游字段名 ratio（两份都带，兼容不同 adaptor）
+      - 其余标量（model/duration/resolution/seed/generate_audio/camera_fixed/camera…）
+        原样透传顶层 —— 运镜/速度等新参数前端加进 params 即随链路到达插件，
+        插件不认识的键自行忽略，不破坏既有提交。
+    """
+    body = {k: v for k, v in params.items()
+            if k not in ("_gateway", "prompt", "first_frame_url", "last_frame_url")}
+    content: "list[dict]" = []
+    prompt = params.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        content.append({"type": "text", "text": prompt})
+    first = params.get("first_frame_url")
+    if isinstance(first, str) and first.strip():
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": first},
+            "role": "first_frame",
+        })
+    last = params.get("last_frame_url")
+    if isinstance(last, str) and last.strip():
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": last},
+            "role": "last_frame",
+        })
+    if content:
+        body["content"] = content
+    aspect = params.get("aspect_ratio")
+    if aspect and "ratio" not in body:
+        body["ratio"] = aspect
+    return body
+
+
+def _extract_video_urls(raw: Any) -> "list[str]":
+    """从轮询响应递归收集视频 URL（保序去重）。
+
+    识别键：video_url / videoUrl 全量收集；url 仅在明显是视频时收集
+    （兄弟节点 type=video，或字符串以 .mp4 结尾 / 含 /video 路径）。
+    """
+    urls: "list[str]" = []
+
+    def walk(o: Any, hint_video: bool = False) -> None:
+        if isinstance(o, dict):
+            for k in ("video_url", "videoUrl"):
+                v = o.get(k)
+                if isinstance(v, str) and v:
+                    urls.append(v)
+            u = o.get("url")
+            looks_video = hint_video or o.get("type") == "video" or (
+                isinstance(u, str) and (u.lower().endswith(".mp4") or "/video" in u.lower()))
+            if isinstance(u, str) and u and looks_video:
+                urls.append(u)
+            for k, v in o.items():
+                walk(v, hint_video or k in ("video", "videos"))
+        elif isinstance(o, list):
+            for it in o:
+                walk(it, hint_video)
+
+    walk(raw)
+    seen, out = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _video_submit_error_message(raw: Any) -> str | None:
+    """提交即被上游同步拒绝（如任务插件 payload 校验失败）时提取可读原因。"""
+    candidates: list[Any] = []
+    if isinstance(raw, dict):
+        candidates.append(raw.get("error"))
+        candidates.append(raw.get("message"))
+        candidates.append(raw.get("status_msg"))
+    for c in candidates:
+        if isinstance(c, dict):
+            msg = c.get("message")
+            if isinstance(msg, str) and msg.strip():
+                # message 本身可能是内嵌 JSON（任务插件校验失败形态：
+                # {"status":"FAILED","errorCode":...,"message":"duration: ..."}）
+                try:
+                    parsed = json.loads(msg)
+                except Exception:  # noqa: BLE001
+                    return msg[:300]
+                if isinstance(parsed, dict) and parsed.get("message"):
+                    return f"{parsed.get('errorCode', '')} {parsed['message']}".strip()[:300]
+                return msg[:300]
+        elif isinstance(c, str) and c.strip():
+            return c[:300]
+    return None
+
+
+def _video_fail_reason(inner: Any, raw: Any) -> dict:
+    """从轮询响应提取失败原因（fail_reason / error 优先，兜底留原始键）。"""
+    message = "上游视频任务失败"
+    if isinstance(inner, dict):
+        reason = inner.get("fail_reason") or inner.get("reason") or inner.get("error")
+        if isinstance(reason, dict):
+            message = reason.get("message") or json.dumps(reason, ensure_ascii=False)[:300]
+        elif isinstance(reason, str) and reason:
+            message = reason
+    return {"error": {
+        "message": message,
+        "type": "external_video_failed",
+        "stage": "poll",
+        "upstream_keys": sorted(inner.keys()) if isinstance(inner, dict) else None,
+        "upstream": raw if isinstance(raw, (str, int, float, bool)) else None,
+    }}
+
+
+async def _run_external_video(uid: int, request_id: str, params: dict) -> dict:
+    """外部网关视频任务（BYOK 服务）：提交任务端点 + 后台轮询 + 落盘视频。
+
+    与 _run_external 同款非阻塞契约：POST 恒毫秒级返回 processing，
+    真正的提交/轮询在后台协程完成并回写请求日志（mode=sync，
+    前端 GET /api/tasks/{id} 走 sync 分支直接读结果）。
+    轮询期间网关凭证只存在于后台协程内存，不落库（进程重启丢在途任务，
+    与 _spawn_* 系列同款代价，前端轮询超时后重试即可）。
+    """
+    gw = params.get("_gateway") or {}
+    base_url = (gw.get("base_url") or "").strip().rstrip("/")
+    api_key = gw.get("api_key") or ""
+    if not base_url or not api_key:
+        raise ValueError("external gateway 需要 base_url 与 api_key")
+    # ⭐ 两种 baseUrl 形态（2026-10-08 飞哥实测配置：
+    #    baseUrl = https://tasks.oneapis.cn/aivideomaker/api/v3/contents/generations/tasks
+    #    —— curl 成功样本的**完整任务端点**，不是网关根地址）：
+    #  A) 任务端点直连：base 以 /contents/generations/tasks 结尾 →
+    #     提交 = POST base 本体，轮询 = GET base/{task_id}（火山协议语义，不追加任何后缀）；
+    #  B) 网关根地址：追加 v1/video/generations（v1 前缀去重，同 _run_external）。
+    if base_url.endswith("/contents/generations/tasks"):
+        submit_url = base_url
+        poll_base = base_url
+    else:
+        sub_path = "v1/video/generations"
+        if base_url.endswith("/v1") and sub_path.startswith("v1/"):
+            sub_path = sub_path[len("v1/"):]
+        submit_url = f"{base_url}/{sub_path}"
+        poll_base = f"{base_url}/{sub_path}"
+    # 落库前掩码（params._gateway 含明文 key，绝不入库）
+    model = params.get("model") or params.get("model_name") or ""
+    log_params = {k: v for k, v in params.items() if k != "_gateway"}
+    await cloudstore.request_log_put(
+        uid, request_id, "video-gen", "external", model, log_params,
+        status="submitted", mode="sync")
+    body = _external_video_body(params)
+    task = asyncio.create_task(_external_video_and_record(
+        uid, request_id, submit_url, poll_base, api_key, body))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return _task_view(request_id, request_id, "video-gen", "sync", "processing", {})
+
+
+async def _external_video_and_record(uid: int, request_id: str, submit_url: str,
+                                     poll_base: str, api_key: str,
+                                     body: dict) -> None:
+    """后台：提交视频任务 → 轮询至终态 → 落盘视频产物 → 回写请求日志（全程留痕）。"""
+    try:
+        raw = await na.request_external("POST", submit_url, api_key=api_key, json=body)
+    except Exception as e:  # noqa: BLE001 —— 必须吞掉并留痕
+        err = _error_record(e, "external_gateway_error", "request", url=submit_url, uid=uid)
+        logger.warning("外部网关视频提交失败 uid=%s req=%s url=%s err=%s",
+                       uid, request_id, submit_url, err["error"]["message"])
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return
+    inner = _normalize_task(_unwrap(raw))
+    task_id = inner.get("task_id") if isinstance(inner, dict) else None
+    if not task_id:
+        # 极少数网关可能同步直出视频：能归一化出产物就按成功处理。
+        result = _normalize_sync_result(raw)
+        if isinstance(result, dict) and _iter_outputs(result):
+            task = {"result": result}
+            try:
+                task = await _persist_outputs(task, request_id, uid, "video-gen",
+                                              request_id=request_id)
+            except Exception:  # noqa: BLE001 —— 落盘失败不算生成失败，保留网关 URL
+                logger.exception("外部网关视频落盘失败 uid=%s req=%s", uid, request_id)
+            await cloudstore.request_log_update(
+                request_id, status="succeeded", task_id=request_id,
+                result=task.get("result"))
+            return
+        try:
+            snippet = json.dumps(raw, ensure_ascii=False)[:400]
+        except Exception:
+            snippet = str(raw)[:400]
+        upstream_msg = _video_submit_error_message(raw)
+        if upstream_msg:
+            err = {"error": {
+                "message": f"上游拒绝视频任务：{upstream_msg}",
+                "type": "external_video_rejected",
+                "stage": "submit",
+                "detail": snippet,
+            }}
+        else:
+            err = {"error": {
+                "message": "视频任务已提交但未返回任务号（task_id），无法跟踪进度，请重试",
+                "type": "external_video_no_task_id",
+                "stage": "submit",
+                "detail": snippet,
+            }}
+        logger.warning("外部网关视频提交无任务号 uid=%s req=%s url=%s", uid, request_id, submit_url)
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return
+
+    await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
+    poll_url = f"{poll_base}/{task_id}"
+    logger.info("外部网关视频任务已受理 uid=%s req=%s task=%s poll=%s",
+                uid, request_id, task_id, poll_url)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _EXTERNAL_VIDEO_POLL_TIMEOUT
+    delay, err_streak = 5.0, 0
+    while loop.time() < deadline:
+        await asyncio.sleep(delay)
+        delay = min(delay + 2.0, 15.0)
+        try:
+            poll_raw = await na.request_external("GET", poll_url, api_key=api_key)
+        except Exception as e:  # noqa: BLE001 —— 网络抖动容忍，连续超限才判失败
+            err_streak += 1
+            logger.warning("外部网关视频轮询失败(%s/%s) uid=%s req=%s err=%s",
+                           err_streak, _EXTERNAL_VIDEO_POLL_MAX_ERRORS, uid, request_id, e)
+            if err_streak >= _EXTERNAL_VIDEO_POLL_MAX_ERRORS:
+                err = _error_record(e, "external_poll_error", "poll", url=poll_url, uid=uid)
+                await cloudstore.request_log_update(
+                    request_id, status="failed", task_id=task_id, result=err)
+                return
+            continue
+        err_streak = 0
+        inner = _unwrap(poll_raw)
+        gstatus = (inner.get("status") or "").lower() if isinstance(inner, dict) else ""
+        if gstatus in _EXTERNAL_VIDEO_SUCCEEDED:
+            urls = _extract_video_urls(inner)
+            if not urls:
+                err = _no_media_error(poll_raw)
+                err["error"]["type"] = "external_video_no_media"
+                logger.warning("外部网关视频成功但无产物 uid=%s req=%s task=%s", uid, request_id, task_id)
+                await cloudstore.request_log_update(
+                    request_id, status="failed", task_id=task_id, result=err)
+                return
+            result = {"videos": [{"url": u} for u in urls]}
+            task = {"result": result}
+            try:
+                task = await _persist_outputs(task, task_id, uid, "video-gen",
+                                              request_id=request_id)
+            except Exception:  # noqa: BLE001 —— 落盘失败保留网关原始 URL
+                logger.exception("外部网关视频落盘失败 uid=%s req=%s task=%s", uid, request_id, task_id)
+            await cloudstore.request_log_update(
+                request_id, status="succeeded", task_id=task_id, result=task.get("result"))
+            logger.info("外部网关视频生成成功 uid=%s req=%s task=%s", uid, request_id, task_id)
+            return
+        if gstatus in _EXTERNAL_VIDEO_FAILED:
+            err = _video_fail_reason(inner, poll_raw)
+            logger.warning("外部网关视频任务失败 uid=%s req=%s task=%s status=%s",
+                           uid, request_id, task_id, gstatus)
+            await cloudstore.request_log_update(
+                request_id, status="failed", task_id=task_id, result=err)
+            return
+    err = {"error": {
+        "message": "视频生成超时（超过 15 分钟未出结果），上游可能仍在处理，请稍后重试",
+        "type": "external_video_timeout",
+        "stage": "poll",
+        "task_id": task_id,
+    }}
+    await cloudstore.request_log_update(request_id, status="failed", task_id=task_id, result=err)
 
 
 # ---------------------------------------------------------------------------

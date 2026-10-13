@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="JxS64CSPPyzL5L0LuhAAOc">
+<head data-page-node-id="5hOR5EQU5mq87omiK70EZe">
+<meta charset="UTF-8" data-page-node-id="M8h89DP0SF18FA6v8EuA4T">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="BAOZ4nAZd9SSlNOQg0j53S">
+<title>oneArt 版本介绍书 · 公开版 / 商业版</title>
+<style>
+  :root{
+    --ink:#111827; --ink-soft:#4B5563; --ink-mute:#9AA3B2;
+    --brand:#6D5BFF; --brand-2:#9B7BFF; --accent:#0EA5A4;
+    --bg:#F7F8FC; --card:#FFFFFF; --line:#E7EAF2;
+    --biz-bg:#12132B; --biz-ink:#EDEFFF;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;background:var(--bg);color:var(--ink);line-height:1.65}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+
+  /* ---- hero ---- */
+  .hero{background:linear-gradient(135deg,#1B1C3A 0%,#2A2470 55%,#5A3FE0 100%);color:#fff;padding:72px 0 64px}
+  .hero .logo{display:inline-flex;align-items:center;gap:10px;font-size:22px;font-weight:800;letter-spacing:1px}
+  .hero .logo .dot{width:12px;height:12px;border-radius:3px;background:linear-gradient(135deg,#8B7BFF,#31D0C8);transform:rotate(45deg)}
+  .hero h1{margin-top:26px;font-size:40px;line-height:1.25;font-weight:800}
+  .hero h1 span{background:linear-gradient(90deg,#9B8CFF,#31D0C8);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.sub{margin-top:14px;max-width:640px;color:#C9CBEF;font-size:16px}
+  .hero .badges{display:flex;gap:10px;margin-top:28px;flex-wrap:wrap}
+  .hero .badge{border:1px solid rgba(255,255,255,.25);border-radius:999px;padding:5px 14px;font-size:13px;color:#E4E6FF}
+
+  /* ---- sections ---- */
+  section{padding:56px 0}
+  .kicker{font-size:12px;font-weight:800;letter-spacing:3px;color:var(--brand);text-transform:uppercase}
+  h2{font-size:26px;margin-top:6px;font-weight:800}
+  .lead{margin-top:8px;color:var(--ink-soft);max-width:720px}
+
+  /* ---- split logic ---- */
+  .logic{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:28px}
+  .logic .box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px}
+  .logic h3{font-size:15px;font-weight:800}
+  .logic p{margin-top:8px;font-size:13.5px;color:var(--ink-soft)}
+  .logic .tag{display:inline-block;font-size:11px;font-weight:800;border-radius:999px;padding:3px 10px;margin-bottom:10px}
+  .tag.free{background:#EAF7F6;color:#0B8A88}
+  .tag.biz{background:#EFECFF;color:#5A48D6}
+
+  /* ---- compare table ---- */
+  table{width:100%;border-collapse:separate;border-spacing:0;margin-top:28px;background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;font-size:14px}
+  th,td{padding:13px 18px;text-align:left;border-top:1px solid var(--line);vertical-align:top}
+  thead th{border-top:none;background:#FBFBFE;font-size:13px;font-weight:800;color:var(--ink-soft)}
+  thead th.biz-col{background:#F3F1FF;color:#4A3AC8}
+  td.feat{font-weight:700;width:220px}
+  td .note{display:block;font-weight:400;font-size:12px;color:var(--ink-mute);margin-top:2px}
+  .yes{color:#0B8A88;font-weight:800}
+  .part{color:#B45309;font-weight:700}
+  .no{color:#B6BCC9;font-weight:700}
+  tr:hover td{background:#FAFAFF}
+
+  /* ---- biz highlights ---- */
+  .biz{background:var(--biz-bg);color:var(--biz-ink);border-radius:24px;padding:44px 40px;margin-top:8px}
+  .biz .kicker{color:#9B8CFF}
+  .biz h2{color:#fff}
+  .biz .lead{color:#B9BCDF}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:30px}
+  .cards .c{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:20px}
+  .cards .c h4{font-size:15px;font-weight:800;color:#fff}
+  .cards .c p{margin-top:8px;font-size:13px;color:#B9BCDF}
+  .cards .c .n{font-size:12px;font-weight:800;color:#31D0C8;letter-spacing:2px}
+
+  /* ---- scenarios ---- */
+  .scen{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:28px}
+  .scen .s{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:22px}
+  .scen h4{font-size:15px;font-weight:800}
+  .scen .who{font-size:12px;font-weight:800;color:var(--accent);margin-top:2px}
+  .scen ul{margin:12px 0 0 18px;color:var(--ink-soft);font-size:13px}
+  .scen li{margin-top:5px}
+
+  /* ---- pricing ---- */
+  .price{display:grid;grid-template-columns:1fr 1.2fr;gap:16px;margin-top:28px}
+  .price .p{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px}
+  .price .p.biz-p{border:2px solid var(--brand);position:relative;background:linear-gradient(180deg,#FBFAFF,#F5F3FF)}
+  .price .p.biz-p .ribbon{position:absolute;top:-12px;right:20px;background:var(--brand);color:#fff;font-size:11px;font-weight:800;border-radius:999px;padding:4px 12px}
+  .price h4{font-size:16px;font-weight:800}
+  .price .fee{margin-top:6px;font-size:26px;font-weight:800}
+  .price .fee small{font-size:12px;font-weight:600;color:var(--ink-mute)}
+  .price ul{margin:14px 0 0 18px;color:var(--ink-soft);font-size:13.5px}
+  .price li{margin-top:6px}
+  .price .contact{margin-top:14px;font-size:12px;color:var(--ink-mute)}
+
+  /* ---- faq ---- */
+  .faq{margin-top:24px}
+  .faq details{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 20px;margin-top:12px}
+  .faq summary{font-weight:700;font-size:14px;cursor:pointer}
+  .faq details p{margin-top:10px;font-size:13.5px;color:var(--ink-soft)}
+
+  footer{padding:36px 0 48px;color:var(--ink-mute);font-size:12.5px;text-align:center}
+  @media (max-width:820px){
+    .logic,.cards,.scen,.price{grid-template-columns:1fr}
+    .hero h1{font-size:30px}
+    td.feat{width:auto}
+  }
+</style>
+</head>
+<body data-page-node-id="KdyWARz6ej8ro2GF5yN343">
+
+<header class="hero" data-page-node-id="WYnTqOGDfeSEuNaWOdVh2A">
+  <div class="wrap" data-page-node-id="Z47zYbLpR20cA0m7ZgC1AD">
+    <div class="logo" data-page-node-id="k2KlxHe720gf9HFdYEcxp9"><span class="dot" data-page-node-id="4nvFC3X9zu8j4OKngJiJla"></span>oneArt 在线创作站</div>
+    <h1 data-page-node-id="QkGKCoEFEfvSkAhntssx09">一个创作站，<span data-page-node-id="7a4zSm4hJGWqFYGwfY781k">两种打开方式</span></h1>
+    <p class="sub" data-page-node-id="7OGwUiux5c7SW2PIawU1XN">公开版让你零门槛开始 AI 创作；商业版为专业创作者与工作室提供完整产能：全模型、工作流分镜、云端素材库与团队协作。</p>
+    <div class="badges" data-page-node-id="HvwjdMCVubL9DUJddoRgT0">
+      <span class="badge" data-page-node-id="niJ2UPD2vOqVZwoCtwwBOJ">AI 生图</span>
+      <span class="badge" data-page-node-id="UaWoAUDTOwwTSCtztBL839">AI 生视频</span>
+      <span class="badge" data-page-node-id="xwCFsyqJrSQZZVmtC0CuyQ">分镜 · 工作流</span>
+      <span class="badge" data-page-node-id="6JE67Sa4NSQSCImd92ySrN">云端素材库</span>
+      <span class="badge" data-page-node-id="Q8hpJKbiG6j8VKHghxvCp0">团队协作</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap" data-page-node-id="OhvrTG8bUDZfeJIcwxcQut">
+
+  <section id="logic" data-page-node-id="UwS0MBWPmte3yFMko8a1Uc">
+    <div class="kicker" data-page-node-id="fe0gWq5uVA70z9VR7dqoJg">Edition Split</div>
+    <h2 data-page-node-id="8b5ikW52hcUCbqr9btZzdc">版本划分逻辑：按「产能与协作」切分，不按「能不能用」切分</h2>
+    <p class="lead" data-page-node-id="8w7ChCFJ25EHndC90Vg9Tm">公开版保证个人创作者每天都能完整走通「灵感 → 生图 → 生视频 → 成片」的核心链路；商业版把上限抬高——更多模型、更高产能、可协作、可管理。</p>
+    <div class="logic" data-page-node-id="dkqMFlbhmh44tuGYLZ0qaG">
+      <div class="box" data-page-node-id="oZVJOAQEz0xichJCTGhGf8">
+        <span class="tag free" data-page-node-id="5sde7D9xsDJvanSb18JP4Y">公开版 · 免费</span>
+        <h3 data-page-node-id="rA3AZiNgWB1LePgJTTYhFc">个人创作的完整体验</h3>
+        <p data-page-node-id="bHSe1V4SCAB96nM536jj0X">注册即用。常用生图与视频模型、基础工作流与分镜、个人云端素材库（有限容量）。按日限额计费，足够日常尝试与轻量产出。</p>
+      </div>
+      <div class="box" data-page-node-id="PPxvDrRUjfEssWa0upk0Bo">
+        <span class="tag biz" data-page-node-id="Ic0WHnmxoPFjKHbLxlj8Fg">商业版 · 订阅</span>
+        <h3 data-page-node-id="gYxEALNRJnJX7r4f71eKqF">专业产能 + 工作室协作</h3>
+        <p data-page-node-id="rEy8phc4vwdi9y9358Yq7Z">面向以创作为生产力的用户：全模型优先接入、高清长时视频、大容量素材库与云同步，以及多团队 / 共享额度池 / 用量报表等工作室级管理能力。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="compare" data-page-node-id="9nzDwRuOkPm0oWEDDuhKWH">
+    <div class="kicker" data-page-node-id="ha1WsQ2j0zgGGKTHGL3g5M">Feature Comparison</div>
+    <h2 data-page-node-id="0FZClCnDLk7oZqkR7hNp2R">功能对照表</h2>
+    <table data-page-node-id="gKX5cIFE0auD8BQCB1yS2r">
+      <thead data-page-node-id="b877IkrVB5X9VzDWVCdFrx">
+        <tr data-page-node-id="43E6CWm8QmNyuWsHxsYNsZ">
+          <th style="width:220px" data-page-node-id="VdTD0iJHGtA1JHVWZMuYkd">功能</th>
+          <th data-page-node-id="qM9jiEnhyAR0HRiraBBZrZ">公开版（免费）</th>
+          <th class="biz-col" data-page-node-id="fYxJaQD6JCQvQbsKCGVzsY">商业版（订阅）</th>
+        </tr>
+      </thead>
+      <tbody data-page-node-id="uoCt6AxZ5wnGFOjKNh8bdz">
+        <tr data-page-node-id="IP5DSPqnRNqfQmtXNUQXic">
+          <td class="feat" data-page-node-id="r8tQskgFCFYIrdZrAs2qPQ">AI 生图<span class="note" data-page-node-id="PofJ3pCzk1bz1TIZ24K3Lx">多模型聚合网关</span></td>
+          <td data-page-node-id="vpV37bDqoCkK1rEy0ghQ1I"><span class="part" data-page-node-id="4WwSXITh58kv58GPQHAfpJ">部分模型</span><span class="note" data-page-node-id="UDoDeSttqwvcdnc5dWijEG">每日限额内使用常用模型</span></td>
+          <td data-page-node-id="ViFrVfhV5IhEO4Z3aPyGEN"><span class="yes" data-page-node-id="WmHtE62rHJ9QnZqq9Bf9QL">全模型</span><span class="note" data-page-node-id="42onxy1v5XPyCn7tvE1Wz3">新模型优先接入，不限模型子集</span></td>
+        </tr>
+        <tr data-page-node-id="sBbnXXSJVOMNLfAteaikEx">
+          <td class="feat" data-page-node-id="vEKzQZy41UsfGdZu9NksKQ">AI 生视频</td>
+          <td data-page-node-id="4pGaDH1miVxH1jLfgz7prZ"><span class="part" data-page-node-id="9gUih4kSIUrk0IxgkkwZcQ">可用</span><span class="note" data-page-node-id="burcE26yNH8QRY59ScNZE0">限基础时长档位与每日次数</span></td>
+          <td data-page-node-id="4UeG7nfXTgFCWKyDg6r2yo"><span class="yes" data-page-node-id="9R3gWGtZpmn5ew4u9RrYQn">完整时长档位</span><span class="note" data-page-node-id="GQG75mCmuosxDP9jvdFjSp">更高日额度，长时长档全开</span></td>
+        </tr>
+        <tr data-page-node-id="7YDlD3yrSOKZW81ulPrgI6">
+          <td class="feat" data-page-node-id="J70ljQ6OIINRh6cdJGMuq1">分镜 / 工作流画布</td>
+          <td data-page-node-id="9Lvp1XPY97DWh5R9HIbbif"><span class="part" data-page-node-id="DByVxlw5ExSQyqwHQQJ9x7">基础能力</span><span class="note" data-page-node-id="mKZ6sa5AcOcR6J7Z4mcdpm">简单生成链路</span></td>
+          <td data-page-node-id="LbXjaT4YzF2hTEowf5Khva"><span class="yes" data-page-node-id="bTNXAilBRRr3pzF3suaToc">完整工作流</span><span class="note" data-page-node-id="Icbte7QArsjYu1OUnaPYJ1">多节点编排、批量出图出片、节点级下载</span></td>
+        </tr>
+        <tr data-page-node-id="OHHhkUXpY2fu6KBkITr3av">
+          <td class="feat" data-page-node-id="91ps3nUFcIxOsDrkHeH4jp">云端素材库</td>
+          <td data-page-node-id="Ve9MhjLQTivPSALDtv1NYc"><span class="part" data-page-node-id="J8g8j5zlvl0DBeUHLi81Cj">有限容量</span><span class="note" data-page-node-id="A0mpctU0LGlZxQdtjJmSaz">保留近期作品</span></td>
+          <td data-page-node-id="v2x7wMmree4TjNlbgE7jxT"><span class="yes" data-page-node-id="MDvoCi3O7wTBHJbofGt2Di">大容量 + 历史云同步</span><span class="note" data-page-node-id="pEwMzfsalEeq1J5OSxAkL8">跨设备随取随用</span></td>
+        </tr>
+        <tr data-page-node-id="LTUo7dvL9EAlKmPZhNMC9o">
+          <td class="feat" data-page-node-id="FZ0UVdAl3jMAkEI3DOJ61H">素材分享协作</td>
+          <td data-page-node-id="sU1KZhHNhrexarkCybJc7m"><span class="no" data-page-node-id="PsIT45e52yny0TG1CXUaBB">不支持</span></td>
+          <td data-page-node-id="GoEk9DhiHhm1X3IJL873qj"><span class="yes" data-page-node-id="K2qW2dpI7C25BDTCe4wZdW">支持</span><span class="note" data-page-node-id="BU9b2GaY1lhnOAatD05tH0">定向分享给指定成员</span></td>
+        </tr>
+        <tr data-page-node-id="N6GYygyvUvMLGPfEhHFnUv">
+          <td class="feat" data-page-node-id="Vl6EhgMBj0rZqmD2cGvWVq">团队 / 工作室协作<span class="note" data-page-node-id="SibJT6dDwEr9E3sv6yaPv9">主子账号体系</span></td>
+          <td data-page-node-id="mEP4iHtRiWfLBrWbuhljOv"><span class="no" data-page-node-id="55c8yAoIPNOpgmOuqsYPB4">不支持</span></td>
+          <td data-page-node-id="rGIhat1cPCG1pnFfDDxZ93"><span class="yes" data-page-node-id="85loZJIBQYdRfbL9xMb8i4">完整支持</span><span class="note" data-page-node-id="91OUhrZexRTJvyJPfFFDXU">多团队分组、成员管理</span></td>
+        </tr>
+        <tr data-page-node-id="RqdQrat1kK5E1bOPEcwviP">
+          <td class="feat" data-page-node-id="vNUZ24PBgX9xRneHe8Xaq9">共享额度池<span class="note" data-page-node-id="DPfn9pa5oPJksKP2dBk2Lq">主账户充值，成员共用</span></td>
+          <td data-page-node-id="lv4gpMyRMmhXb3miUeIYv8"><span class="no" data-page-node-id="b20fIJKBRJE1hgmH96Gadd">不支持</span></td>
+          <td data-page-node-id="GB1SODcGpNx4jyzt8Dt0xj"><span class="yes" data-page-node-id="GYfRdGhfOEau8gYdbZREtN">支持</span><span class="note" data-page-node-id="A9noaDNR9DKn65E2MpdVLS">成员无需单独充值，低水位自动补给</span></td>
+        </tr>
+        <tr data-page-node-id="8GBm4xt6DQ3HS5QTUEAfXw">
+          <td class="feat" data-page-node-id="UaNkLugb9F3VYtRhhExreF">成员月度限额与用量报表</td>
+          <td data-page-node-id="ipgdN7wIgL0FC2c31aDdHJ"><span class="no" data-page-node-id="FTcGfVcLX57ELCN8gD2EE0">不支持</span></td>
+          <td data-page-node-id="alYER32Vm1XtKAhWUTlBJv"><span class="yes" data-page-node-id="H4y0TWs438OoUL92glv8fY">支持</span><span class="note" data-page-node-id="4pCeF5OdnG9v8thQ8870AU">按成员设月度上限，水位 / 划转 / 消费一目了然</span></td>
+        </tr>
+        <tr data-page-node-id="kQeDZFbVRiASLmo29uX4nY">
+          <td class="feat" data-page-node-id="HF3BoNU8LbTxKQvqffNnV5">自定义 AI 服务接入</td>
+          <td data-page-node-id="LAEYaV2NqVITLbEGmoLeyS"><span class="no" data-page-node-id="DqPqlzvdx6n4OpUdBTaWQx">不支持</span></td>
+          <td data-page-node-id="Zoo14YUPzaJGJMhwnmpEtw"><span class="yes" data-page-node-id="uJaRFuS6hUpla8A8ChAkn1">支持</span><span class="note" data-page-node-id="5JzHj2pel6QUseajhDTwL3">接入自有网关 / 渠道，额度走自己的上游</span></td>
+        </tr>
+        <tr data-page-node-id="SDXBklVnkayh2AuP79Dbxn">
+          <td class="feat" data-page-node-id="UWHBfHtGb8MubZcCvieu8O">服务支持</td>
+          <td data-page-node-id="yG1eVx3ZuiL9OYv4S5XHUN"><span class="part" data-page-node-id="7cAIhaJZiLLVv1ulSUDkUW">社区支持</span></td>
+          <td data-page-node-id="Z9DJLo08skCxtjTmgguTiC"><span class="yes" data-page-node-id="oZl6n3geNvgNBo8ctMIDiE">优先响应</span><span class="note" data-page-node-id="z4PbuaEFdOBHg3SxxfBVLr">专属对接通道</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="highlights" data-page-node-id="On4h2GM4Rx2PdBrr827BCN">
+    <div class="biz" data-page-node-id="zKiKkJOEkcRjzboEkXeAoe">
+      <div class="kicker" data-page-node-id="rGsdcC7ZaXhfCs15mQRHfZ">Business Highlights</div>
+      <h2 data-page-node-id="nEOHsk98qZhsjnKn6aDJkL">商业版四大核心能力</h2>
+      <p class="lead" data-page-node-id="MGo8zM9cQ5rRmloJdBGYZi">不只是一个「更大的账号」，而是一套面向工作室运营的产能与管理体系。</p>
+      <div class="cards" data-page-node-id="Zvdi3so0wmhuwafSdjdjjT">
+        <div class="c" data-page-node-id="UxP9AR2c5KQyedmOcjA1kO">
+          <div class="n" data-page-node-id="C4dBtL3qzvtQMcUA5Y04d3">01</div>
+          <h4 data-page-node-id="FNYwxuZNCGBZdN66zuq49E">全模型产能</h4>
+          <p data-page-node-id="qha71ZrPJoHHyqMMgCYzYw">生图、生视频全模型开放，新模型优先接入。日额度大幅提升，长时长视频档位全开，满足商业交付节奏。</p>
+        </div>
+        <div class="c" data-page-node-id="RrpfOphnFeZ4crUfuAkDee">
+          <div class="n" data-page-node-id="sjh5abXR9atLSXV1XUXd39">02</div>
+          <h4 data-page-node-id="3H2UxvO32dbuBbSOvnZtuW">共享额度池</h4>
+          <p data-page-node-id="4SPt1tJYZJNcECUEl0PhHD">主账户一处充值，员工子账号共用额度。成员余额低水位时自动从池补给，员工无需各自付费，账目清晰。</p>
+        </div>
+        <div class="c" data-page-node-id="GzeeI2A3goQPeovjtRjj1g">
+          <div class="n" data-page-node-id="Qoib66JvNgsKxXg0VOyj39">03</div>
+          <h4 data-page-node-id="EjCY9XZV6tBXjpCR7jGHEx">多团队分组管理</h4>
+          <p data-page-node-id="uKQH6eGJ3vwg8solQHykww">工作室可按小组建多个团队（如设计部、视频组），每队独立成员与月度限额，成本按组管控。</p>
+        </div>
+        <div class="c" data-page-node-id="BSWg4LgoYcKLBVtdnw6bdd">
+          <div class="n" data-page-node-id="MpH4XSkTavJHs8fyIiSRVm">04</div>
+          <h4 data-page-node-id="zMe0vAJEOwcuSFcMpDRlWO">用量报表</h4>
+          <p data-page-node-id="RfvtnMMU0cSbp7C4Gju6kn">成员当前余额、当月划转、月度限额、累计消费实时可见，随时掌握每个人的产能与成本。</p>
+        </div>
+        <div class="c" data-page-node-id="MxkAOIQ0nETC3FHRam7JDk">
+          <div class="n" data-page-node-id="7Uk2D4gtY4zqv728yrOatY">05</div>
+          <h4 data-page-node-id="2ZGbJ6IuRMMOdXQDbwFiRz">云端素材库</h4>
+          <p data-page-node-id="8PjFRj0bw3SDgUId3oIp5p">大容量云端存储与历史云同步，作品跨设备随取随用，支持向指定成员定向分享素材。</p>
+        </div>
+        <div class="c" data-page-node-id="RCsMGEJzZCqhS2fOY2TfN2">
+          <div class="n" data-page-node-id="GizWOzA87mfmhcB82YIZ4D">06</div>
+          <h4 data-page-node-id="B5k2M15clCw9KKHhus326T">自有服务接入</h4>
+          <p data-page-node-id="jzpvFsh3H9zpHdzkCWPQD2">已拥有自有 AI 服务 / 网关的团队可直连接入，创作体验不变，额度消耗走自己的上游。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="scenarios" data-page-node-id="cwbS5AyPIgt3S68kVBFZiF">
+    <div class="kicker" data-page-node-id="tt3BNswWjR9L5qLZEwoBMH">Who Is It For</div>
+    <h2 data-page-node-id="TdqXVYXwzzy3eADMk8ObFA">适用场景</h2>
+    <div class="scen" data-page-node-id="JZqtvrKWPRsChrNGbjslQI">
+      <div class="s" data-page-node-id="4OIu6b80BDw4wqPqmqDOQJ">
+        <h4 data-page-node-id="pALj5KVXAyCGBfzLjTRXps">尝鲜与学习</h4>
+        <div class="who" data-page-node-id="KMBMhDGIRiwM57XbDUgRHy">公开版 · 免费</div>
+        <ul data-page-node-id="ptBLAm7jtnCL3ckXXMzQFz">
+          <li data-page-node-id="q8IVstxAK0MSwDmAHDozB3">体验 AI 生图与生视频的完整链路</li>
+          <li data-page-node-id="Pl491yUL8fAZvX3WHiBxLU">轻量个人创作，日限额内够用</li>
+          <li data-page-node-id="pX3QCRybbkhIZbX3wub9kn">先跑通效果，再决定是否升级</li>
+        </ul>
+      </div>
+      <div class="s" data-page-node-id="Vz5Geu4cAlkZ7VlE62QAx1">
+        <h4 data-page-node-id="AmdCSsRyCXVsDo1SNNN5Og">专业独立创作者</h4>
+        <div class="who" data-page-node-id="BHjNfqBiq3Q3x7UO1VLgza">商业版 · 个人席位</div>
+        <ul data-page-node-id="tT3k6iyz0WI6xTjNsbcBEh">
+          <li data-page-node-id="NS4q3tfAY1LNjpnuTRVYRA">全模型与完整工作流，以创作为产出</li>
+          <li data-page-node-id="j6o5EGARJrkTExLSFHs2a4">大容量素材库沉淀个人作品资产</li>
+          <li data-page-node-id="mBsPzvJo9fTiUHGDSgwBE7">对出片速度和模型广度有要求</li>
+        </ul>
+      </div>
+      <div class="s" data-page-node-id="NHGPYUwUJwO2eIyyaR6mds">
+        <h4 data-page-node-id="KEk1GigGUmsHlCSG9IPlkn">工作室 / 小团队</h4>
+        <div class="who" data-page-node-id="noEEWXIT2vH1Bgc73CVeNf">商业版 · 团队席位</div>
+        <ul data-page-node-id="bDqtbZRrTZapwMTdie6oqY">
+          <li data-page-node-id="GBtfK3bvqR5BGxze3vEoaw">老板一处充值，全员共用额度池</li>
+          <li data-page-node-id="ue3mLD9Gi6YSLvRZhEF9g2">分组管理 + 月度限额，成本可控</li>
+          <li data-page-node-id="sRSbjEh51rnnhQsmowA4YO">用量报表透明，账目好对</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section id="pricing" data-page-node-id="VbxHIAJoT8RAePAP97PqwG">
+    <div class="kicker" data-page-node-id="XuzlFMSoXJsxeHVDRpAcYx">Plans</div>
+    <h2 data-page-node-id="rWbN8EkQmbjfmykwd36pyC">订阅方案</h2>
+    <div class="price" data-page-node-id="r5mBXuQGexmBa6vNkVIFM0">
+      <div class="p" data-page-node-id="V3NpUVGvWrGo2E82utbeH8">
+        <h4 data-page-node-id="NBCultOiXZWGNr8fsEPndn">公开版</h4>
+        <div class="fee" data-page-node-id="BEGXGRZtSaDdhLZhSNcjmU">免费<small data-page-node-id="01IAbgciEIn7WeeAnBsKGt"> / 注册即用</small></div>
+        <ul data-page-node-id="IM19LLlvIxOzIwPtX8klMe">
+          <li data-page-node-id="oGUugmgDdYOb9AFFrWcq82">常用生图 / 生视频模型（日限额）</li>
+          <li data-page-node-id="ihVkVT5coN6UAQ0Mt0FPRw">基础分镜与工作流</li>
+          <li data-page-node-id="oHAaIEiSBaA6ECmZfb8uqb">有限容量云端素材库</li>
+          <li data-page-node-id="xdBRpFFJ1xFQE2pFwvUUVn">社区支持</li>
+        </ul>
+      </div>
+      <div class="p biz-p" data-page-node-id="nuod6BK77YF5C8eZcWGHaU">
+        <span class="ribbon" data-page-node-id="2uqUII76DDAIX1QQKkPpbH">推荐</span>
+        <h4 data-page-node-id="yopZTQjLUeYrEEAItKIpQl">商业版</h4>
+        <div class="fee" data-page-node-id="7R1sai5mx49K0vFCTGHFGM">按席位订阅<small data-page-node-id="b1ThzPC5FDWZFFiDHZg2Qh"> / 具体价格以商务报价为准</small></div>
+        <ul data-page-node-id="2MMDdXrvht1n4mJ5Jn0REo">
+          <li data-page-node-id="6ZTY9ITEK8ddlGdh1CStCh">全模型 + 完整工作流与分镜</li>
+          <li data-page-node-id="xqXPBind00xfIy7lW25raf">大容量素材库与历史云同步</li>
+          <li data-page-node-id="Cra3WZMKFQARX61AUuB6IS">团队协作：多团队分组 / 成员管理</li>
+          <li data-page-node-id="iVWnXhJimNnrCvJ0Hri9En">共享额度池 + 成员月度限额</li>
+          <li data-page-node-id="7bD3HG9kZbEU35lctGY53t">成员用量报表与优先支持</li>
+          <li data-page-node-id="Nz4F3ALenmhwqqOYXngo7s">支持自有 AI 服务接入</li>
+        </ul>
+        <div class="contact" data-page-node-id="WDvyxa2zj9R5ct9jsRk6kl">价格按席位与额度档位报价，支持按月 / 按年；团队席位含共享池与报表能力，详情请与商务对接。</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="faq" data-page-node-id="Wf7e3yUEFK8BFSY0mFhB5n">
+    <div class="kicker" data-page-node-id="jBf8XgOvjYiWaKHaGUdHh3">FAQ</div>
+    <h2 data-page-node-id="GJMFHGb0jmgP92hRDukWGh">常见问题</h2>
+    <div class="faq" data-page-node-id="Bn6PziajJzqeugRnSNVd7X">
+      <details data-page-node-id="eW1Uj88RXIg6fkk7QbHLSU">
+        <summary data-page-node-id="tY6Bw0037adnBGAiKw52Nc">公开版免费，会有功能阉割到没法用吗？</summary>
+        <p data-page-node-id="ApHldWxflwExJajz8dPgIG">不会。公开版保留完整的「生图 → 生视频 → 素材保存」核心创作链路，限制主要在模型广度与每日额度上，日常尝试与轻量产出完全够用。</p>
+      </details>
+      <details data-page-node-id="iNMve3WAVpAuqXapvPP8w0">
+        <summary data-page-node-id="o7AEBIhRIeByfxdBju9HGJ">团队共享池是怎么扣费的？员工要自己充值吗？</summary>
+        <p data-page-node-id="2zVWOiW4KQwYxJZHjzwRSW">不需要。主账户充值进共享池，成员创作时自动从池中补给个人额度；每月可给每个成员设置划转上限，超出即停，成本始终可控。</p>
+      </details>
+      <details data-page-node-id="OU2M41A6UafjGxeLfxnD5z">
+        <summary data-page-node-id="FD860RLGz8FxEcFi6DwA61">一个工作室可以分多个小组吗？</summary>
+        <p data-page-node-id="xkcMrm41xdoyHjsH87CZE6">可以。商业版支持一个主账户创建多个团队（如设计部、视频组），每个团队独立管理成员、独立设置月度限额，报表按团队分开看。</p>
+      </details>
+      <details data-page-node-id="p7POWGVur02bRtTs4bZKZa">
+        <summary data-page-node-id="aT5Ktp4fCVqaEhugjCbzvE">成员离职或换组怎么处理？</summary>
+        <p data-page-node-id="oP2rSeFADcpekMRYyCiN33">从团队移除成员即可，其个人账号与已生成作品不受影响，仅解除与共享池的关联；新成员按用户名拉入即可。</p>
+      </details>
+      <details data-page-node-id="WaEDNlKiF3PWhxoDq1bjYU">
+        <summary data-page-node-id="T5lCCUaY1SJuXM5cYhMaaZ">我们已有自己的 AI 服务 / 网关，能用吗？</summary>
+        <p data-page-node-id="xpe2sxVSodEds0ldqniwgc">商业版支持接入自有服务：创作界面与工作流保持不变，调用走你自己的上游通道，额度消耗计在自己的服务上。</p>
+      </details>
+    </div>
+  </section>
+
+</div>
+
+<footer data-page-node-id="jSuPxE11iq1w87LArvy3P6">
+  <div class="wrap" data-page-node-id="EaW2EDjUW7ayxUs19qn5UU">oneArt 在线创作站 · 版本介绍书 · 本页内容以实际交付功能为准，价格与额度档位以商务报价为准</footer>
+</footer>
+
+</body>
+</html>

@@ -30,7 +30,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from .. import cloudstore, config, platform_catalog, tasks
+from .. import cloudstore, config, platform_catalog, tasks, teams
 from ..platform_catalog import ModelSuspendedError
 from ..resp import ok
 from ..security import is_admin, require_session
@@ -128,6 +128,13 @@ async def _create_task_common(
                 logger.warning("409 拦截日志落库失败 uid=%s model=%s: %s",
                                session.get("uid"), model_name, log_err)
             raise
+    # 团队低水位划转（飞哥 2026-10-09）：团队成员提交任务前若自身 quota 低于
+    # 水位线，从主账号池自动划一块补足（消费本尊仍扣子账号自己，见 app/teams.py）。
+    # 划转任何失败只在服务端日志告警，绝不阻断提交。
+    try:
+        await teams.ensure_member_quota(int(session["uid"]))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("团队划转钩子异常 uid=%s: %s", session.get("uid"), e)
     # BFF 按 type 的 mode 分流（async 透传网关 tasks / sync 阻塞直出），并记录请求日志。
     # pat 透传：sk- 缺失/轮换时优先用用户 PAT 自建（token 归属用户本人，计费正确；
     # 2026-09-24 计费错账修复——管理员代建的 sk- 会被 new-api 挂到管理员名下）。

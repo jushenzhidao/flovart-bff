@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="hmyfAIkqRcbSar8jTyNEjO">
+<head data-page-node-id="ZSisQMHBiOUB1tBZNDgGFC">
+<meta charset="UTF-8" data-page-node-id="LoWxdJTRu1KCph45rbZU7I">
+<meta name="viewport" content="width=device-width, initial-scale=1.0" data-page-node-id="0CaogeoPIpEpWhZvn5CZWc">
+<title>oneArt AI 创作站 · 竞品分析与产品计划书</title>
+<style>
+  :root {
+    --primary: #6d4aff;
+    --primary-soft: #f0ecff;
+    --ink: #1a1a2e;
+    --ink-2: #4a4a68;
+    --ink-3: #8a8aa3;
+    --line: #e8e8f2;
+    --bg: #ffffff;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --no: #cbd5e1;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: var(--ink); background: #f6f6fa; line-height: 1.75;
+  }
+  .page { max-width: 960px; margin: 0 auto; background: var(--bg); padding: 56px 64px 72px; }
+  @media print {
+    body { background: #fff; }
+    .page { padding: 24px 8px; max-width: 100%; }
+    .no-print { display: none; }
+    section { page-break-inside: avoid; }
+  }
+  /* ---------- 封面 ---------- */
+  .cover { text-align: center; padding: 40px 0 48px; border-bottom: 1px solid var(--line); }
+  .cover .logo-badge {
+    display: inline-flex; align-items: center; gap: 10px;
+    background: linear-gradient(135deg, #6d4aff, #9b6dff); color: #fff;
+    padding: 10px 26px; border-radius: 999px; font-size: 22px; font-weight: 700; letter-spacing: 1px;
+  }
+  .cover h1 { font-size: 34px; margin-top: 28px; letter-spacing: 2px; }
+  .cover .sub { color: var(--ink-2); font-size: 16px; margin-top: 10px; }
+  .cover .meta { color: var(--ink-3); font-size: 13px; margin-top: 26px; }
+  /* ---------- 标题 ---------- */
+  section { padding: 34px 0 6px; }
+  h2 {
+    font-size: 22px; margin-bottom: 18px; display: flex; align-items: center; gap: 12px;
+  }
+  h2 .no {
+    background: var(--primary); color: #fff; width: 32px; height: 32px; border-radius: 9px;
+    display: inline-flex; align-items: center; justify-content: center; font-size: 16px; flex: none;
+  }
+  h3 { font-size: 16px; margin: 20px 0 10px; color: var(--ink); }
+  p.lead { color: var(--ink-2); margin-bottom: 14px; }
+  /* ---------- 卡片 ---------- */
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 8px; }
+  .card {
+    border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; background: #fbfbfe;
+  }
+  .card .t { font-weight: 700; font-size: 15px; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+  .card .t .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--primary); flex: none; }
+  .card .d { color: var(--ink-2); font-size: 13.5px; }
+  .card.hero { grid-column: 1 / -1; background: linear-gradient(135deg, #f5f2ff, #fbfbfe); border-color: #ded5ff; }
+  /* ---------- 表格 ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 10px 0 6px; }
+  th, td { border: 1px solid var(--line); padding: 9px 12px; text-align: left; vertical-align: top; }
+  thead th { background: var(--primary-soft); color: var(--ink); font-weight: 700; white-space: nowrap; }
+  tbody tr:nth-child(even) { background: #fafafd; }
+  td.us { background: #f5f2ff !important; font-weight: 600; }
+  .yes { color: var(--ok); font-weight: 700; }
+  .part { color: var(--warn); font-weight: 600; }
+  .no2 { color: var(--no); }
+  .me-col { background: var(--primary); color: #fff; }
+  /* ---------- 徽章/统计 ---------- */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 14px 0 8px; }
+  .stat { border: 1px solid var(--line); border-radius: 14px; text-align: center; padding: 18px 8px; background: #fbfbfe; }
+  .stat .num { font-size: 30px; font-weight: 800; color: var(--primary); }
+  .stat .lab { color: var(--ink-2); font-size: 13px; margin-top: 2px; }
+  .badge { display: inline-block; background: var(--primary-soft); color: var(--primary); border-radius: 6px; padding: 1px 9px; font-size: 12px; font-weight: 600; margin-right: 6px; }
+  /* ---------- Roadmap ---------- */
+  .road { border-left: 3px solid var(--primary); margin: 14px 0 8px 8px; padding-left: 24px; }
+  .road .phase { position: relative; padding-bottom: 22px; }
+  .road .phase::before {
+    content: ""; position: absolute; left: -31.5px; top: 6px; width: 12px; height: 12px;
+    border-radius: 50%; background: #fff; border: 3px solid var(--primary);
+  }
+  .road .ph-t { font-weight: 700; font-size: 15.5px; }
+  .road .ph-t small { color: var(--ink-3); font-weight: 500; margin-left: 8px; }
+  .road ul { margin: 8px 0 0 18px; color: var(--ink-2); font-size: 13.5px; }
+  .road li { margin-bottom: 4px; }
+  .road li b { color: var(--ink); }
+  /* ---------- 引用块 ---------- */
+  .callout {
+    background: linear-gradient(135deg, #f5f2ff, #fdfcff); border: 1px solid #ded5ff;
+    border-radius: 14px; padding: 16px 22px; margin-top: 14px; font-size: 14.5px;
+  }
+  .callout b { color: var(--primary); }
+  .foot { border-top: 1px solid var(--line); margin-top: 40px; padding-top: 18px; color: var(--ink-3); font-size: 12.5px; text-align: center; }
+</style>
+</head>
+<body data-page-node-id="yhwU6catnaa00arT42gkRw">
+<div class="page" data-page-node-id="Yj5E5fSVja1CkLpQQKUYLa">
+
+  <!-- ============ 封面 ============ -->
+  <div class="cover" data-page-node-id="JeWrZep7y5M19NriV0lpvN">
+    <span class="logo-badge" data-page-node-id="izux9ANlsBVs1WPczVj7Ge">✦ oneArt AI 创作站</span>
+    <h1 data-page-node-id="yqHYeHIrVqPGV2C4hLrzMB">竞品分析与产品计划书</h1>
+    <div class="sub" data-page-node-id="er4fbDRkMmO7fjMOyHoCDY">节点式 AI 视觉创作平台 · 图片 / 视频 / 分镜一站式生产</div>
+    <div class="meta" data-page-node-id="aM0HYNHZ2MDMn1y0kWihDE">商务合作版 · 2026 年 10 月 · 数据基于公开竞品调研与产品实测</div>
+  </div>
+
+  <!-- ============ 一、产品定位 ============ -->
+  <section data-page-node-id="J58LIA3ZyEzRt2AmXMxzrv">
+    <h2 data-page-node-id="j6GGRQjWtWJyWBgPFKhgKs"><span class="no" data-page-node-id="dVx4w2fEH1m2F5diabK43z">1</span>产品定位与核心优势</h2>
+    <p class="lead" data-page-node-id="x6IkpeosDU2EQgjRGqFMQn">oneArt 是一款<b data-page-node-id="9sG4Pc9PRrcXoTetbnCbLE">节点式（Node-based）AI 视觉创作平台</b>：用户在无限画布上创建图片 / 视频节点，通过连线组织"生成 → 编辑 → 加工 → 分镜"的完整生产流水线，覆盖从灵感到成片的全流程。</p>
+    <div class="cards" data-page-node-id="1BkQd9sG1GiTQX4rCctdck">
+      <div class="card hero" data-page-node-id="Uvzs4lXxFOTDabJX1DIjWx">
+        <div class="t" data-page-node-id="RqHSAiycBUdIFimCjJsZtX"><span class="dot" data-page-node-id="DuOmFbckphZzjyQFhd8a8u"></span>差异化核心：节点式工作流，不只是"一堆按钮"</div>
+        <div class="d" data-page-node-id="E8zj0iJC0zVqirsxktZV23">主流竞品的 AI 编辑均为"单图单工具"模式——用户需要在多个页面间来回导出导入。oneArt 将全部能力沉淀在<b data-page-node-id="lgnZK32sUOu5luFMFf3m0C">一张无限画布</b>上：多节点连线、批量执行、自动分组、操作可重跑（配方化），真正面向"批量生产"而非"单次尝鲜"。这是与即梦 / Canva / 美图类产品的<b data-page-node-id="YkZQTi1KADQZkSewxWdRUq">代际差异</b>，对标国际新兴的 Krea / Weavy 形态并完成本土化超越。</div>
+      </div>
+      <div class="card" data-page-node-id="VVVx1ow5sgkU5jlR6kzKno">
+        <div class="t" data-page-node-id="UqWRRC0J2iNfG0fVJFIHV6"><span class="dot" data-page-node-id="lR9UOXcFjE3HH43nY2RNLL"></span>全链路一站式</div>
+        <div class="d" data-page-node-id="r5HJOxJXoxEQWDaVnFUK0O">22 种图片 AI 工具 + 视频生成 + 视频加工套件 + 智能分镜模板 + 自定义工具栏，图片到视频无需切换平台。</div>
+      </div>
+      <div class="card" data-page-node-id="wdot5qd9woFGad2redbv0f">
+        <div class="t" data-page-node-id="gOogRF5URBIaFoylNn3aMv"><span class="dot" data-page-node-id="PhRwxFHSThG06xFejJNLpA"></span>网关化计费体系</div>
+        <div class="d" data-page-node-id="UeEY92UFvKYKYglTSBdlDT">全站调用统一经 AI 网关按量计费，账目清晰、可审计、可对账，适配平台运营与渠道合作两类场景。</div>
+      </div>
+      <div class="card" data-page-node-id="7tlsv01Gjnky3OYIwfDYkh">
+        <div class="t" data-page-node-id="viAYfA1APjXwOIciJDpQjA"><span class="dot" data-page-node-id="A0DSQwRcDqO5IoaxmPUoKk"></span>多上游模型接入框架</div>
+        <div class="d" data-page-node-id="y86llKnwfV74O3bkthVM8Z">已打通 16+ 上游模型通道，能力级开关运行时可配——合作方的自有模型可快速接入，天然适配商务共建。</div>
+      </div>
+      <div class="card" data-page-node-id="JfJ5oWtBGB5CCTsd0lfrQG">
+        <div class="t" data-page-node-id="8CcqaSimNLxA15maUrceF3"><span class="dot" data-page-node-id="hvfcouP7FzLhiH4wjPr4ZW"></span>私有化与可集成</div>
+        <div class="d" data-page-node-id="ddHmuJtiCOa2YnIsJImZJQ">容器化交付，支持私有化部署；提供标准化 API，可作为企业内容生产的底层引擎。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 二、竞品对比 ============ -->
+  <section data-page-node-id="VMykrk8wthDVP2dGxPEZ6e">
+    <h2 data-page-node-id="Q48hzkgfAgPnFRdqYHp5pz"><span class="no" data-page-node-id="p7GMYeL91FwKruuMmX6ZXu">2</span>竞品对比分析</h2>
+    <p class="lead" data-page-node-id="SavLexOWRDoE7LIN6wB4s7">选取国内头部（即梦、可灵）、国际平台（Canva、Photoshop）、新兴 AI 原生工具（Krea、Lovart、Photoroom、Freepik）共 9 家进行对标。其中 <b data-page-node-id="npC97nxhgCX0jyJDtzE1K9">Lovart</b>（设计 Agent 赛道头部，2025 年 7 月全球上线）与 oneArt 的画布形态最为接近，单列重点对比。</p>
+
+    <h3 data-page-node-id="5GttDXVVPQPRKElmEog4SO">2.1 综合能力矩阵</h3>
+    <table data-page-node-id="gdbXiCrbCK19Hmx9WhjzLG">
+      <thead data-page-node-id="2fwSNQazH3u6ORpyEbJfte">
+        <tr data-page-node-id="mCJ3mXBebJLqHBEj0I2CNc">
+          <th style="width:15%" data-page-node-id="rTuMDT0vnirapeyKBzqt9w">能力维度</th>
+          <th class="me-col" data-page-node-id="wGLrLGhCONscKDimpL609q">oneArt</th>
+          <th data-page-node-id="CzklfkSWs4pJNM68SLtO8B">即梦</th>
+          <th data-page-node-id="6jfouSrMJM5WFQGn0Lokha">可灵</th>
+          <th data-page-node-id="mTE3AWgZD3H9r47PZBrSh9">Canva</th>
+          <th data-page-node-id="V2GXmCH333SVOjPtSN9ILW">Photoshop</th>
+          <th data-page-node-id="ugIvd82qa822Y37zzKhMcN">Krea</th>
+          <th data-page-node-id="LNiQrF6dMVUWSlASavCCBH">Lovart</th>
+          <th data-page-node-id="WpmApbQ6s8z8Aq8HDL7xdk">Photoroom</th>
+        </tr>
+      </thead>
+      <tbody data-page-node-id="WDtwWbHcsv182fsgI18oQi">
+        <tr data-page-node-id="TRlkFA1EhNxu6cw0BnUGXY">
+          <td data-page-node-id="6pNsFWpoa1KhHiLBlpdmLg">节点式工作流</td>
+          <td class="us" data-page-node-id="SJnmsVf8gHcZmO65UENNYB"><span class="yes" data-page-node-id="6UEerQ0bZwtDcesmuv0Z2m">✔ 核心形态</span></td>
+          <td class="no2" data-page-node-id="6ETjfuBJsHa7QiT8BofY5g">✘</td><td class="no2" data-page-node-id="IawflxAjAGg4fjY2YQAHeb">✘</td><td class="no2" data-page-node-id="x61HEpFxlOEk40Z3cAEltZ">✘</td>
+          <td class="part" data-page-node-id="kTI1mr9ppWZOgysDMaBXBE">△ 图层非节点</td><td class="yes" data-page-node-id="0Z5joyIOesiRcrzWN3fPAE">✔</td><td class="part" data-page-node-id="UTzLUtwCbgANyArpGrC2wB">△ 画布但 Agent 主导</td><td class="no2" data-page-node-id="xkhGEACsiahTHOmG2oX5XD">✘</td>
+        </tr>
+        <tr data-page-node-id="1c5iGNUIz4j5MAOPhjW0Wf">
+          <td data-page-node-id="poJUUFbCGgEeP707j7Nvri">图片 AI 工具数量</td>
+          <td class="us" data-page-node-id="8fKl7D2iEBnYQbrpHa8Bay"><span class="yes" data-page-node-id="BRHzWrCUf6bfZcgMfCs2dM">22 种</span></td>
+          <td class="part" data-page-node-id="bTFcyywgTTGRQYcsZ4XTfW">约 15 种</td><td class="part" data-page-node-id="rMlLyCf0VmKUXu3WDlD8nW">约 10 种</td><td class="part" data-page-node-id="YhsVlAJB5arMHqlNYov5zY">Magic Studio 套件</td>
+          <td class="yes" data-page-node-id="bCwMuJFzxnntChSeLOT4hM">最全（Firefly）</td><td class="part" data-page-node-id="t68hXqmceCorY80b0CW4gP">约 12 种</td><td class="part" data-page-node-id="r8VHuHkI4khzjmwdPGK4Ms">Agent 集成（多模型）</td><td class="part" data-page-node-id="bV4xBsRP8h1M92fVAdYGhf">专注抠图/背景</td>
+        </tr>
+        <tr data-page-node-id="yT4xDKHoS693drrf8wwxtX">
+          <td data-page-node-id="Bq9RKHDBX1QAySCgpOQK2m">视频生成</td>
+          <td class="us" data-page-node-id="HmSdHSdx5PIYAOEBwlBemQ"><span class="yes" data-page-node-id="rBYB2lzwxGPRjh2nIQPEtN">✔ 文/图生视频、首尾帧</span></td>
+          <td class="yes" data-page-node-id="Ufyah6uL9jr6JrNUZ9PZeQ">✔</td><td class="yes" data-page-node-id="c7DzTqBFYmMcf5fCDlkm28">✔ 行业领先</td><td class="no2" data-page-node-id="hptFmqaJl6rOEIaGU8NEJs">弱</td>
+          <td class="no2" data-page-node-id="C34d4wh7AcHaxxqZE2LGAm">✘</td><td class="yes" data-page-node-id="jcI61kiq44DFkzzlMV7vrl">✔</td><td class="yes" data-page-node-id="I961ubXijs4ZpIBoRDt8H6">✔</td><td class="no2" data-page-node-id="RkjC42AYim2JeIVimERc9G">✘</td>
+        </tr>
+        <tr data-page-node-id="GsrUy51CvmTaCT6ReW0pYA">
+          <td data-page-node-id="pv6o1eGZqw8fG2K6hBdt0I">视频加工（剪辑/拼合/抽帧）</td>
+          <td class="us" data-page-node-id="W9DSoMmt8aMUB0HwiuKu4D"><span class="yes" data-page-node-id="8XLyTOfxTzuAHSQu1p87KP">✔ 4 项内置</span></td>
+          <td class="part" data-page-node-id="jUfybYlP1mTLozr9h3tprz">部分</td><td class="part" data-page-node-id="iIwn4czftr9DiQaDHsuN33">部分</td><td class="yes" data-page-node-id="Q3cOJHttEbZCTTLwz2pKwu">✔（非 AI 向）</td>
+          <td class="yes" data-page-node-id="e4R1uziwN5cm3SfykZQuWL">✔</td><td class="no2" data-page-node-id="Cr0qea2C9N0sk3U3ZeUcZV">✘</td><td class="no2" data-page-node-id="LW0RBV0mx25bJ8EJLDYee7">✘</td><td class="no2" data-page-node-id="DesdSyuDAFsJ016ihUw33x">✘</td>
+        </tr>
+        <tr data-page-node-id="7Lp1tU3K1qrOYCdN73BWTp">
+          <td data-page-node-id="PLP2RaInU74yMi697JwvOg">智能分镜 / 故事板</td>
+          <td class="us" data-page-node-id="KWaCrkUahWyvwjNqSZJFEw"><span class="yes" data-page-node-id="ZivoDU8b7PL9qW8BHgGogG">✔ 剧本 AI 拆解 + 批量出图出片</span></td>
+          <td class="no2" data-page-node-id="GSbQu7zcRAb2JM0yZe8G73">✘</td><td class="no2" data-page-node-id="yklsbJAnMbAfJwj5UMu4VV">✘</td><td class="no2" data-page-node-id="tXFMHnUBYsMtCOk2Y8xDlp">✘</td>
+          <td class="no2" data-page-node-id="PBJgvEs0dKnyV9PIhDtVto">✘</td><td class="no2" data-page-node-id="UkieyTJkyTzfslwJb5NmNR">✘</td><td class="yes" data-page-node-id="ie0NPLZPdZffd5oy05fwp1">✔ Agent 生成</td><td class="no2" data-page-node-id="qEbUZDYuJGCoi3DCBdPmi0">✘</td>
+        </tr>
+        <tr data-page-node-id="i4dr9YVos2BJfjDHE4LyHS">
+          <td data-page-node-id="JHbANMZEFEC6ZDUkeACu7s">批量生产（多节点并行）</td>
+          <td class="us" data-page-node-id="e7ecx2WJX2whgIHX1gX10k"><span class="yes" data-page-node-id="FdUsNj0boWMC2udDGxWtuH">✔ 批量生图/生视频</span></td>
+          <td class="no2" data-page-node-id="51ZbOh4rREbLCWBXmInGGL">✘</td><td class="no2" data-page-node-id="L7YEgtjZiZMAi2eOI3xlsY">✘</td><td class="part" data-page-node-id="FgKh4PmYL5k56FUUhiriu0">模板批量</td>
+          <td class="no2" data-page-node-id="8483KSLS6V19EzEfgew3qP">✘</td><td class="part" data-page-node-id="JpAALy3FPNCc6NSYIuk3DA">部分</td><td class="yes" data-page-node-id="6LNQDKl2vNsooYGRoGjhY3">✔ 单次多资产</td><td class="yes" data-page-node-id="vQZNd0GhORcp7uEWsUE2JH">✔ 电商批量</td>
+        </tr>
+        <tr data-page-node-id="Y8ZWIMYLdH0q13SyJruEz0">
+          <td data-page-node-id="MPYYAwLwXViNQFC2XB7jNY">自定义工具栏</td>
+          <td class="us" data-page-node-id="BD7Fzuslo9m6MzefSmT7wd"><span class="yes" data-page-node-id="W8nEYLjbzzfHZMEN05U3VC">✔ 钉选/收纳</span></td>
+          <td class="no2" data-page-node-id="JMIq4jwxaGcneUHh0Fjk1u">✘</td><td class="no2" data-page-node-id="QPCB3HrHAbwCTr7m901p1O">✘</td><td class="no2" data-page-node-id="MF52wpGoRo3jLimlrPSS51">✘</td>
+          <td class="yes" data-page-node-id="77y2dy69GZTTJlwGGVoxmz">✔ 工作区</td><td class="no2" data-page-node-id="vWKXdU38k1Ed8jDBhy5gHI">✘</td><td class="no2" data-page-node-id="nK5oWc2wRYYmfco45ljXG4">✘</td><td class="no2" data-page-node-id="XtAH0u0Qbuqw1LvdypNiFX">✘</td>
+        </tr>
+        <tr data-page-node-id="9zjr86RcEldNRl8yDO4iJg">
+          <td data-page-node-id="vL1seiQ6to6oqr4uDLPcRm">网关化按量计费</td>
+          <td class="us" data-page-node-id="wESPO4FGrpw5vyzFJiJnt0"><span class="yes" data-page-node-id="KXVOeeyi2r7sjL0co8UjCC">✔ 独有</span></td>
+          <td class="no2" data-page-node-id="hZnzj7SXIHicEbC2oKx5TV">✘</td><td class="no2" data-page-node-id="tVMawQX1AZj6K41ExNUtVB">✘</td><td class="no2" data-page-node-id="sHkX0TxakQFAYTvlCGNd9d">✘</td>
+          <td class="no2" data-page-node-id="3FtexyHJaUvTa1ABoohFZ9">✘</td><td class="part" data-page-node-id="ISrZg6ZoAdd96zZEbs05IC">订阅制</td><td class="part" data-page-node-id="wpL9YpYPZK4Pb1Qzph1Fqh">△ 订阅积分</td><td class="no2" data-page-node-id="2VnvjZoLD8SaOSI8hRV3VB">✘</td>
+        </tr>
+        <tr data-page-node-id="9SSSAzltdHvADBOCxsdjA6">
+          <td data-page-node-id="HzxSq71w0C1WpQsn1CiIdi">合作方自有模型接入</td>
+          <td class="us" data-page-node-id="SXFAPbxLajStG51Bjeg9b3"><span class="yes" data-page-node-id="8uHHZFEhHnbgPISO4nyIvq">✔ 多上游框架</span></td>
+          <td class="no2" data-page-node-id="kJTYKeTpANFeA6EwicbAzV">✘</td><td class="no2" data-page-node-id="JxMlWjIbn7dMGuVjCG7Ac6">✘</td><td class="no2" data-page-node-id="EQje3ykUDlL0in1nX7PEX3">✘</td>
+          <td class="part" data-page-node-id="4NeLRXuFWhq7ldN0MCHsmP">插件生态</td><td class="part" data-page-node-id="8jz29TBe6Juxb8RK19cQCp">部分</td><td class="no2" data-page-node-id="uHYZ0621Mbcn7ywVahNP22">✘</td><td class="no2" data-page-node-id="YKLL4vTXe74p3cKtj5PV1F">✘</td>
+        </tr>
+        <tr data-page-node-id="rpdCuNqoOCiDbID6DIkWpb">
+          <td data-page-node-id="vT2ixOTuIRhuYa12rplMjk">私有化部署</td>
+          <td class="us" data-page-node-id="vCIqfMTwv0hVtP0Efn4J3G"><span class="yes" data-page-node-id="yjmBKxRHL5ayxUOMzMhE2V">✔ 容器化</span></td>
+          <td class="no2" data-page-node-id="AtfMVv6FzL3UfBLkMnwE6l">✘</td><td class="no2" data-page-node-id="E34JfAb0hyKfCxjaDEczx8">✘</td><td class="part" data-page-node-id="ohlNA7WXmocgjr2qXCDY3W">企业版有限</td>
+          <td class="no2" data-page-node-id="sHXxxIxeTYBqbfcvWW8BY8">✘</td><td class="no2" data-page-node-id="c0bc6kuqIEhaDghUO8ELX9">✘</td><td class="no2" data-page-node-id="QTT7QJNqDhHWdkAb96IyA3">✘</td><td class="no2" data-page-node-id="dJkrmIgGOREu2JoQwpR8Nt">✘</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3 data-page-node-id="iXiDgey7GcypkfG4AdIUZV">2.2 主要竞品一句话画像</h3>
+    <table data-page-node-id="u5Ck3SLZoCFziK80IyNQsa">
+      <thead data-page-node-id="VW4o0hHFpKW9He7CrsR7Qw"><tr data-page-node-id="8ZWFNGw6hgA0NdGS7HDh1W"><th style="width:14%" data-page-node-id="D1lIAAgXdIgaKL3c7P5EKd">竞品</th><th style="width:44%" data-page-node-id="fDG1JUECchd2UzBC08HK3H">强项</th><th data-page-node-id="YKFKpGz1fwmhgJ4VCPnMBZ">相对短板（即 oneArt 机会点）</th></tr></thead>
+      <tbody data-page-node-id="ZJMeTpQEYz0kXM4jqi0OD7">
+        <tr data-page-node-id="QIhoxnZhrK90V3A9jjFm9b"><td data-page-node-id="uAl50z9O87nngi906ofyGO"><b data-page-node-id="PBBxeosTfjX08TJgN1QcpA">即梦</b>（字节）</td><td data-page-node-id="fq4dVeMdPvxrpYloiamFAN">中文生态最好，图片编辑器覆盖广，背靠抖音分发</td><td data-page-node-id="8AToFqtTlan151DjIrediF">单图单工具、无工作流；无法批量组织生产管线；不支持私有化与自有模型接入</td></tr>
+        <tr data-page-node-id="Ioo24IW4WcmaVBjOhDTnqR"><td data-page-node-id="c8qJTxOfkDxXA1KurF67gk"><b data-page-node-id="klZxU9rR9wPuGz7Y5FSuPb">可灵</b>（快手）</td><td data-page-node-id="6SBia5kU2JrlTBygL6BgDM">视频生成质量与时长行业领先</td><td data-page-node-id="hd8uVbPGBSfVUCETIoN0Yr">重视频轻图片编辑；同样无工作流形态；计费单一</td></tr>
+        <tr data-page-node-id="iqko7uxPqjIvbLwJADBNpU"><td data-page-node-id="B03d72rA9lOL0SE365XzrN"><b data-page-node-id="hsI2B3iGBsOBfTxbEmTNtl">Canva</b></td><td data-page-node-id="NM1ZHntYe2UdHKg6p0oiuj">模板生态与团队协作全球最强，Magic Resize 独树一帜</td><td data-page-node-id="3HNSrCNhEoHFN7IpIW0lyt">AI 生成能力依赖第三方，视频生成弱；不面向重度 AI 生产</td></tr>
+        <tr data-page-node-id="mCcqLXNbbgAaI641KKK7Ds"><td data-page-node-id="GSBIQABcjb5v4vdEIKjcYX"><b data-page-node-id="MAKBw4W0Qs5T3B2x1RyXEP">Photoshop</b></td><td data-page-node-id="Y7plBR5GswggUCPX8TApwp">专业编辑天花板，Firefly 生成合规</td><td data-page-node-id="qP6mCb8kVhaGqRe1KTiIZA">学习成本高、订阅贵；无批量 AI 工作流；国产化/私有化受限</td></tr>
+        <tr data-page-node-id="JqKSHIARbWCmyh5MBCibQH"><td data-page-node-id="SFiCKUr9NSymCXT1CqtT4y"><b data-page-node-id="QOg4yy1fmpoemhO69SeICD">Krea</b></td><td data-page-node-id="ypgB06MtrdriQySYb1bgOw">实时画布体验惊艳，AI 原生形态最接近</td><td data-page-node-id="BMDUx8w2FirXrCBEAWrzX0">无中文生态与本土运营；缺电商工具链（商拍/换背景/去水印）；无分镜能力</td></tr>
+        <tr data-page-node-id="FGRlZgsJnHkfU2uCniIkxu"><td data-page-node-id="C0LDo3P3pDkN5fpws9yL6b"><b data-page-node-id="2OmAvq9wJqaxqWwrWtELGJ">Lovart</b></td><td data-page-node-id="k8qO0w2Icf2AcMQIZrMEAE">全球首个"设计 Agent"：一句话 Brief 拆解为子任务，单次产出整套设计资产（品牌套装/社媒图/分镜/UI），ChatCanvas 聊天 + 无限画布交互，聚合多家顶级模型，订阅积分制（$19~199/月）</td><td data-page-node-id="9rKkRxcPedxzGy5cr94mZB">Agent 黑盒主导、用户<b data-page-node-id="MdrHhLlkmdnYbLba2iNWKa">无法手动编排精细生产管线</b>；无电商工具链（商拍/换背景/去水印/批量规格）；不支持私有化与自有模型接入；积分制重度使用成本高，无渠道/批发合作模式</td></tr>
+        <tr data-page-node-id="rtdUygHAYh4F429jGuIp05"><td data-page-node-id="cReHXmvnIrr1pWnXV3bb8D"><b data-page-node-id="whXQrVTvqYzpNWsHjhcDWU">Photoroom</b></td><td data-page-node-id="pghrMfXDOm9jV79jHCFeua">电商抠图/背景替换极致简洁</td><td data-page-node-id="bBmgRWKcLjPbc0TPyG6JWf">功能面窄，仅围绕商品图，无视频无分镜</td></tr>
+        <tr data-page-node-id="kxnJ1hqvwcpNpWFZfmgUu9"><td data-page-node-id="s0wAsUVQsHeLhgOs5FF5H9"><b data-page-node-id="l3bsAou6HvyIuoIlLz1mBE">Freepik</b></td><td data-page-node-id="fJ4shxmFyU1QfZMFMeYFzO">素材库 + AI 套件打包，设计师流量大</td><td data-page-node-id="Rg72LIjSj7A2TihqHF02PD">AI 能力偏拼装，工作流深度不足</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout" data-page-node-id="XFA2CcxypF39WZH88ckWxy">
+      <b data-page-node-id="HNZ5hXSGGCd8yq7v6EAlBn">总结论：</b>国内头部产品（即梦 / 可灵）强在模型与流量、弱在生产组织形态；国际新兴工具（Krea、Lovart）验证了"画布 / Agent"形态是 AI 生产力的正确方向，但前者缺本土化、后者 Agent 黑盒不可控且商务开放度低。oneArt 站在两者交叉点：<b data-page-node-id="S7q1JgqasScMv0QDEuvNz0">用节点工作流组织国内一流模型能力，覆盖"图 → 视频 → 分镜成片"的完整生产链</b>，并以网关化计费 + 多上游 + 私有化构建商务合作 uniqueness。
+    </div>
+  </section>
+
+  <!-- ============ 三、功能全景 ============ -->
+  <section data-page-node-id="jOjOBNrYpMtLSZe00RTw1P">
+    <h2 data-page-node-id="jbweSTP0RClD1zYrocBpAX"><span class="no" data-page-node-id="dcJggsgDBa0d0CxSFWyqP1">3</span>当前功能全景</h2>
+    <div class="stats" data-page-node-id="BCU4Flf1aa4bze6bQM0gog">
+      <div class="stat" data-page-node-id="BhQMLc4B0XgLzsaKGzVlkI"><div class="num" data-page-node-id="i1ZOqIO2cLJgQM4wGS6prq">22</div><div class="lab" data-page-node-id="ftp0HOf77y0OjTJAqDUBsC">图片 AI 工具</div></div>
+      <div class="stat" data-page-node-id="fH2TWyNcfZ6t6tptXEPhg4"><div class="num" data-page-node-id="sxlB3bqbD0Lt62bNrW8vrH">4</div><div class="lab" data-page-node-id="7rGhxk6vHBLvCI5Lu7Eide">视频加工操作</div></div>
+      <div class="stat" data-page-node-id="UnbChBO8xsAk0T5JbsKptY"><div class="num" data-page-node-id="KUoZ6AmLAAe4RiJusugZms">4 组</div><div class="lab" data-page-node-id="s5RSaVQ0Cx73dmxmNqHurq">智能分镜模板</div></div>
+      <div class="stat" data-page-node-id="0fRNinB3KHwARhNo9zGixB"><div class="num" data-page-node-id="FsEpYqlc2pRMnlKhXTfCMm">16+</div><div class="lab" data-page-node-id="14ThWUeM1rMD1OFtL5sdP7">上游模型通道</div></div>
+    </div>
+    <h3 data-page-node-id="neP2GDFyKSeir897cEAZWJ">3.1 图片 AI 工具（22 种，按场景分组）</h3>
+    <table data-page-node-id="qQErShBEiturxRnUSmc48A">
+      <thead data-page-node-id="VeCCv6edllBHcMoL8mzQbl"><tr data-page-node-id="vkdEXZbQrrJ5xixejs6IX2"><th style="width:18%" data-page-node-id="CiVBBOdGHUK0sIv5DYIsPx">分组</th><th data-page-node-id="Q12UJL47sc6aL6XDiRYEi5">工具</th></tr></thead>
+      <tbody data-page-node-id="JMgEguhVJumqjnX8Abr8qq">
+        <tr data-page-node-id="ZYV2WTBxDVnmkosmEjPUUM"><td data-page-node-id="hOV71ZqhjfljmeHS7ZtMxh"><b data-page-node-id="Qwm5iHgVDxOzR7B6OBUWvb">电商商拍</b>（6）</td><td data-page-node-id="MP8zfqe4hoOiSLGcNMDQsH">背景替换 · 移除背景 · 水印去除 · 文字去除 · 高清放大 · 切边矫正</td></tr>
+        <tr data-page-node-id="yeH6OcaeZO0tMPtNKB3r5L"><td data-page-node-id="fozme0ZB2R5ikKAbg1Nvpx"><b data-page-node-id="B6BgHMl1mylFLABvddlFG1">创意编辑</b>（7）</td><td data-page-node-id="yU7CeBbGhhaZ9KEJe6KJWQ">扩图 · 消除 · 文字编辑（替换/去除一体） · AI 重绘 · 换风格 · 相似图 · 提线稿</td></tr>
+        <tr data-page-node-id="q5SmhCZEOtnvyCQaBKH9JQ"><td data-page-node-id="Cqxz42IDk6OnNwIh98OliK"><b data-page-node-id="QyaHGkKp7NTzs4lZOrSArN">人像与修复</b>（4）</td><td data-page-node-id="a5bsfWwlZBOUnAG0khg3uM">人像美颜 · AI 打光 · 图片修复 · 去屏幕纹</td></tr>
+        <tr data-page-node-id="A1J4qOAr0SuyvkyRdrQ8j8"><td data-page-node-id="goA9SZGBnfBTw4hRqWPZsY"><b data-page-node-id="5iL5toqYFy7JgqOmPCGEGI">画面调优</b>（5）</td><td data-page-node-id="z1nQ54FEdIl8nevPZDxdg9">换天空 · 黑白上色 · 图片滤镜 · 局部遮罩编辑 · 标注涂鸦</td></tr>
+      </tbody>
+    </table>
+    <h3 data-page-node-id="xiPOxBtDiHgz3vOGCEfmxZ">3.2 视频与分镜</h3>
+    <table data-page-node-id="aBpQPFwYWyruS8Dcom1Zos">
+      <thead data-page-node-id="mzunf6pncmjSP6X3DWcBYB"><tr data-page-node-id="ylllXXwli1rHtVAtI7rEGy"><th style="width:22%" data-page-node-id="ESHaItN3msN33r4ioWg2QF">模块</th><th data-page-node-id="FCmmluhaVmPuWGFYwtP2iC">能力</th></tr></thead>
+      <tbody data-page-node-id="TpSUsSpMu8YxhAbxbrchNQ">
+        <tr data-page-node-id="TZRcUkCFUZFQPijqnyZSAD"><td data-page-node-id="vxGQJA1yvEgV8a9I4WhAfS">AI 视频生成</td><td data-page-node-id="O6HLxVTJZH5zov4gtHwIMl">文生视频 / 图生视频 / 全能参考（音视频参考生成）/ 首尾帧，支持镜头运动、时长、分辨率参数</td></tr>
+        <tr data-page-node-id="oz2OjqnmrTd5zu1SqSAthA"><td data-page-node-id="aaJH93Y1oqsorr3Hz1LA2Y">视频加工套件</td><td data-page-node-id="FI0xLSogrZFqOqupZJu6MR">视频剪辑 · 音视频分离 · 视频拼接 · 导出视频帧（可回喂图生视频形成闭环）</td></tr>
+        <tr data-page-node-id="2K24bieHHMdKE2BgFSQDuG"><td data-page-node-id="mwnFiR1yUJBwc5Jvasr5Hl">智能分镜模板</td><td data-page-node-id="pCn6xDPLB5XQZOmTBqkxwr">多机位九宫格 · 角色三视图 · 剧情四宫格 · 25 宫格连贯分镜；剧本 AI 拆解 → 分镜批量出图 → 批量出片自动连线</td></tr>
+        <tr data-page-node-id="fJqB81FkBPY0wUTExc5g7i"><td data-page-node-id="kEX7RdWgdibkRWGoefHZZy">画布体验</td><td data-page-node-id="FsSu0PyhV8bAauIv68FHnB">自定义工具栏（钉选/收纳）、自由缩放、操作配方化可重跑、无限画布多节点管理</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============ 四、本版本升级 ============ -->
+  <section data-page-node-id="kgqNyblfshb5JC4XFYwHpG">
+    <h2 data-page-node-id="2UXKD0hHxT40FP2P8mpT3f"><span class="no" data-page-node-id="6aHRzeFJwu0cDCl3GOjfMR">4</span>本次版本升级亮点</h2>
+    <table data-page-node-id="h5usb7KGNcIVr82sZcqW9Z">
+      <thead data-page-node-id="nETUXeyhmkd8N11glRK5Hj"><tr data-page-node-id="1sWWUPK3cMIdKNTH3bBir8"><th style="width:26%" data-page-node-id="44dbg7ONE3LsdsKDg8lAuv">升级</th><th data-page-node-id="hBdiB44MNis8OqXNFaAf6c">说明</th><th style="width:26%" data-page-node-id="ntreEj9YvLyeH861ZSqWwt">客户价值</th></tr></thead>
+      <tbody data-page-node-id="B4xyEhYZ11I0uguxIwQuYV">
+        <tr data-page-node-id="69Nu0Q0ggriRsklXxjTGUp"><td data-page-node-id="vsaeW8Frs7Qr3Td4d9d5B1"><b data-page-node-id="YacqJDyJ88Hr4YMnrUTuUH">图片工具扩容至 22 种</b></td><td data-page-node-id="FR5uTck8aVOm512HI3lnRW">新增电商商拍 6 种、创意编辑 7 种、人像修复 4 种，覆盖竞品主流能力并补齐本土化场景</td><td data-page-node-id="G3tL61Je5AyYghqKWBEsDh">一个平台替代多款工具订阅</td></tr>
+        <tr data-page-node-id="2Tgm6sjY9OFaHE9xwGXhV1"><td data-page-node-id="UoB2BpNCUHlybDZl7a5gfo"><b data-page-node-id="DW3clUYP82LPSUM0ZXMDt7">工具整合体验升级</b></td><td data-page-node-id="VCoKUKOHNc7DSKOtyQAE4E">文字编辑（替换/去除一体）、背景（替换/移除一体）等整合式交互，降低学习成本</td><td data-page-node-id="xZlLs6xtAN0zVGit8yiIdZ">更少点击、更高产出效率</td></tr>
+        <tr data-page-node-id="OFj27yZZ5uuOddAFZolEYK"><td data-page-node-id="HMcDn15BX40gNMax6LTw97"><b data-page-node-id="yZV0JNGGcIEHwbG3pscWou">自定义工具栏</b></td><td data-page-node-id="h7ec059ScAeq1uTeYBplKA">高频工具钉选、长尾工具收纳进"更多"菜单，工作区千人千面</td><td data-page-node-id="ej7XdSxTHN1C3niuhYl51M">团队按角色定制操作面板</td></tr>
+        <tr data-page-node-id="0kuVyizBHSiOMoHIKOHiQB"><td data-page-node-id="LQ2IiuTutCbsNumFldNqVl"><b data-page-node-id="oO7ZNVSVQ2GZYKKKdQg8u3">网关化计费</b></td><td data-page-node-id="EKE8oie9ENhIM2EfLD6KQh">全站调用统一经 AI 网关按量计费，管理台配置即时生效，调用明细可查可对账</td><td data-page-node-id="mGxAa0bGIvUk9ej90ZlI3v">账目清晰、成本可控、结算透明</td></tr>
+        <tr data-page-node-id="F1epYWGQ7rFie5guouYwXG"><td data-page-node-id="qCbXw7OwA4hmyG8qqMscvd"><b data-page-node-id="zPSVlW2dJuygHseZvAg3UX">多上游模型框架</b></td><td data-page-node-id="LLfAUve3v1KeV4lLEftFlo">16+ 模型通道、能力级开关运行时可配</td><td data-page-node-id="WLwmAWWG4SPNQdd5BgW1Py">合作方模型快速接入共建</td></tr>
+        <tr data-page-node-id="eE8PpqVQfITq7v1WWaL7Dt"><td data-page-node-id="DVirriaCGV3YL779aavQkp"><b data-page-node-id="2WF8V1BTUt4AkOLTYheEi4">生成质量大修</b></td><td data-page-node-id="nLvFgoT2w0esh0xBxb2R7T">蒙版精准传递、语义注入、失败自动重试等 5 项底层升级</td><td data-page-node-id="o2E1iR6R2XLJmoSw5RXd1Z">一键工具"零提示词"也精准生效，成功率显著提升</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============ 五、上新计划 ============ -->
+  <section data-page-node-id="HslN0A0qd3uotgGlVGSsGL">
+    <h2 data-page-node-id="MPcn8N6jFVEC1UAAgIJi1D"><span class="no" data-page-node-id="FUoZohLvVqZxk3fd1ZF078">5</span>后续上新计划（Roadmap）</h2>
+    <div class="road" data-page-node-id="LJVmrqIsGCiQhTZRwlahuK">
+      <div class="phase" data-page-node-id="QuNhwqDS15fdY46uyC3kvX">
+        <div class="ph-t" data-page-node-id="eGysjFe48ibSTI2nevFJxF">近期 <small data-page-node-id="DFoADhGs2V8ZmHEUhzDFqV">未来 1 ~ 2 个月</small></div>
+        <ul data-page-node-id="ndW6M7IHTlqiUGQQe8Ku1T">
+          <li data-page-node-id="M5xrfCEkDfcLM2BBclwlkT"><b data-page-node-id="grQlFUKrMoReuRlIeD77iE">涂鸦生图</b>：画布内嵌画板，简笔涂鸦 + 描述词一键生成成图（草图 → 成品）</li>
+          <li data-page-node-id="nulQx4mCZxtQN1ksSqKKAr"><b data-page-node-id="0TwFaqCdOdqIAbYlhIJqPn">局部重绘强度可调</b>：0.3 ~ 1.0 重绘幅度滑杆，精细控制修改范围（对标即梦）</li>
+          <li data-page-node-id="KioMsr0tSBJyV6gabCS52N"><b data-page-node-id="Nk5azKTAsB0qsQrkPO3KsI">一键主体选区</b>：AI 自动识别主体生成蒙版，替代纯手涂</li>
+          <li data-page-node-id="0PJIwF3qfSyRufzDRQhDuE"><b data-page-node-id="aF6z6BHKi7F5AoUpl3Kyk9">多尺寸智能适配</b>：裁剪 + 扩图组合，一键产出多平台尺寸（对标 Canva Magic Resize）</li>
+          <li data-page-node-id="iIeSqZPD3NGuZLNpHtP6uF"><b data-page-node-id="TrKcWvAajQBqQBA5EgSz5t">视频渠道扩容</b>：接入更多视频生成上游，提升可用性与性价比</li>
+        </ul>
+      </div>
+      <div class="phase" data-page-node-id="PXIUl4CGoqUpZGWUsemp73">
+        <div class="ph-t" data-page-node-id="yIKo1BkLOvgY4k5BZ41xCp">中期 <small data-page-node-id="0uM8ZajD2aHGISMWJacpXn">3 ~ 6 个月</small></div>
+        <ul data-page-node-id="6wfo0W7O0ZBeBfTswiOrYy">
+          <li data-page-node-id="o8bto4bScciP6CChULdM9n"><b data-page-node-id="gSVWyLXqOCSE8aeMVfcTNH">批量电商商拍</b>：多 SKU × 多背景 × 多尺寸矩阵式一键出图</li>
+          <li data-page-node-id="n3v94NQO3MPSH0gd9FgyuN"><b data-page-node-id="KnKAbGVjrdZBGiUn7ZX1B2">画质修复套件 2.0</b>：老照片修复 + 上色 + 超分一体化流水线</li>
+          <li data-page-node-id="wxe9Dwmg35swYjzbSXjDft"><b data-page-node-id="QbZjTm2Bd376FVWL5w3Bvf">开放 API</b>：将节点生产能力以标准化 API 输出，供企业系统集成</li>
+          <li data-page-node-id="q2ZeGPrbjJYri17St2hoV4"><b data-page-node-id="Fa6gqFsQEl7SMfZljSpObh">实时画布（评估中）</b>：涂鸦即所得的极速生成体验，待极速模型渠道就绪后上线</li>
+        </ul>
+      </div>
+      <div class="phase" data-page-node-id="2E48b7boypM1ur3DR1Cxix">
+        <div class="ph-t" data-page-node-id="eHkLFRLzY3d4yMGWECR6dw">远期 <small data-page-node-id="j7HGd0LKhcnOV0G1yhOVUj">6 个月以上</small></div>
+        <ul data-page-node-id="gRdgoAZKNfBMQORExNW3EB">
+          <li data-page-node-id="O2oEMsoab3VN3BMh1INcb1"><b data-page-node-id="zeOfNcBWdwIrjqUksQU26H">团队协作</b>：多人画布、云空间、素材库共享、角色权限</li>
+          <li data-page-node-id="mWJl5X6ha59F7Fsx1nMRYM"><b data-page-node-id="XDFdRST3CJowEa119HrDl7">模型接入市场</b>：合作方模型自助上架，能力分成生态</li>
+          <li data-page-node-id="9hgxXC4ulFQZTQtqjAEqFn"><b data-page-node-id="Ak3USziWhKiQKO9ycyTDDd">多端覆盖</b>：移动端 / 小程序轻量创作入口</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 六、合作模式 ============ -->
+  <section data-page-node-id="nOmSxPJhMrX7sYbZsHDCQs">
+    <h2 data-page-node-id="kBDAqiXcU2s9zEJfIbz4uO"><span class="no" data-page-node-id="Wv5p0GfA0AvKXy7Lr3c8Oc">6</span>合作模式与价值主张</h2>
+    <div class="cards" data-page-node-id="qeDpmxkxUiubYggpEDnRnT">
+      <div class="card" data-page-node-id="l7yA5Yfo5gq9tBgSgTBEns">
+        <div class="t" data-page-node-id="IThmA0lombicLCB17j9T30"><span class="dot" data-page-node-id="Ae9649R4rDVXRNfIxRDeIz"></span>渠道合作</div>
+        <div class="d" data-page-node-id="TKoT4NzJKViroEDdRTDbsT">合作接入即走网关计费：按实际调用量结算，明细可查、可审计、可对账，平台无需垫付算力成本，双方账目清晰。</div>
+      </div>
+      <div class="card" data-page-node-id="M4HxmrY2DXtOjy6soWRlZj">
+        <div class="t" data-page-node-id="rFvbh7wgnnoQNPUBzxu3cS"><span class="dot" data-page-node-id="RohhuVGmAD1LeXwEAeEAKA"></span>模型共建</div>
+        <div class="d" data-page-node-id="gjlsBjDQSrzOmuk8odpHpk">多上游接入框架支持合作方自有模型快速上架，能力级开关灰度放量，共同服务终端客户。</div>
+      </div>
+      <div class="card" data-page-node-id="Dh6F5myijwXeUS1JrE04pt">
+        <div class="t" data-page-node-id="CEVbDqLFageuwHP9vOT4Ka"><span class="dot" data-page-node-id="DQPIyhEOB5B9xuTPv7mCCf"></span>私有化交付</div>
+        <div class="d" data-page-node-id="06E4tFtIsGEBAserBAiGjC">容器化部署，可交付至合作方自有环境，数据不出域，适合电商、 MCN 、企业内容团队。</div>
+      </div>
+      <div class="card" data-page-node-id="v0QL2OMjAEY1P13VM6R6My">
+        <div class="t" data-page-node-id="548pdgUjmgLP5C5lNsw8xO"><span class="dot" data-page-node-id="diZOh8aUu82NqQvISuaNlq"></span>OEM / 白标</div>
+        <div class="d" data-page-node-id="oO6txyvnaNh6CIh1JKuLek">产品能力可整体输出，合作方以自有品牌运营，oneArt 提供持续版本迭代与上新支持（见 Roadmap）。</div>
+      </div>
+    </div>
+    <div class="callout" style="margin-top:18px" data-page-node-id="N8me2y09NfavThDuPL5Sli">
+      <b data-page-node-id="pt7az6SkAiO2V8bjeOou0l">一句话价值主张：</b>把即梦们的"单点工具"升级为 Krea 们的"生产流水线"，并且是国内唯一支持<b data-page-node-id="hWElVHwCsjw7hTeLvPEkBE">网关化计费 + 自有模型接入 + 私有化</b>三者兼备的节点式 AI 创作平台。
+    </div>
+  </section>
+
+  <div class="foot" data-page-node-id="1kdt5oYxHXp6aEz4bygato">
+    oneArt AI 创作站 · 竞品分析与产品计划书 · 商务合作版<br data-page-node-id="F0lBhbUgkhWfbjkq1jE2YP">
+    本文档基于 2026 年 10 月公开竞品信息与产品实测整理，Roadmap 仅供合作参考，具体交付以双方协议为准。
+  </div>
+</div>
+</body>
+</html>
