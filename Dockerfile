@@ -95,6 +95,10 @@ WORKDIR /app
 # 故都不拷 —— 与 hewapi 不同，别照抄它的 COPY 行。
 COPY --chown=bff:bff app/ ./app/
 
+# 例外：埋点行为报表查询脚本要进镜像（2026-10-13 服务器上 docker exec 报
+# No such file 才补的）。只放行这一个文件，其余 scripts/ 探针仍不进镜像。
+COPY --chown=bff:bff scripts/events_query.py ./scripts/events_query.py
+
 # /data 存放 admin_cred.json（含管理员 PAT）、user_keys.json（用户 sk- 的
 # AES-GCM 密文）、signup_bonus.json、flovart_cloud.db 与 media/ 回落目录。
 # 目录权限收到 700 —— admin_cred 与 user_keys 都等同凭证。
