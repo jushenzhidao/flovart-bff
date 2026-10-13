@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""用户行为埋点查询脚本（cloud_events）。
+"""用户行为埋点查询脚本（cloud_events）。双数据库方言：PG（生产容器）+ SQLite（本地）。
 
 用法（在 flovart-bff 目录下）：
   本地：  C:/Users/81068/.workbuddy/binaries/python/envs/flovart-bff/Scripts/python.exe scripts/events_query.py --days 7
@@ -7,7 +7,11 @@
   只看明细： scripts/events_query.py --recent 20 --event generate_failed
   按 uid 过滤： scripts/events_query.py --uid 42 --days 30
 
-数据库选择：优先 --db 指定路径；否则按 BFF 同款规则（POSTGRES_DSN/分项环境变量 → 回退 data/flovart_cloud.db）。
+数据库选择：优先 --db 指定 SQLite 路径；否则按 BFF 同款规则（POSTGRES_DSN/分项
+环境变量 → PG；都没有 → 回退 data/flovart_cloud.db）。
+⚠️ 2026-10-13 教训：初版 SQL 是纯 SQLite 方言（datetime('now',?)/json_extract/? 占位符），
+本地验证过、上 PG 容器直接 PostgresSyntaxError。现按方言分别拼 SQL，PG 侧必须用
+$n 占位符。改查询先想清楚两边方言。
 """
 import argparse
 import asyncio
@@ -17,9 +21,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+DB_PATH = None  # 由 main() 设置（SQLite 模式）
 
-def _q_rows(sql: str, args: tuple = ()) -> list[tuple]:
-    """统一查询入口：PG 可用走 PG，否则走本地 SQLite。返回行元组列表。"""
+
+def _pg_dsn() -> str:
     dsn = os.environ.get("POSTGRES_DSN", "")
     if not dsn and os.environ.get("POSTGRES_HOST"):
         dsn = "postgres://{user}:{password}@{host}:{port}/{db}".format(
@@ -29,6 +34,12 @@ def _q_rows(sql: str, args: tuple = ()) -> list[tuple]:
             port=os.environ.get("POSTGRES_PORT", "5432"),
             db=os.environ.get("POSTGRES_DB", "flovart"),
         )
+    return dsn
+
+
+def _q_rows(sql: str, args: tuple = ()) -> list[tuple]:
+    """统一查询入口：PG 可用走 PG（asyncpg，$n 占位符），否则走本地 SQLite。"""
+    dsn = _pg_dsn()
     if dsn:
         import asyncpg
 
@@ -51,7 +62,18 @@ def _q_rows(sql: str, args: tuple = ()) -> list[tuple]:
         conn.close()
 
 
-DB_PATH = None  # 由 main() 设置（SQLite 模式）
+class _Bind:
+    """按方言累计绑定参数：PG 生成 $1/$2…，SQLite 生成 ?。"""
+
+    def __init__(self, pg: bool):
+        self.pg = pg
+        self.n = 0
+        self.args: list = []
+
+    def add(self, value):
+        self.n += 1
+        self.args.append(value)
+        return f"${self.n}" if self.pg else "?"
 
 
 def print_table(headers: list[str], rows: list[tuple]) -> None:
@@ -77,74 +99,97 @@ def main() -> None:
     a = p.parse_args()
     DB_PATH = a.db
 
-    uid_cond = " AND uid = ?" if a.uid is not None else ""
-    ev_cond = " AND event = ?" if a.event else ""
-    params_tail: list = []
-    if a.uid is not None:
-        params_tail.append(a.uid)
-    if a.event:
-        params_tail.append(a.event)
+    pg = bool(_pg_dsn() and not a.db)
 
-    print(f"\n=== 行为埋点报表（最近 {a.days} 天）===\n")
+    def conds(b: _Bind) -> str:
+        """WHERE 尾巴：时间窗在前，uid/event 在后（PG 占位符按出现顺序编号）。"""
+        if pg:
+            since = f"created_at >= now() - make_interval(days => {b.add(a.days)})"
+        else:
+            since = f"created_at >= datetime('now', {b.add(f'-{a.days} days')})"
+        tail = ""
+        if a.uid is not None:
+            tail += f" AND uid = {b.add(a.uid)}"
+        if a.event:
+            tail += f" AND event = {b.add(a.event)}"
+        return since + tail
 
+    print(f"\n=== 行为埋点报表（最近 {a.days} 天 | {'PG' if pg else 'SQLite'}）===\n")
+
+    b = _Bind(pg)
     rows = _q_rows(
         f"""SELECT event, COUNT(*) FROM cloud_events
-            WHERE created_at >= datetime('now', ?){uid_cond}{ev_cond}
+            WHERE {conds(b)}
             GROUP BY event ORDER BY 2 DESC""",
-        tuple([f"-{a.days} days"] + params_tail),
+        tuple(b.args),
     )
     print("[事件总量排行]")
     print_table(["event", "count"], rows)
 
+    b = _Bind(pg)
     rows = _q_rows(
         f"""SELECT COUNT(DISTINCT client_id), COUNT(DISTINCT uid)
             FROM cloud_events
-            WHERE created_at >= datetime('now', ?){ev_cond}""",
-        tuple([f"-{a.days} days"] + ([a.event] if a.event else [])),
+            WHERE {conds(b)}""",
+        tuple(b.args),
     )
     print("\n[活跃度]  设备数 / 已登录用户数")
     print_table(["devices", "logged_in_users"], rows)
 
+    b = _Bind(pg)
     rows = _q_rows(
-        f"""SELECT COALESCE(uid, 0) AS uid, COUNT(*) FILTER (WHERE event='generate_submit'),
+        f"""SELECT COALESCE({'uid::text' if pg else 'uid'}, '0') AS uid,
+                   COUNT(*) FILTER (WHERE event='generate_submit'),
                    COUNT(*) FILTER (WHERE event='generate_success'),
                    COUNT(*) FILTER (WHERE event='generate_failed'),
                    COUNT(*) FILTER (WHERE event='download')
             FROM cloud_events
-            WHERE created_at >= datetime('now', ?){uid_cond}
+            WHERE {conds(b)}
             GROUP BY uid ORDER BY 2 DESC LIMIT 20""",
-        tuple([f"-{a.days} days"] + params_tail),
+        tuple(b.args),
     )
     print("\n[用户行为明细 Top20]  提交 / 成功 / 失败 / 下载（uid=0 为匿名/未登录）")
     print_table(["uid", "submit", "success", "failed", "download"], rows)
 
+    model_expr = "props_json::jsonb->>'model'" if pg else "json_extract(props_json, '$.model')"
+    b = _Bind(pg)
     rows = _q_rows(
-        f"""SELECT json_extract(props_json, '$.model') AS model, COUNT(*),
+        f"""SELECT {model_expr} AS model, COUNT(*),
                    COUNT(*) FILTER (WHERE event='generate_failed')
             FROM cloud_events
-            WHERE event LIKE 'generate_%' AND created_at >= datetime('now', ?){uid_cond}
+            WHERE event LIKE 'generate_%' AND {conds(b)}
             GROUP BY model ORDER BY 2 DESC LIMIT 15""",
-        tuple([f"-{a.days} days"] + params_tail),
+        tuple(b.args),
     )
     print("\n[模型使用排行]  提交数 / 其中失败数")
     print_table(["model", "total", "failed"], rows)
 
+    day_expr = "to_char(created_at, 'YYYY-MM-DD')" if pg else "date(created_at)"
+    b = _Bind(pg)
     rows = _q_rows(
-        f"""SELECT date(created_at) AS day, COUNT(DISTINCT client_id), COUNT(*)
+        f"""SELECT {day_expr} AS day, COUNT(DISTINCT client_id), COUNT(*)
             FROM cloud_events
-            WHERE created_at >= datetime('now', ?){uid_cond}{ev_cond}
-            GROUP BY day ORDER BY day DESC LIMIT {a.days}""",
-        tuple([f"-{a.days} days"] + params_tail),
+            WHERE {conds(b)}
+            GROUP BY day ORDER BY day DESC LIMIT {int(a.days)}""",
+        tuple(b.args),
     )
     print("\n[每日趋势]  日期 / 活跃设备 / 事件量")
     print_table(["day", "devices", "events"], rows)
 
     if a.recent:
+        b = _Bind(pg)
+        # 最近明细不带时间窗：uid/event 条件在前，LIMIT 参数收尾。
+        tail = ""
+        if a.uid is not None:
+            tail += f" AND uid = {b.add(a.uid)}"
+        if a.event:
+            tail += f" AND event = {b.add(a.event)}"
         rows = _q_rows(
-            f"""SELECT id, COALESCE(uid, '-'), client_id, event, props_json, path, created_at
-                FROM cloud_events WHERE 1=1{uid_cond}{ev_cond}
-                ORDER BY id DESC LIMIT ?""",
-            tuple(params_tail + [a.recent]),
+            f"""SELECT id, COALESCE({'uid::text' if pg else 'uid'}, '-'), client_id,
+                       event, props_json, path, created_at
+                FROM cloud_events WHERE 1=1{tail}
+                ORDER BY id DESC LIMIT {b.add(int(a.recent))}""",
+            tuple(b.args),
         )
         print(f"\n[最近 {a.recent} 条明细]")
         print_table(["id", "uid", "client", "event", "props", "path", "time"], rows)
