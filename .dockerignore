@@ -46,4 +46,7 @@ demo_*
 # ---- 测试与运维脚本（不进生产镜像，少一个文件少一处攻击面）----
 tests/
 scripts/
+# 例外：埋点行为报表查询脚本要被 Dockerfile COPY 进镜像（2026-10-13 CI
+# 因少这条反排除挂在 COPY not found）。其余探针脚本维持排除。
+!scripts/events_query.py
 .e2e/
