@@ -132,7 +132,9 @@ def test_external_gateway_non_newapierror_also_recorded(monkeypatch):
 
 
 def test_external_request_masks_api_key_before_persist(monkeypatch):
-    """落库的 payload 里 _gateway.api_key 必须掩码，真实 key 绝不能进日志库。"""
+    """落库的 payload 绝不能含明文 key（2026-10-16 新口径：_gateway 整体剥离，
+    只留顶层 upstream_base_url 供排查上游归属）。"""
+
     logs = _install_fake_log(monkeypatch)
 
     async def ok(method, url, *, api_key, json=None, client=None):
@@ -152,7 +154,8 @@ def test_external_request_masks_api_key_before_persist(monkeypatch):
     asyncio.run(tasks._run_external(9, "req-ext-3", "image-gen", {"sync_path": "images/generations"}, params))
 
     stored = logs["req-ext-3"]["payload"]
-    assert stored["_gateway"]["api_key"] == "***"
+    assert "_gateway" not in stored
+    assert stored["upstream_base_url"] == "https://api.chatfire.cn/v1"
     assert "sk-super-secret" not in json.dumps(stored)
     assert logs["req-ext-3"]["status"] == "succeeded"
 

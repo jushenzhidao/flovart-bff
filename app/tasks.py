@@ -1125,12 +1125,11 @@ async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params
     if base_url.endswith("/v1") and path.startswith("v1/"):
         path = path[len("v1/"):]
     url = f"{base_url}/{path}"
-    # 诊断日志：外部网关请求也要留痕（掩码 key），便于排查「无图返回」类问题。
-    # 注意：params 仍含 _gateway（明文 api_key），落库前必须掩码。
-    _log_params = {**params}
-    _gw_log = _log_params.get("_gateway")
-    if isinstance(_gw_log, dict):
-        _log_params["_gateway"] = {**_gw_log, "api_key": "***"}
+    # 诊断日志：外部网关请求也要留痕。2026-10-16 飞哥拍板：日志只记上游 base_url
+    # （提到顶层 upstream_base_url，管理台详情一眼可见），_gateway（含明文 api_key）
+    # 整体剥离不入库 —— 与 video 分支口径一致。
+    _log_params = {k: v for k, v in params.items() if k != "_gateway"}
+    _log_params["upstream_base_url"] = base_url
     # mode 仍记 sync：语义是「网关同步直出」，只是 BFF 侧改为后台等待，
     # 前端轮询行为不变（get_task 的 mode=='sync' 分支直接回读存储结果）。
     await cloudstore.request_log_put(
@@ -1364,9 +1363,11 @@ async def _run_external_video(uid: int, request_id: str, params: dict) -> dict:
             sub_path = sub_path[len("v1/"):]
         submit_url = f"{base_url}/{sub_path}"
         poll_base = f"{base_url}/{sub_path}"
-    # 落库前掩码（params._gateway 含明文 key，绝不入库）
+    # 落库前掩码（params._gateway 含明文 key，绝不入库）；upstream_base_url 顶层可查
+    # （2026-10-16 飞哥拍板：日志只记上游地址、不记 key，image/video 口径一致）。
     model = params.get("model") or params.get("model_name") or ""
     log_params = {k: v for k, v in params.items() if k != "_gateway"}
+    log_params["upstream_base_url"] = base_url
     await cloudstore.request_log_put(
         uid, request_id, "video-gen", "external", model, log_params,
         status="submitted", mode="sync")
