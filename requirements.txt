@@ -12,6 +12,10 @@ python-multipart>=0.0.9
 # Windows x64 / Linux x64 / macOS 全平台预编译 wheel，无需 ImageMagick 等外部依赖。
 Pillow>=10.4
 psd-tools>=1.10
+# 图像转 PPTX（下载格式选，convert 路由懒导入）。
+# 2026-10-20 补：此前只在测试里出现、没进依赖清单，导致 CI 收集即炸、
+# 生产镜像里「转 PPTX」运行时 ModuleNotFoundError。
+python-pptx>=1.0
 # 外部对象存储（OSS/COS/S3 兼容，boto3 S3 协议）—— 媒体字节层
 boto3>=1.34
 # 元数据层 PostgreSQL 异步驱动（替代本地 SQLite，多副本可共享）
