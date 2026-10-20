@@ -153,6 +153,12 @@ TASK_TYPES: "dict[str, dict]" = {
     "restyle": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_RESTYLE_PATH},
     "redraw": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_REDRAW_PATH},
     "similar": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_SIMILAR_PATH},
+    # ── SenseAudio TTS 直连（2026-10-20 接入，thirdparty sync 形态）──
+    # MiniMax t2a_v2 私有协议，网关渠道接不了 → 照抄 wavespeed 范式 BFF 直连。
+    # 唯一区别：合成是**同步秒级**返回，不走 prediction 轮询 —— provider=thirdparty
+    # 且 mode=sync 时走 _submit_thirdparty_sync（后台直调 + 结果落 BFF media）。
+    # 前端产物契约：result.audio = {url(_bffMediaKey 同款), mime, voiceId, model, durationMs}。
+    "tts": {"provider": "thirdparty", "tp": "senseaudio", "mode": "sync"},
 }
 
 
@@ -541,6 +547,8 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
     provider = spec.get("provider", "gateway")
 
     if provider == "thirdparty":
+        if spec.get("mode") == "sync":
+            return await _submit_thirdparty_sync(uid, request_id, kind, spec, params)
         return await _submit_thirdparty(uid, request_id, kind, spec, params)
 
     mode = spec["mode"]
@@ -1494,6 +1502,60 @@ async def _external_video_and_record(uid: int, request_id: str, submit_url: str,
 # ---------------------------------------------------------------------------
 # 第三方直连 Provider 分支（multi-angle 等网关未接入的能力）
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 同步型第三方（SenseAudio TTS）：合成秒级返回，无 prediction 可轮询。
+# 复用 sync 任务范式：提交即落日志 + 后台直调 + 结果落 BFF media，前端轮询读存储结果。
+# ---------------------------------------------------------------------------
+async def _submit_thirdparty_sync(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
+    tp = spec.get("tp")
+    if tp != "senseaudio":
+        raise ValueError(f"unsupported thirdparty sync provider: {tp}")
+    if not config.SENSEAUDIO_ENABLED:
+        raise NewApiError("TTS 服务未启用（SENSEAUDIO_API_KEY 未配置）", 503)
+    model = str(params.get("model") or config.SENSEAUDIO_TTS_MODEL)
+    await cloudstore.request_log_put(
+        uid, request_id, kind, "thirdparty", model, {**params},
+        status="submitted", mode="sync")
+    task = asyncio.create_task(_run_tts_sync_safe(uid, request_id, params))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return _task_view(request_id, request_id, kind, "sync", "processing", {})
+
+
+async def _run_tts_sync_safe(uid: int, request_id: str, params: dict) -> None:
+    try:
+        await _run_tts_sync(uid, request_id, params)
+    except Exception:  # noqa: BLE001 —— 内部已写 failed 状态与原因，此处仅防未捕获告警
+        logger.exception("TTS 同步任务后台执行异常 uid=%s req=%s", uid, request_id)
+
+
+async def _run_tts_sync(uid: int, request_id: str, params: dict) -> None:
+    from .thirdparty import senseaudio
+
+    try:
+        result = await senseaudio.synthesize(params)
+    except Exception as e:  # noqa: BLE001
+        await cloudstore.request_log_update(request_id, status="failed", result={
+            "error": {"message": str(e), "type": "tts_synthesize_failed"}})
+        return
+    try:
+        info = await cloudstore.media_put(
+            uid, "audio", result["mime"], result["audio"], source_request_id=request_id)
+    except ValueError as e:  # 配额/大小拦截：上游已计费但产物落不了盘，必须显式留痕
+        logger.error("TTS 产物落盘失败 uid=%s req=%s: %s", uid, request_id, e)
+        await cloudstore.request_log_update(request_id, status="failed", result={
+            "error": {"message": f"音频生成成功但保存失败：{e}", "type": "tts_persist_failed"}})
+        return
+    audio = {
+        "url": info["url"], "mime": info["mime"], "_bffMediaKey": info["media_key"],
+        "voiceId": result["voiceId"], "model": result["model"],
+        "durationMs": result["durationMs"], "usageChars": result["usageChars"],
+    }
+    view = {"audio": audio, "bffMedia": [{
+        "mediaKey": info["media_key"], "mime": info["mime"], "url": info["url"]}]}
+    await cloudstore.request_log_update(request_id, status="succeeded", result=view)
+
+
 async def _submit_thirdparty(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
     """直连第三方提交：调对应 tp 适配器拿第三方任务 id，落请求日志后返回 processing 视图。"""
     tp = spec.get("tp")

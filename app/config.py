@@ -421,3 +421,15 @@ WAVESPEED_TIMEOUT: int = _int("WAVESPEED_TIMEOUT", 300)            # 单次提�
 WAVESPEED_POLL_INTERVAL: int = _int("WAVESPEED_POLL_INTERVAL", 2)  # 轮询间隔（秒）
 WAVESPEED_POLL_MAX: int = _int("WAVESPEED_POLL_MAX", 120)          # 最大轮询次数（≈ MAX*INTERVAL 秒）
 WAVESPEED_ENABLED: bool = bool(WAVESPEED_API_KEY)                  # 无 key 时 /readyz 提示但不崩
+
+# SenseAudio TTS 直连（商汤，2026-10-20 接入）。
+# 协议 = MiniMax t2a_v2 私有形态（非 OpenAI audio/speech），走不了网关渠道 → 照抄
+# wavespeed 范式 BFF 直连。文档：https://docs.senseaudio.cn/api-reference/endpoint/tts/synthesize
+# 模型（就 2 个）：sensenova-tts-2.0（推荐，支持克隆/文生音色）、senseaudio-tts-1.5-260319。
+# 计费按合成字符数（上游套餐定音色可用范围，音色清单运行时从 /v1/get_voice 拉）。
+SENSEAUDIO_API_KEY: str = os.getenv("SENSEAUDIO_API_KEY", "").strip()
+SENSEAUDIO_BASE_URL: str = os.getenv("SENSEAUDIO_BASE_URL", "https://api.senseaudio.cn").rstrip("/")
+SENSEAUDIO_TTS_MODEL: str = os.getenv("SENSEAUDIO_TTS_MODEL", "sensenova-tts-2.0").strip()
+SENSEAUDIO_TIMEOUT: int = _int("SENSEAUDIO_TIMEOUT", 120)              # 单次合成 HTTP 超时（秒）
+SENSEAUDIO_MAX_TEXT_CHARS: int = _int("SENSEAUDIO_MAX_TEXT_CHARS", 10000)  # 与上游文档一致
+SENSEAUDIO_ENABLED: bool = bool(SENSEAUDIO_API_KEY)                # 无 key 时 TTS 能力 503，不崩

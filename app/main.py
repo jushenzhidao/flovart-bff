@@ -84,6 +84,12 @@ async def _lifespan(_app: FastAPI):
         await ws.close()  # 归还 WaveSpeed 直连 httpx 连接池
     except Exception:  # noqa: BLE001
         pass
+    try:
+        from .thirdparty import senseaudio as sa
+
+        await sa.close()  # 归还 SenseAudio TTS 直连 httpx 连接池
+    except Exception:  # noqa: BLE001
+        pass
     await db.close_pool()  # 归还 PG 连接池（docs/storage-architecture.md 语义）
 
 

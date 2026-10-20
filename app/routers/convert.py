@@ -26,7 +26,66 @@ from .. import config
 router = APIRouter()
 
 MAX_SOURCE_BYTES = 30 * 1024 * 1024  # 30MB
-ALLOWED_FORMATS = {"psd"}
+# 2026-10-19 P0-3：放开 pdf/pptx —— PDF 用 Pillow 原生写出（零新依赖），
+# PPTX 用 python-pptx（单页全幅图，图片元素可在 PPT 里拖拽缩放）。
+ALLOWED_FORMATS = {"psd", "pdf", "pptx"}
+
+
+def _pil_to_pdf_bytes(pil_img: Image.Image, dpi: float = 150.0) -> bytes:
+    """PIL Image → 单页 PDF（Pillow 原生支持，无额外依赖）。
+
+    resolution 决定像素→物理页面的映射（points = px * 72 / dpi）；
+    150 dpi 在「文件不至于巨大」与「页面尺寸合理」之间取平衡。
+    """
+    rgb = pil_img.convert("RGB")
+    buf = BytesIO()
+    rgb.save(buf, "PDF", resolution=dpi)
+    return buf.getvalue()
+
+
+def _pil_to_pptx_bytes(pil_img: Image.Image) -> bytes:
+    """PIL Image → 单页 PPTX：幻灯片尺寸=图片尺寸（96dpi 换算 EMU），
+    图片全幅铺满。图片是独立 picture 元素，用户在 PowerPoint/WPS 里
+    可直接拖动/缩放/替换 —— 这是「可编辑交付」的 v1 语义。
+    """
+    from pptx import Presentation
+    from pptx.util import Emu
+
+    # RGBA → PPT 全幅白底更稳（PNG 透明区在幻灯片里透出白色母版）
+    if pil_img.mode not in ("RGB", "L"):
+        rgb = pil_img.convert("RGB")
+    else:
+        rgb = pil_img
+
+    prs = Presentation()
+    # 96 dpi：EMU = px * 9525（1 inch = 914400 EMU / 96 px）
+    prs.slide_width = Emu(rgb.width * 9525)
+    prs.slide_height = Emu(rgb.height * 9525)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+    slide.shapes.add_picture(
+        _pil_to_png_bytes(rgb), 0, 0, width=prs.slide_width, height=prs.slide_height
+    )
+    buf = BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+def _pil_to_png_bytes(pil_img: Image.Image) -> BytesIO:
+    buf = BytesIO()
+    pil_img.save(buf, "PNG")
+    buf.seek(0)
+    return buf
+
+
+def _convert_to_bytes(pil_img: Image.Image, fmt: str) -> bytes:
+    """统一转换分发：psd / pdf / pptx。"""
+    if fmt == "psd":
+        return _pil_to_psd_bytes(pil_img)
+    if fmt == "pdf":
+        return _pil_to_pdf_bytes(pil_img)
+    if fmt == "pptx":
+        return _pil_to_pptx_bytes(pil_img)
+    raise ValueError(f"未知格式: {fmt}")
 
 
 def _is_allowed_source(url: str) -> bool:
@@ -107,7 +166,7 @@ def _make_response(psd_bytes: bytes, filename: str):
 @router.get("/api/convert/image")
 async def convert_image(
     url: str = Query(..., description="源图像绝对 URL（必须与 NEWAPI_BASE_URL 同主机）"),
-    format: str = Query("psd", description="目标格式：v1 只支持 psd"),
+    format: str = Query("psd", description="目标格式：psd / pdf / pptx"),
 ):
     """服务端拉 URL 转换。适用：源是 new-api 公共直链（媒体托管 URL）的场景。
 
@@ -141,21 +200,21 @@ async def convert_image(
         raise HTTPException(status_code=415, detail=f"图像解码失败: {type(e).__name__}") from e
 
     try:
-        psd_bytes = _pil_to_psd_bytes(pil_img)
+        data = _convert_to_bytes(pil_img, fmt)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PSD 写出失败: {type(e).__name__}") from e
+        raise HTTPException(status_code=500, detail=f"{fmt.upper()} 写出失败: {type(e).__name__}") from e
 
     # 从源 URL 末尾推断一个简单文件名；否则随机
-    filename = "image.psd"
+    filename = f"image.{fmt}"
     try:
         path = urlparse(url).path.rsplit("/", 1)[-1]
         if path and "." in path:
             stem = path.rsplit(".", 1)[0][:32] or "image"
-            filename = f"{stem}.psd"
+            filename = f"{stem}.{fmt}"
     except Exception:
         pass
 
-    return _make_response(psd_bytes, filename)
+    return _make_response(data, filename)
 
 
 @router.post("/api/convert/psd-layers")
@@ -229,7 +288,7 @@ async def convert_psd_layers(
 @router.post("/api/convert/image")
 async def convert_image_upload(
     file: UploadFile = File(..., description="源图像二进制（PNG/JPG/SVG/WebP …）"),
-    format: str = Form("psd", description="目标格式：v1 只支持 psd"),
+    format: str = Form("psd", description="目标格式：psd / pdf / pptx"),
 ):
     """浏览器直接上传源文件二进制。适用：源是浏览器本地 blob URL
     （Flovart 创作站从 IndexedDB 喂出来的图）的场景——服务端 httpx 无法
@@ -251,20 +310,20 @@ async def convert_image_upload(
         raise HTTPException(status_code=415, detail=f"图像解码失败: {type(e).__name__}") from e
 
     try:
-        psd_bytes = _pil_to_psd_bytes(pil_img)
+        data = _convert_to_bytes(pil_img, fmt)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PSD 写出失败: {type(e).__name__}") from e
+        raise HTTPException(status_code=500, detail=f"{fmt.upper()} 写出失败: {type(e).__name__}") from e
 
-    # 文件名：优先用上传文件名（去扩展名） + .psd；否则 image.psd
-    filename = "image.psd"
+    # 文件名：优先用上传文件名（去扩展名） + 目标格式后缀；否则 image.<fmt>
+    filename = f"image.{fmt}"
     if file.filename:
         try:
             stem = file.filename.rsplit(".", 1)[0][:32] or "image"
-            filename = f"{stem}.psd"
+            filename = f"{stem}.{fmt}"
         except Exception:
             pass
 
-    return _make_response(psd_bytes, filename)
+    return _make_response(data, filename)
 
 
 # ---- SVG 矢量转换（visioncortex VTracer） ----

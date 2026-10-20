@@ -27,7 +27,7 @@ import logging
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from .. import cloudstore, config, platform_catalog, tasks, teams
@@ -41,7 +41,7 @@ router = APIRouter()
 
 
 class SubmitBody(BaseModel):
-    type: str = Field(..., description="image-gen | upscale | remove-background | split-layers | outpaint | mask | annotate | relight | edit | video-gen | dewatermark | removetext | erase | beauty | filter | restore | sketch | textreplace | bgreplace | restyle | redraw | similar")
+    type: str = Field(..., description="image-gen | upscale | remove-background | split-layers | outpaint | mask | annotate | relight | edit | video-gen | dewatermark | removetext | erase | beauty | filter | restore | sketch | textreplace | bgreplace | restyle | redraw | similar | tts")
     params: dict[str, Any] = Field(default_factory=dict, description="各 type 请求体，原样透传网关")
 
 
@@ -182,6 +182,52 @@ async def get_task(request_id: str, session: dict = Depends(require_session)):
 async def cancel_task(request_id: str, session: dict = Depends(require_session)):
     result = await tasks.cancel_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(result)
+
+
+# ---------- SenseAudio TTS：音色清单（运行时拉取，禁止前端写死） ----------
+@router.get("/api/tts/voices",
+            summary="当前账号可用 TTS 音色（BFF 缓存 10 分钟；可用范围跟上游套餐走）")
+async def list_tts_voices(session: dict = Depends(require_session)):
+    if not config.SENSEAUDIO_ENABLED:
+        raise HTTPException(status_code=503, detail="TTS 服务未启用")
+    from ..thirdparty import senseaudio
+
+    return ok({"voices": await senseaudio.list_voices()})
+
+
+class TtsPreviewBody(BaseModel):
+    model: str | None = None
+    voiceId: str = Field(..., description="试听音色")
+    speed: float | None = None
+    vol: float | None = None
+    pitch: float | None = None
+
+
+# 固定试听文本：不用用户文本，防止借试听端点白嫖长文合成（按字符计费，控制在 ~12 字）。
+_TTS_PREVIEW_TEXT = "你好，这是我合成语音的效果"
+
+
+@router.post("/api/tts/preview",
+             summary="音色试听：固定样例文本直连合成，返回 mp3 字节流（不落任务/媒体库）")
+async def preview_tts_voice(body: TtsPreviewBody, session: dict = Depends(require_session)):
+    if not config.SENSEAUDIO_ENABLED:
+        raise HTTPException(status_code=503, detail="TTS 服务未启用")
+    from ..thirdparty import senseaudio
+
+    # 试听是同步小调用：上游报错（音色不在套餐/限频/参数问题）必须原样透传，
+    # 否则前端只能看到 HTTP 500，用户无从判断失败原因（2026-10-20 实测反馈）。
+    try:
+        result = await senseaudio.synthesize({
+            "text": _TTS_PREVIEW_TEXT,
+            "model": body.model,
+            "voiceId": body.voiceId,
+            "speed": body.speed,
+            "vol": body.vol,
+            "pitch": body.pitch,
+        })
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"试听失败: {exc}") from exc
+    return Response(content=result["audio"], media_type="audio/mpeg")
 
 
 # ---------- 用户请求日志（拉日志对齐）----------
