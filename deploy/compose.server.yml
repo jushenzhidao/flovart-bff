@@ -16,7 +16,8 @@ services:
   bff:
     # ⭐ 升级只改这一行：tag = GitHub Actions 产物 sha-<commit前7位>。
     #   实际 tag 以 Actions 运行日志 / GHCR 包页面为准，生产钉 sha tag 别用 latest。
-    image: ghcr.io/jushenzhidao/flovart-bff:sha-71cbf31
+    #   sha-7ccd3e5 = 2026-10-21 高清放大改道 wavespeed（含 BYOK 形态）。
+    image: ghcr.io/jushenzhidao/flovart-bff:sha-7ccd3e5
     # 容器名参数化：并存多实例时用 FLOVART_BFF_CONTAINER_NAME 区分。
     container_name: ${FLOVART_BFF_CONTAINER_NAME:-flovart-bff}
     restart: unless-stopped

@@ -181,3 +181,14 @@ def test_wavespeed_submit_upscale_body_and_id(monkeypatch):
     path, body = fake.calls[0]
     assert path == "/v3/" + config.WAVESPEED_UPSCALE_MODEL
     assert body == {"image": "https://cdn.example/src.png"}
+
+    # 2026-10-21 透传：新字段直传（白名单校验），旧 targetLongEdge 兼容映射，非法值丢弃
+    asyncio.run(ws.submit_upscale(7, "mk-1", options={"targetResolution": "8k", "outputFormat": "png"}))
+    assert fake.calls[1][1] == {"image": "https://cdn.example/src.png", "target_resolution": "8k", "output_format": "png"}
+    asyncio.run(ws.submit_upscale(7, "mk-1", options={"targetLongEdge": 4096}))
+    assert fake.calls[2][1] == {"image": "https://cdn.example/src.png", "target_resolution": "4k"}
+    asyncio.run(ws.submit_upscale(7, "mk-1", options={"targetResolution": "16k", "outputFormat": "bmp"}))
+    assert fake.calls[3][1] == {"image": "https://cdn.example/src.png"}
+    # real-esrgan 不吃这些参数（模型名守卫）
+    asyncio.run(ws.submit_upscale(7, "mk-1", model="wavespeed-ai/real-esrgan", options={"targetResolution": "8k"}))
+    assert fake.calls[4][1] == {"image": "https://cdn.example/src.png"}

@@ -228,15 +228,37 @@ async def submit_split_layers(uid: int, source_media_key: str, *, num_layers=4,
     return str(pred_id)
 
 
-async def submit_upscale(uid: int, source_media_key: str, *, model=None) -> str:
+async def submit_upscale(uid: int, source_media_key: str, *, model=None, options: dict | None = None) -> str:
     """提交高清放大任务，返回 WaveSpeed prediction id。
 
     默认 wavespeed-ai/image-upscaler（仅 image 必填，其余参数走模型默认；
     2026-10-21 实测 1x1 小图提交+轮询全通过）。备选 wavespeed-ai/real-esrgan。
+
+    ⭐ options 透传（2026-10-21 对齐官方 schema，前端已同步改为真实参数）：
+    - targetResolution → target_resolution（官方档位 2k/4k/8k，默认 4k；白名单校验）
+    - outputFormat     → output_format（jpeg/png/webp，默认 jpeg）
+    - 兼容旧 targetLongEdge：≤2048→2k，≤4096→4k，>4096→8k（历史记录/旧前端重放）
+    仅 image-upscaler 系模型接受这些参数（real-esrgan 不吃，传了可能 400，故按模型名守卫）。
     """
     src_url = await _resolve_source_url(uid, source_media_key)
     model = model or config.WAVESPEED_UPSCALE_MODEL
-    resp = await _client().post(f"/v3/{model}", json={"image": src_url})
+    body: dict = {"image": src_url}
+    if options and "image-upscaler" in model:
+        resolution = str(options.get("targetResolution") or "").strip().lower()
+        if resolution in ("2k", "4k", "8k"):
+            body["target_resolution"] = resolution
+        else:
+            long_edge = options.get("targetLongEdge")
+            try:
+                long_edge = int(long_edge) if long_edge else 0
+            except (TypeError, ValueError):
+                long_edge = 0
+            if long_edge:
+                body["target_resolution"] = "2k" if long_edge <= 2048 else ("4k" if long_edge <= 4096 else "8k")
+        fmt = str(options.get("outputFormat") or "").strip().lower()
+        if fmt in ("jpeg", "png", "webp"):
+            body["output_format"] = fmt
+    resp = await _client().post(f"/v3/{model}", json=body)
     if resp.status_code >= 400:
         logger.error("WaveSpeed upscale submit failed %s: %s", resp.status_code, resp.text[:500])
         raise RuntimeError(f"WaveSpeed 放大提交失败 HTTP {resp.status_code}")

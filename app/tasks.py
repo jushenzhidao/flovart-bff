@@ -1633,8 +1633,11 @@ async def _submit_thirdparty(uid: int, request_id: str, kind: str, spec: dict, p
                 )
             elif kind == "upscale":
                 # 高清放大（2026-10-21）：wavespeed-ai/image-upscaler，仅 image 必填。
+                # 2026-10-21 晚：透传 options.targetLongEdge → target_resolution（2k/4k/8k），
+                # 否则模型恒定 4K 输出，前端选 2048 也一样慢（30~70s 实测）。
                 model = params.get("model") or config.WAVESPEED_UPSCALE_MODEL
-                tp_task_id = await ws.submit_upscale(uid, source, model=model)
+                tp_task_id = await ws.submit_upscale(uid, source, model=model,
+                                                     options=params.get("options") or {})
             else:
                 raise ValueError(f"unsupported thirdparty kind: {kind}")
         except Exception:
