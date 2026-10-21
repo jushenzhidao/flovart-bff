@@ -120,7 +120,12 @@ TASK_TYPES: "dict[str, dict]" = {
         "async_path": config.GATEWAY_IMAGE_TASKS_PATH,
         "sync_path": config.GATEWAY_SYNC_IMAGE_PATH,
     },
-    "upscale": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_UPSCALE_PATH},
+    # 高清放大（2026-10-21 改道 wavespeed 直连）：网关 images 通道对 gemini 系模型
+    # （渠道 type=24 Gemini 原生）的 images/generations 转换只支持 imagen，
+    # 平台链路一律 convert_request_failed；gpt-image 渠道上游也时好时坏。
+    # 自配 BYOK 网关（_gateway）同样不认识 task='upscale' 非标语义 → 也是必死路，
+    # 故 submit() 内对 upscale **一律**拦截改道（含 _gateway），见 _reroute_upscale_to_wavespeed。
+    "upscale": {"provider": "thirdparty", "tp": "wavespeed", "mode": "async"},
     "remove-background": {"provider": "gateway", "mode": "sync", "sync_path": config.GATEWAY_SYNC_REMOVE_BG_PATH},
     # 图片编辑类（原纯 BYOK 直连，现走 BFF→网关，用户免 Key）：
     # 扩展画面 / 编辑蒙版 / 标注涂鸦 / 打光面板 / 通用编辑（换装等）。
@@ -518,6 +523,29 @@ def _fix_params_image_mime(params: dict) -> dict:
     return fixed
 
 
+async def _reroute_upscale_to_wavespeed(uid: int, params: dict) -> dict:
+    """把前端 image-gen 形态的 upscale 入参改写成第三方形态。
+
+    前端契约：image = dataURL 字符串数组（data:<mime>;base64,<payload>）。
+    取首图解码 → 落 BFF 盘换 media key → 第三方分支用它上传 wavespeed 换公网 URL。
+    """
+    imgs = params.get("image")
+    first = imgs[0] if isinstance(imgs, list) and imgs else None
+    if not isinstance(first, str) or not first.startswith("data:"):
+        raise ValueError("upscale 需要 dataURL 图像入参")
+    header, _, b64 = first.partition(",")
+    mime = header[5:].split(";")[0] or "image/png"
+    try:
+        blob = base64.b64decode(b64)
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"upscale 图像 base64 解码失败: {e}") from e
+    if not blob:
+        raise ValueError("upscale 图像内容为空")
+    media = await cloudstore.media_put(uid, "image", mime, blob)
+    return {"source_media_key": media["media_key"],
+            "options": params.get("options") or {}}
+
+
 async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) -> dict:
     """提交任务：按 TASK_TYPES[kind] 分流。
 
@@ -529,6 +557,22 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
     返回统一视图 {id, taskId, kind, mode, status, result?, gatewayTask}；
     前端用 id 轮询 GET /api/tasks/{id}。
     """
+    # 高清放大改道 wavespeed 直连（2026-10-21，两轮迭代）：
+    # 前端把 upscale 收敛成 image-gen + task='upscale' 打 images 通道，但
+    # ① 平台网关对 gemini 系模型的 images 转换只支持 imagen → convert_request_failed；
+    # ② 自配 BYOK 网关（_gateway，如 oneapis workbuddy）同样是 new-api 兼容层，
+    #    根本不认识 task='upscale' 这个非标语义 → 同样 convert_request_failed
+    #    （2026-10-21 14:45 实测，首轮修复漏了这条路径：守卫只豁免了 _gateway）。
+    # 结论：images/generations 通道对 upscale 是**必死路**，无论平台还是 BYOK，
+    # 一律改道 wavespeed 直连（平台 key 计费）；仅当入参已是第三方形态
+    # （source_media_key）或 wavespeed 未配置时放行原路径。
+    if (config.WAVESPEED_ENABLED
+            and not params.get("source_media_key")
+            and (kind == "upscale"
+                 or (kind == "image-gen" and str(params.get("task") or "") == "upscale"))):
+        params = await _reroute_upscale_to_wavespeed(uid, params)
+        kind = "upscale"
+        logger.info("upscale rerouted to wavespeed uid=%s", uid)
     spec = TASK_TYPES.get(kind)
     if spec is None:
         raise ValueError(f"unsupported task type: {kind}")
@@ -541,7 +585,9 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
     # 两条命中路径：① kind 本身是能力名（dewatermark/upscale/…）；② 前端编辑类收敛到
     # image-gen 时以 variant 携带能力语义（mask/outpaint/edit…），variant 命中档案同样适配。
     adapt_kind = kind if kind in upstream_profiles.PROFILES else str(params.get("variant") or "")
-    if adapt_kind:
+    # ⚠️ 仅网关任务参与档案适配（2026-10-21）：upscale 已改道第三方直连，
+    # 开关打开时 build() 会改写/丢弃 source_media_key → 第三方分支必炸，故跳过。
+    if adapt_kind and spec.get("provider", "gateway") == "gateway":
         params = upstream_profiles.adapt(adapt_kind, params)
     request_id = uuid.uuid4().hex
     provider = spec.get("provider", "gateway")
@@ -1585,6 +1631,10 @@ async def _submit_thirdparty(uid: int, request_id: str, kind: str, spec: dict, p
                     prompt=params.get("prompt", ""), model=model,
                     resolution=params.get("resolution"),
                 )
+            elif kind == "upscale":
+                # 高清放大（2026-10-21）：wavespeed-ai/image-upscaler，仅 image 必填。
+                model = params.get("model") or config.WAVESPEED_UPSCALE_MODEL
+                tp_task_id = await ws.submit_upscale(uid, source, model=model)
             else:
                 raise ValueError(f"unsupported thirdparty kind: {kind}")
         except Exception:

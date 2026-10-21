@@ -417,6 +417,11 @@ WAVESPEED_SPLIT_MODEL_PRO: str = os.getenv(
     "WAVESPEED_SPLIT_MODEL_PRO", "bytedance/seedream-v5.0-pro/layer-decomposition").strip()
 WAVESPEED_SPLIT_PRO_RESOLUTION: str = os.getenv(
     "WAVESPEED_SPLIT_PRO_RESOLUTION", "1k").strip()  # 1k | 1.5k | 2k
+# 高清放大模型（2026-10-21 接入）：网关 images 通道对 gemini 系模型
+# （渠道 type=24）的 images/generations 转换只支持 imagen → convert_request_failed，
+# 平台链路 upscale 改道 wavespeed 直连。备选：wavespeed-ai/real-esrgan（更便宜）。
+WAVESPEED_UPSCALE_MODEL: str = os.getenv(
+    "WAVESPEED_UPSCALE_MODEL", "wavespeed-ai/image-upscaler").strip()
 WAVESPEED_TIMEOUT: int = _int("WAVESPEED_TIMEOUT", 300)            # 单次提交/轮询 HTTP 超时（秒）
 WAVESPEED_POLL_INTERVAL: int = _int("WAVESPEED_POLL_INTERVAL", 2)  # 轮询间隔（秒）
 WAVESPEED_POLL_MAX: int = _int("WAVESPEED_POLL_MAX", 120)          # 最大轮询次数（≈ MAX*INTERVAL 秒）

@@ -228,6 +228,32 @@ async def submit_split_layers(uid: int, source_media_key: str, *, num_layers=4,
     return str(pred_id)
 
 
+async def submit_upscale(uid: int, source_media_key: str, *, model=None) -> str:
+    """提交高清放大任务，返回 WaveSpeed prediction id。
+
+    默认 wavespeed-ai/image-upscaler（仅 image 必填，其余参数走模型默认；
+    2026-10-21 实测 1x1 小图提交+轮询全通过）。备选 wavespeed-ai/real-esrgan。
+    """
+    src_url = await _resolve_source_url(uid, source_media_key)
+    model = model or config.WAVESPEED_UPSCALE_MODEL
+    resp = await _client().post(f"/v3/{model}", json={"image": src_url})
+    if resp.status_code >= 400:
+        logger.error("WaveSpeed upscale submit failed %s: %s", resp.status_code, resp.text[:500])
+        raise RuntimeError(f"WaveSpeed 放大提交失败 HTTP {resp.status_code}")
+    j = resp.json()
+    if isinstance(j, dict) and j.get("success") is False:
+        raise RuntimeError(f"WaveSpeed 放大提交被拒: {j.get('message')}")
+    data = (j.get("data") if isinstance(j, dict) else None) or j
+    pred_id = None
+    if isinstance(data, dict):
+        pred_id = data.get("id") or data.get("prediction_id") or data.get("task_id")
+    if not pred_id and isinstance(j, dict):
+        pred_id = j.get("id") or j.get("prediction_id") or j.get("task_id")
+    if not pred_id:
+        raise RuntimeError(f"WaveSpeed 放大未返回 prediction id: {resp.text[:300]}")
+    return str(pred_id)
+
+
 async def get_status(prediction_id: str) -> "tuple[str, list[str]]":
     """轮询结果，返回 (status, image_urls)。"""
     resp = await _client().get(f"/v3/predictions/{prediction_id}/result")
