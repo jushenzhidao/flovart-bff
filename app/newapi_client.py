@@ -73,7 +73,14 @@ def get_client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(
             base_url=config.NEWAPI_BASE_URL,
             timeout=httpx.Timeout(15.0, connect=5.0),
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            # ⭐ keepalive_expiry=90s（2026-11-17 生图变慢事故）：默认 5s 意味着两次
+            # 网关调用间隔 >5s 就重新建连（SYN+TLS 握手）。而 BFF 机链路丢包（~5%，
+            # TCP 建连 p95 3.1s）下每次建连都有可观概率吃 1~4s 重传惩罚——生图一次
+            # 要过网关多次（发 sk-、生成、查状态），惩罚叠加直接把 30s 拖成分钟级。
+            # 90s < 网关 nginx keepalive_timeout(101s)：由 BFF 侧先回收连接，
+            # 避免复用被 nginx 单方面关闭的死连接（httpx 复用死连接会抛错）。
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20,
+                                keepalive_expiry=90.0),
             trust_env=False,  # 不走本机代理
         )
         observability.instrument_httpx(_client)

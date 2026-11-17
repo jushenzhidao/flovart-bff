@@ -210,7 +210,10 @@ def _sync_client() -> httpx.AsyncClient:
         _SYNC_CLIENT = httpx.AsyncClient(
             base_url=config.NEWAPI_BASE_URL,
             timeout=httpx.Timeout(config.GATEWAY_SYNC_TIMEOUT, connect=10.0),
-            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+            # ⭐ keepalive_expiry=90s：同 newapi_client.get_client——BFF 机链路丢包下
+            # 复用连接躲开建连重传惩罚（90s < 网关 nginx keepalive 101s）。
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10,
+                                keepalive_expiry=90.0),
             trust_env=False,
         )
     return _SYNC_CLIENT
