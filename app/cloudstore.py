@@ -396,7 +396,7 @@ class PgMeta(_Meta):
         pool = await self._c()
         tag = await pool.execute(
             """UPDATE cloud_request_log
-               SET status='failed', result=$1, updated_at=now()
+               SET status='failed', result_json=$1, updated_at=now()
                WHERE status='submitted' AND created_at < now() - make_interval(hours => $2)""",
             stale, hours)
         return int(tag.split()[-1]) if tag and tag.startswith("UPDATE") else 0
