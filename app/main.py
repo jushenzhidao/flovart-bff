@@ -16,8 +16,10 @@ from . import cloudstore, config, newapi_client as na, observability, store, tas
 from .newapi_client import NewApiError
 from .platform_catalog import ModelSuspendedError
 from .resp import ok
-from .routers import (auth, billing, cloud, console, convert, events, keys, platform_services,
-                      tasks as tasks_router, teams as teams_router, usage, chat, shares)
+from .routers import (auth, apikeys, billing, cloud, console, convert, events, keys,
+                      platform_services, tasks as tasks_router, teams as teams_router,
+                      usage, chat, shares)
+from . import mcp_server
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("bff")
@@ -70,7 +72,10 @@ async def _lifespan(_app: FastAPI):
         cleanup_task = asyncio.create_task(_media_cleanup_loop())
     # 图片任务（同步/异步双模式）：BFF 不跑 worker；异步透传网关、同步阻塞直出后落盘，
     # 每次提交写一条请求日志（落 PG，见 app/tasks.py）。只需归还 httpx 连接池。
-    yield
+    # 远程 MCP（2026-11-03）：session manager 需要 lifespan 启动 —— 在主 lifespan 内嵌套
+    # 子应用 lifespan（Starlette mount 不会自动跑子 lifespan）。
+    async with mcp_server.mcp_http_app.lifespan(mcp_server.mcp_http_app):
+        yield
     if cleanup_task:
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -98,8 +103,12 @@ observability.setup(app)
 
 # 统一响应壳 {success, message, data}（同 hewapi）。注意：FastAPI 自动 422 校验
 # 失败返回的是 pydantic 默认形状，前端需兼容两种（参考 hewapi 前端处理）。
-for r in (auth.router, keys.router, usage.router, console.router, convert.router, cloud.router, tasks_router.router, billing.router, chat.router, shares.router, platform_services.router, teams_router.router, events.router):
+for r in (auth.router, keys.router, usage.router, console.router, convert.router, cloud.router, tasks_router.router, billing.router, chat.router, shares.router, platform_services.router, teams_router.router, events.router, apikeys.router):
     app.include_router(r)
+
+# 远程 MCP server（X-API-Key 鉴权在 app/mcp_server.py 的 ASGI 中间件）。
+# mount 前缀 /mcp + 子路由 '/' → 最终端点 /mcp；放在 include_router 之后（不抢业务路由）。
+app.mount("/mcp", mcp_server.mcp_http_app)
 
 
 # ---------- 异常处理：业务错误透传 message，内部错误不泄露 ----------

@@ -62,7 +62,7 @@ def _install_fake_log(monkeypatch):
     """把 cloudstore 的请求日志读写换成内存版，断言不触网、不落盘。"""
     logs: dict[str, dict] = {}
 
-    async def fake_put(uid, request_id, kind, provider, model, params, status="submitted", mode="sync"):
+    async def fake_put(uid, request_id, kind, provider, model, params, status="submitted", mode="sync", source="web"):
         logs[request_id] = {
             "uid": uid, "kind": kind, "provider": provider, "model": model,
             "payload": params, "status": status, "mode": mode, "result": None,

@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from .. import cloudstore, config, platform_catalog, tasks, teams
 from ..platform_catalog import ModelSuspendedError
 from ..resp import ok
-from ..security import is_admin, require_session
+from ..security import is_admin, require_identity, require_session
 
 logger = logging.getLogger("bff.tasks_router")
 
@@ -46,7 +46,7 @@ class SubmitBody(BaseModel):
 
 
 @router.post("/api/tasks")
-async def create_task(body: SubmitBody, session: dict = Depends(require_session)):
+async def create_task(body: SubmitBody, session: dict = Depends(require_identity)):
     return await _create_task_common(body, session)
 
 
@@ -120,7 +120,8 @@ async def _create_task_common(
                 await cloudstore.request_log_put(
                     int(session["uid"]), req_id, body.type, "gateway",
                     model_name, cloudstore.strip_b64({**params}),
-                    status="failed", mode="blocked")
+                    status="failed", mode="blocked",
+                    source="agent" if session.get("via") == "api-key" else "web")
                 await cloudstore.request_log_update(
                     req_id, result={"code": e.code, "reason": e.reason,
                                     "message": e.message})
@@ -139,20 +140,21 @@ async def _create_task_common(
     # pat 透传：sk- 缺失/轮换时优先用用户 PAT 自建（token 归属用户本人，计费正确；
     # 2026-09-24 计费错账修复——管理员代建的 sk- 会被 new-api 挂到管理员名下）。
     task = await tasks.submit(int(session["uid"]), body.type, params,
-                              pat=session.get("pat"))
+                              pat=session.get("pat"),
+                              source="agent" if session.get("via") == "api-key" else "web")
     return ok(task)
 
 
 # ---------- 镜像路由：提交（路径即语义，D1） ----------
 @router.post("/api/v1/images/generations",
              summary="生图同步提交（镜像路由，等价 POST /api/tasks image-gen mode=sync）")
-async def create_task_mirror_sync(body: SubmitBody, session: dict = Depends(require_session)):
+async def create_task_mirror_sync(body: SubmitBody, session: dict = Depends(require_identity)):
     return await _create_task_common(body, session, path_mode="sync")
 
 
 @router.post("/api/async/v1/images/generations",
              summary="生图异步提交（镜像路由，等价 POST /api/tasks image-gen mode=async）")
-async def create_task_mirror_async(body: SubmitBody, session: dict = Depends(require_session)):
+async def create_task_mirror_async(body: SubmitBody, session: dict = Depends(require_identity)):
     return await _create_task_common(body, session, path_mode="async")
 
 
@@ -165,14 +167,14 @@ async def create_task_mirror_async(body: SubmitBody, session: dict = Depends(req
             summary="生图同步轮询（BFF 扩展语义，读存储结果；上游同步端点无 GET）")
 @router.get("/api/async/v1/images/generations/{request_id}",
             summary="生图异步轮询（镜像路由，等价 GET /api/tasks/{request_id}）")
-async def get_task_mirror(request_id: str, session: dict = Depends(require_session)):
+async def get_task_mirror(request_id: str, session: dict = Depends(require_identity)):
     # id 即提交时返回的 request_id；网关按 New-Api-User 隔离，越权/不存在返回 404。
     task = await tasks.get_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(task)
 
 
 @router.get("/api/tasks/{request_id}")
-async def get_task(request_id: str, session: dict = Depends(require_session)):
+async def get_task(request_id: str, session: dict = Depends(require_identity)):
     # id 即提交时返回的 request_id；网关按 New-Api-User 隔离，越权/不存在返回 404。
     task = await tasks.get_task(request_id, int(session["uid"]), pat=session.get("pat"))
     return ok(task)

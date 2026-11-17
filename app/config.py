@@ -118,6 +118,10 @@ QUOTA_PER_CNY: int = _int("BFF_QUOTA_PER_CNY", 500000)
 POINTS_PER_CNY: int = _int("BFF_POINTS_PER_CNY", 10000)
 POINTS_UNIT_NAME: str = os.getenv("BFF_POINTS_UNIT_NAME", "积分")
 
+# MCP 生图默认模型（2026-11-03 外部接入）：agent 不传 model 时的兜底。
+# 需是平台目录已发布、且当前网关分组有渠道的模型；留空则 MCP 内部启发式挑选。
+MCP_DEFAULT_IMAGE_MODEL: str = os.getenv("BFF_MCP_DEFAULT_IMAGE_MODEL", "gpt-image-2.5-flare").strip()
+
 # ---------- 团队（工作室主子账号，飞哥 2026-10-09 拍板）----------
 # 子账号消费仍由 new-api 扣自己 quota（网关语义零改动）；BFF 做「低水位自动划转」：
 # 子账号 quota 低于阈值 → 从主账号池划一块过去（管理员 API 两步非原子，失败记日志人工对账）。

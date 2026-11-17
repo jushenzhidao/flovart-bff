@@ -96,7 +96,7 @@ class _Meta:
     async def overview(self, uid) -> dict:
         raise NotImplementedError
 
-    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode) -> None:
+    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode, source="web") -> None:
         raise NotImplementedError
 
     async def reqlog_update(self, request_id, status=None, task_id=None,
@@ -111,6 +111,24 @@ class _Meta:
 
     async def reqlog_fail_stale(self, hours: int) -> int:
         """启动兜底：把「submitted 且超过 hours」的行标 failed（进程重启丢在途后台任务）。返回条数。"""
+        raise NotImplementedError
+
+    # ---- 外部接入 Key（agent/MCP，2026-11-03；只存哈希，明文仅生成时返回）----
+    async def api_key_create(self, uid, key_hash, prefix, name) -> dict:
+        raise NotImplementedError
+
+    async def api_key_list(self, uid) -> list:
+        raise NotImplementedError
+
+    async def api_key_delete(self, uid, key_id) -> bool:
+        raise NotImplementedError
+
+    async def api_key_lookup(self, key_hash) -> "dict | None":
+        """按哈希查 Key（全局，含 uid）。status != 'active' 视为不存在。"""
+        raise NotImplementedError
+
+    async def api_key_touch(self, key_hash) -> None:
+        """更新 last_used_at / use_count（尽力而为，失败不抛）。"""
         raise NotImplementedError
 
     # ---- 素材共享（A 点对点：指定 new-api 用户）----
@@ -279,14 +297,14 @@ class PgMeta(_Meta):
         return {"doc_count": doc_count, "media_count": m["n"], "bytes_used": m["t"],
                 "quota_bytes": config.OSS_QUOTA_BYTES, "media_limit_bytes": MAX_MEDIA_BYTES}
 
-    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode):
+    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode, source="web"):
         pool = await self._c()
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         await pool.execute(
             """INSERT INTO cloud_request_log
-               (request_id, uid, kind, provider, model, payload_json, status, mode, created_at, updated_at)
-               VALUES($1,$2,$3,$4,$5,$6,$7,$8,now(),now())""",
-            request_id, uid, kind, provider, model, raw, status, mode)
+               (request_id, uid, kind, provider, model, payload_json, status, mode, source, created_at, updated_at)
+               VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now(),now())""",
+            request_id, uid, kind, provider, model, raw, status, mode, source)
 
     async def reqlog_update(self, request_id, status=None, task_id=None,
                             gateway_request_id=None, result=None):
@@ -382,6 +400,54 @@ class PgMeta(_Meta):
                WHERE status='submitted' AND created_at < now() - make_interval(hours => $2)""",
             stale, hours)
         return int(tag.split()[-1]) if tag and tag.startswith("UPDATE") else 0
+
+    # ---- 外部接入 Key（agent/MCP，2026-11-03）----
+    async def api_key_create(self, uid, key_hash, prefix, name):
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """INSERT INTO cloud_api_keys(uid, key_hash, prefix, name)
+               VALUES($1,$2,$3,$4)
+               ON CONFLICT (key_hash) DO UPDATE SET name=EXCLUDED.name
+               RETURNING id, uid, key_hash, prefix, name, status, created_at, last_used_at, use_count""",
+            uid, key_hash, prefix, name)
+        return self._api_key_row(row)
+
+    async def api_key_list(self, uid):
+        pool = await self._c()
+        rows = await pool.fetch(
+            """SELECT id, uid, key_hash, prefix, name, status, created_at, last_used_at, use_count
+               FROM cloud_api_keys WHERE uid=$1 ORDER BY id DESC""", uid)
+        return [self._api_key_row(r) for r in rows]
+
+    async def api_key_delete(self, uid, key_id):
+        pool = await self._c()
+        tag = await pool.execute(
+            "DELETE FROM cloud_api_keys WHERE uid=$1 AND id=$2", uid, key_id)
+        return tag.startswith("DELETE") and tag.split()[-1] not in ("0",)
+
+    async def api_key_lookup(self, key_hash):
+        pool = await self._c()
+        row = await pool.fetchrow(
+            """SELECT id, uid, key_hash, prefix, name, status FROM cloud_api_keys
+               WHERE key_hash=$1 AND status='active'""", key_hash)
+        return self._api_key_row(row) if row else None
+
+    async def api_key_touch(self, key_hash):
+        try:
+            pool = await self._c()
+            await pool.execute(
+                """UPDATE cloud_api_keys SET last_used_at=now(), use_count=use_count+1
+                   WHERE key_hash=$1""", key_hash)
+        except Exception:  # noqa: BLE001 —— 统计尽力而为
+            pass
+
+    @staticmethod
+    def _api_key_row(r) -> dict:
+        return {"id": int(r["id"]), "uid": int(r["uid"]), "prefix": r["prefix"],
+                "name": r["name"], "status": r["status"],
+                "created_at": str(r["created_at"]) if r["created_at"] else None,
+                "last_used_at": str(r["last_used_at"]) if r["last_used_at"] else None,
+                "use_count": int(r["use_count"] or 0)}
 
     # ---- 行为埋点（2026-10-13 飞哥拍板自建：用户行为分析，非 Logfire 运维观测）----
     async def events_insert(self, items):
@@ -695,9 +761,16 @@ class LocalMeta(_Meta):
                     request_id TEXT PRIMARY KEY, uid INTEGER NOT NULL, kind TEXT NOT NULL,
                     provider TEXT, model TEXT, payload TEXT NOT NULL, task_id TEXT,
                     gateway_request_id TEXT, status TEXT NOT NULL DEFAULT 'submitted',
-                    mode TEXT NOT NULL DEFAULT 'async', result TEXT, created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL);
+                    mode TEXT NOT NULL DEFAULT 'async', result TEXT, source TEXT NOT NULL DEFAULT 'web',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS idx_reqlog_uid_created ON cloud_request_log(uid, created_at);
+                CREATE TABLE IF NOT EXISTS cloud_api_keys(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid INTEGER NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+                    prefix TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL, last_used_at TEXT, use_count INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS idx_apikeys_uid ON cloud_api_keys(uid);
                 CREATE TABLE IF NOT EXISTS cloud_media_shares(
                     id TEXT PRIMARY KEY,
                     owner_uid INTEGER NOT NULL,
@@ -753,6 +826,10 @@ class LocalMeta(_Meta):
                              ("monthly_topup_points", "INTEGER NOT NULL DEFAULT 0")):
                 if col not in tm_cols:
                     conn.execute(f"ALTER TABLE cloud_team_members ADD COLUMN {col} {ddl}")
+            # 请求日志来源标记（2026-11-03 外部接入：web / agent）
+            rl_cols = {r[1] for r in conn.execute("PRAGMA table_info(cloud_request_log)").fetchall()}
+            if "source" not in rl_cols:
+                conn.execute("ALTER TABLE cloud_request_log ADD COLUMN source TEXT NOT NULL DEFAULT 'web'")
             # 多团队升级（2026-10-09：owner 可建多队分组）：存量库 owner_uid 带 UNIQUE，
             # SQLite 无法直接去约束 → 重建表搬数据。
             team_sql = conn.execute(
@@ -891,16 +968,16 @@ class LocalMeta(_Meta):
                     "quota_bytes": config.OSS_QUOTA_BYTES, "media_limit_bytes": MAX_MEDIA_BYTES}
         return await asyncio.to_thread(_)
 
-    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode):
+    async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode, source="web"):
         def _():
             raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
             now = _utcnow()
             conn = self._connect()
             conn.execute(
                 """INSERT INTO cloud_request_log
-                   (request_id, uid, kind, provider, model, payload, status, mode, created_at, updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (request_id, uid, kind, provider, model, raw, status, mode, now, now))
+                   (request_id, uid, kind, provider, model, payload, status, mode, source, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (request_id, uid, kind, provider, model, raw, status, mode, source, now, now))
             conn.commit()
         return await asyncio.to_thread(_)
 
@@ -1016,6 +1093,66 @@ class LocalMeta(_Meta):
             conn.commit()
             return n
         return await asyncio.to_thread(_)
+
+    # ---- 外部接入 Key（LocalMeta 兜底，与 PgMeta 同契约）----
+    async def api_key_create(self, uid, key_hash, prefix, name):
+        def _():
+            conn = self._connect()
+            now = _utcnow()
+            ex = conn.execute("SELECT id FROM cloud_api_keys WHERE key_hash=?", (key_hash,)).fetchone()
+            if ex:
+                conn.execute("UPDATE cloud_api_keys SET name=? WHERE key_hash=?", (name, key_hash))
+            else:
+                conn.execute(
+                    "INSERT INTO cloud_api_keys(uid, key_hash, prefix, name, status, created_at, use_count)"
+                    " VALUES(?,?,?,?, 'active', ?, 0)", (uid, key_hash, prefix, name, now))
+            conn.commit()
+            row = conn.execute("SELECT * FROM cloud_api_keys WHERE key_hash=?", (key_hash,)).fetchone()
+            return self._api_key_row(row)
+        return await asyncio.to_thread(_)
+
+    async def api_key_list(self, uid):
+        def _():
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT * FROM cloud_api_keys WHERE uid=? ORDER BY id DESC", (uid,)).fetchall()
+            return [self._api_key_row(r) for r in rows]
+        return await asyncio.to_thread(_)
+
+    async def api_key_delete(self, uid, key_id):
+        def _():
+            conn = self._connect()
+            cur = conn.execute("DELETE FROM cloud_api_keys WHERE uid=? AND id=?", (uid, key_id))
+            conn.commit()
+            return cur.rowcount > 0
+        return await asyncio.to_thread(_)
+
+    async def api_key_lookup(self, key_hash):
+        def _():
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT * FROM cloud_api_keys WHERE key_hash=? AND status='active'", (key_hash,)).fetchone()
+            return self._api_key_row(row) if row else None
+        return await asyncio.to_thread(_)
+
+    async def api_key_touch(self, key_hash):
+        def _():
+            try:
+                conn = self._connect()
+                conn.execute(
+                    "UPDATE cloud_api_keys SET last_used_at=?, use_count=use_count+1 WHERE key_hash=?",
+                    (_utcnow(), key_hash))
+                conn.commit()
+            except Exception:  # noqa: BLE001 —— 统计尽力而为
+                pass
+        return await asyncio.to_thread(_)
+
+    @staticmethod
+    def _api_key_row(r) -> dict:
+        return {"id": int(r["id"]), "uid": int(r["uid"]), "prefix": r["prefix"],
+                "name": r["name"], "status": r["status"],
+                "created_at": r["created_at"], "last_used_at": r["last_used_at"],
+                "use_count": int(r["use_count"] or 0)}
 
     # ---- 行为埋点（LocalMeta 兜底，与 PgMeta 同契约）----
     async def events_insert(self, items):
@@ -1601,8 +1738,8 @@ def strip_b64(obj, _max: int = 256):
 
 
 async def request_log_put(uid: int, request_id: str, kind: str, provider: str, model: str,
-                          payload: dict, status: str, mode: str) -> None:
-    await META.reqlog_put(uid, request_id, kind, provider, model, payload, status, mode)
+                          payload: dict, status: str, mode: str, source: str = "web") -> None:
+    await META.reqlog_put(uid, request_id, kind, provider, model, payload, status, mode, source)
 
 
 async def request_log_update(request_id: str, status=None, task_id=None,
@@ -1695,6 +1832,28 @@ async def media_index_get_by_key(key) -> Optional[dict]:
 
 async def media_get_shared(key, viewer_uid) -> Optional[dict]:
     return await META.media_get_shared(key, viewer_uid)
+
+
+# ---------------- 外部接入 Key（agent/MCP，2026-11-03）----------------
+
+async def api_key_create(uid: int, key_hash: str, prefix: str, name: str) -> dict:
+    return await META.api_key_create(uid, key_hash, prefix, name)
+
+
+async def api_key_list(uid: int) -> list:
+    return await META.api_key_list(uid)
+
+
+async def api_key_delete(uid: int, key_id: int) -> bool:
+    return await META.api_key_delete(uid, key_id)
+
+
+async def api_key_lookup(key_hash: str) -> "dict | None":
+    return await META.api_key_lookup(key_hash)
+
+
+async def api_key_touch(key_hash: str) -> None:
+    await META.api_key_touch(key_hash)
 
 
 # ---------------- 团队（工作室主子账号）----------------

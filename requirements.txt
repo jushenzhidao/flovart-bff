@@ -26,3 +26,4 @@ asyncpg>=0.29
 # 表现为「配好了却什么都看不到」。
 # extras 带入 FastAPI / httpx 的 OTel instrumentation，缺了会导致对应埋点静默失效。
 logfire[fastapi,httpx]==4.41.0
+fastmcp>=4.1,<5

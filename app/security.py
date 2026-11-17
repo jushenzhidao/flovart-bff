@@ -163,6 +163,75 @@ def require_session(request: Request) -> dict:
     return session
 
 
+# ==================== 双轨身份（Cookie 会话 / 外部接入 Key）====================
+# 外部接入 Key（agent / MCP 调用，2026-11-03）：HTTP 头 X-API-Key，
+# 形如 fvk_<43位urlsafe>。库里只存 SHA-256 哈希（泄露库不泄露 Key）。
+# 鉴权成功构造的「身份」与会话同形（uid/username/pat/role），并带 via="api-key"
+# 供调用链路做来源标记（请求日志 source=agent）与计费归属。
+#
+# 限频：进程内滑动窗口（per key_hash），默认 60 次/分钟。agent 的调用模式与
+# 人不同，Key 一旦外泄这是唯一的止损闸；多副本部署时各副本独立计数（保险丝
+# 语义，不追求精确）。
+
+_API_KEY_PREFIX = "fvk_"
+API_KEY_RATE_LIMIT = 60  # 次 / 分钟 / Key
+_rate_window: "dict[str, list[float]]" = {}
+
+
+def _hash_api_key(raw: str) -> str:
+    import hashlib
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _check_api_key_rate(key_hash: str) -> None:
+    now = time.time()
+    window = _rate_window.setdefault(key_hash, [])
+    cutoff = now - 60.0
+    while window and window[0] < cutoff:
+        window.pop(0)
+    if len(window) >= API_KEY_RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="外部接入 Key 触发限频（60 次/分钟），请稍后再试")
+    window.append(now)
+
+
+async def _identity_from_api_key(request: Request) -> "dict | None":
+    from . import cloudstore  # 局部导入避免环
+    raw = (request.headers.get("X-API-Key") or "").strip()
+    if not raw:
+        return None
+    key_hash = _hash_api_key(raw)
+    _check_api_key_rate(key_hash)
+    rec = await cloudstore.api_key_lookup(key_hash)
+    if rec is None:
+        raise HTTPException(status_code=401, detail="无效的外部接入 Key")
+    await cloudstore.api_key_touch(key_hash)
+    return {"uid": rec["uid"], "username": "", "pat": None, "role": 1,
+            "via": "api-key", "api_key_id": rec["id"]}
+
+
+async def require_identity(request: Request) -> dict:
+    """Cookie 会话优先，其次 X-API-Key 外部接入 Key；都没有 401。
+
+    与 require_session 同形返回（业务层无需感知来源），额外字段：
+    via="cookie" | "api-key"。⚠️ pat 在 api-key 路径为 None —— 下游打网关时
+    走管理员代建通道（tasks._user_api_key 的 None 分支，token 仍建在用户名下）。
+    """
+    session = read_session(request)
+    if session is not None:
+        return {**session, "via": "cookie"}
+    identity = await _identity_from_api_key(request)
+    if identity is not None:
+        return identity
+    raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+
+def generate_api_key() -> "tuple[str, str]":
+    """生成外部接入 Key。返回 (明文, 哈希)。明文只在生成瞬间可见。"""
+    import hashlib
+    raw = _API_KEY_PREFIX + secrets.token_urlsafe(32)
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 # new-api 的角色常量（common/constants.go）：普通 1 / 管理员 10 / root 100。
 ROLE_ADMIN = 10
 

@@ -111,7 +111,7 @@ def test_gemini_response_passthrough_non_gemini_shape():
 def _install_fakes(monkeypatch, captured, gw_raw):
     logs: dict[str, dict] = {}
 
-    async def fake_put(uid, request_id, kind, provider, model, params, status="submitted", mode="sync"):
+    async def fake_put(uid, request_id, kind, provider, model, params, status="submitted", mode="sync", source="web"):
         logs[request_id] = {"status": status, "result": None}
         return logs[request_id]
 

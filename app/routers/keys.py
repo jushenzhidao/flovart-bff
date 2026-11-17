@@ -88,13 +88,22 @@ async def _ensure_token_plain(session: dict) -> dict:
 async def _ensure_token_user(pat: str, uid: int) -> dict:
     d = await na.list_tokens(pat, uid, page=1, size=100)
     items = d.get("items", [])
-    if not items:
+    # ⭐ 2026-10-21：items[0] 排序不稳定（实测同一账号两次 ensure-key 返回不同 token），
+    # 且列表里混着已禁用（status!=1）token —— 无脑取第一个会把坏 key 下发给前端
+    # （症状：脚本拆解 401 无效令牌，且每次 ensure-key 的 key 都可能不一样）。
+    # 修复：过滤禁用 → 优先取 name=='平台默认 Key'（create_token 的固定名字，幂等锚点）
+    # → 都没有才创建。
+    usable = [t for t in items if t.get("status", 1) == 1]
+    t = next((x for x in usable if x.get("name") == "平台默认 Key"), None)
+    if t is None and not usable:
         await na.create_token(pat, uid, "平台默认 Key")
-        d = await na.list_tokens(pat, uid, page=1, size=1)
-        items = d.get("items", [])
-    if not items:
+        d = await na.list_tokens(pat, uid, page=1, size=100)
+        usable = [x for x in d.get("items", []) if x.get("status", 1) == 1]
+        t = next((x for x in usable if x.get("name") == "平台默认 Key"), None)
+    if t is None:
+        t = usable[0] if usable else None
+    if t is None:
         raise na.NewApiError("创建平台 Key 失败", 500)
-    t = items[0]
     plain = await na.get_token_key(pat, uid, t["id"])
     return {"id": t["id"], "name": t.get("name") or "平台默认 Key", "key": plain,
             "status": t.get("status", 1)}

@@ -40,7 +40,7 @@ def _install_fakes(monkeypatch, captured, gw_raw):
     logs: dict[str, dict] = {}
 
     async def fake_put(uid, request_id, kind, provider, model, params,
-                       status="submitted", mode="sync"):
+                       status="submitted", mode="sync", source="web"):
         logs[request_id] = {"status": status, "provider": provider, "mode": mode,
                             "kind": kind, "task_id": None}
         return logs[request_id]

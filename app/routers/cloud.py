@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 
 from .. import cloudstore
 from ..resp import ok
-from ..security import require_session
+from ..security import require_identity, require_session
 from ..timeutil import iso_to_cn
 
 router = APIRouter()
@@ -134,7 +134,7 @@ async def media_upload(
 
 
 @router.get("/api/me/media/{media_key}")
-async def media_download(media_key: str, session: dict = Depends(require_session)):
+async def media_download(media_key: str, session: dict = Depends(require_identity)):
     media = await cloudstore.media_get(_uid(session), media_key)
     if not media:
         raise HTTPException(status_code=404, detail="媒体不存在")

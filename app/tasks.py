@@ -462,11 +462,11 @@ def _task_view(request_id: str, task_id: "str | None", kind: str, mode: str,
 
 
 async def _log_submitted(uid: int, request_id: str, kind: str, mode: str,
-                         params: dict, task_id: "str | None" = None) -> None:
+                         params: dict, task_id: "str | None" = None, source: str = "web") -> None:
     provider = params.get("provider")
     model = params.get("model") or params.get("model_name")
     await cloudstore.request_log_put(
-        uid, request_id, kind, provider, model, params, status="submitted", mode=mode)
+        uid, request_id, kind, provider, model, params, status="submitted", mode=mode, source=source)
     if task_id:
         await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
 
@@ -546,13 +546,16 @@ async def _reroute_upscale_to_wavespeed(uid: int, params: dict) -> dict:
             "options": params.get("options") or {}}
 
 
-async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) -> dict:
+async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None,
+                 source: str = "web") -> dict:
     """提交任务：按 TASK_TYPES[kind] 分流。
 
     - provider="gateway"：async 透传网关 tasks / sync 阻塞直出。
     - provider="thirdparty"：直连第三方 API（提交→轮询→落 BFF 盘）。
     - pat：会话用户 PAT，透传给 _gw_call 用于「用户 PAT 优先自建 sk-」
       （计费错账修复，2026-09-24）；None 时 sk- 走管理员代建兜底。
+    - source：请求来源标记（web / agent），落 cloud_request_log.source，
+      用于区分浏览器与外部接入（MCP）流量。
 
     返回统一视图 {id, taskId, kind, mode, status, result?, gatewayTask}；
     前端用 id 轮询 GET /api/tasks/{id}。
@@ -626,7 +629,7 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
             await cloudstore.request_log_put(
                 uid, request_id, kind, "gateway",
                 params.get("model") or params.get("model_name") or "",
-                {**params}, status="submitted", mode="async")
+                {**params}, status="submitted", mode="async", source=source)
             body = {"type": kind, "params": params}
             # ⚠️ 必须用用户 sk- 打 /v1（PAT 不被 /v1 接受，会 401）—— 见 _gw_call 注释。
             raw = await _gw_call(
@@ -668,7 +671,7 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None) ->
     await cloudstore.request_log_put(
         uid, request_id, kind, "gateway",
         params.get("model") or params.get("model_name") or "",
-        {**params}, status="submitted", mode="sync")
+        {**params}, status="submitted", mode="sync", source=source)
     _spawn_sync_call(uid, request_id, kind, spec["sync_path"], params, pat=pat)
     return _task_view(request_id, request_id, kind, "sync", "processing", {})
 

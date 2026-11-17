@@ -68,10 +68,24 @@ CREATE TABLE IF NOT EXISTS cloud_request_log(
     status TEXT NOT NULL DEFAULT 'submitted',
     mode TEXT NOT NULL DEFAULT 'async',
     result_json TEXT,
+    source TEXT NOT NULL DEFAULT 'web',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_reqlog_uid_created ON cloud_request_log(uid, created_at DESC);
+-- 外部接入 Key（agent/MCP 调用，2026-11-03）：只存 SHA-256 哈希，明文仅生成时返回一次。
+CREATE TABLE IF NOT EXISTS cloud_api_keys(
+    id BIGSERIAL PRIMARY KEY,
+    uid BIGINT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    prefix TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    use_count BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_apikeys_uid ON cloud_api_keys(uid);
 CREATE TABLE IF NOT EXISTS cloud_teams(
     id          TEXT PRIMARY KEY,
     owner_uid   BIGINT NOT NULL,
@@ -157,6 +171,9 @@ async def migrate() -> None:
             "ALTER TABLE cloud_teams DROP CONSTRAINT IF EXISTS cloud_teams_owner_uid_key")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_teams_owner ON cloud_teams(owner_uid)")
+        # 请求日志来源标记（2026-11-03 外部接入：web / agent）
+        await conn.execute(
+            "ALTER TABLE cloud_request_log ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'web'")
 
 
 async def close_pool() -> None:

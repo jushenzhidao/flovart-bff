@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from app import cloudstore, platform_catalog as catalog
 from app.routers import tasks as tasks_router
-from app.security import require_session
+from app.security import require_identity, require_session
 
 
 # ---------------------------------------------------------------------------
@@ -30,14 +30,14 @@ def catalog_open(monkeypatch):
 def _mirror_submit(app, path, params):
     captured: dict = {}
 
-    async def fake_submit(uid, kind, params_, pat=None):
+    async def fake_submit(uid, kind, params_, pat=None, source="web"):
         captured["uid"] = uid
         captured["kind"] = kind
         captured["params"] = params_
         return {"id": "req-mirror-1", "taskId": None, "kind": kind,
                 "mode": params_.get("mode"), "status": "processing", "gatewayTask": {}}
 
-    app.dependency_overrides[require_session] = lambda: {"uid": 7, "username": "tester"}
+    app.dependency_overrides[require_session] = app.dependency_overrides[require_identity] = lambda: {"uid": 7, "username": "tester", "via": "cookie"}
     try:
         tasks_router.tasks.submit, orig = fake_submit, tasks_router.tasks.submit
         try:
@@ -117,7 +117,7 @@ def test_mirror_no_warning_when_modes_agree():
 def test_mirror_rejects_non_image_gen():
     from app.main import app
 
-    app.dependency_overrides[require_session] = lambda: {"uid": 7, "username": "tester"}
+    app.dependency_overrides[require_session] = app.dependency_overrides[require_identity] = lambda: {"uid": 7, "username": "tester", "via": "cookie"}
     try:
         with TestClient(app) as c:
             r = c.post("/api/async/v1/images/generations",
@@ -143,7 +143,7 @@ def test_mirror_poll_equivalent_to_tasks_poll(monkeypatch):
         return view
 
     monkeypatch.setattr(tasks_router.tasks, "get_task", fake_get)
-    app.dependency_overrides[require_session] = lambda: {"uid": 7, "username": "tester"}
+    app.dependency_overrides[require_session] = app.dependency_overrides[require_identity] = lambda: {"uid": 7, "username": "tester", "via": "cookie"}
     try:
         with TestClient(app) as c:
             r1 = c.get("/api/v1/images/generations/req-9")
@@ -163,11 +163,11 @@ def test_legacy_tasks_submit_untouched():
 
     calls: list[dict] = []
 
-    async def fake_submit(uid, kind, params, pat=None):
+    async def fake_submit(uid, kind, params, pat=None, source="web"):
         calls.append({"uid": uid, "kind": kind, "params": params})
         return {"id": "req-1", "kind": kind, "status": "processing"}
 
-    app.dependency_overrides[require_session] = lambda: {"uid": 7, "username": "tester"}
+    app.dependency_overrides[require_session] = app.dependency_overrides[require_identity] = lambda: {"uid": 7, "username": "tester", "via": "cookie"}
     orig = tasks_router.tasks.submit
     tasks_router.tasks.submit = fake_submit
     try:

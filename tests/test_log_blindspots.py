@@ -25,7 +25,7 @@ class _LogSpy:
         self.puts, self.updates = [], []
 
         async def fake_put(uid, request_id, kind, provider, model,
-                           payload, status, mode):
+                           payload, status, mode, source="web"):
             self.puts.append({"uid": uid, "request_id": request_id, "kind": kind,
                               "provider": provider, "model": model,
                               "payload": payload, "status": status, "mode": mode})
@@ -51,7 +51,7 @@ def test_blocked_task_logged_as_failed(monkeypatch):
     async def fake_gate(model):
         raise ModelSuspendedError("m1")
 
-    async def fake_submit(uid, kind, params, pat=None):  # pragma: no cover —— 不应被走到
+    async def fake_submit(uid, kind, params, pat=None, source="web"):  # pragma: no cover —— 不应被走到
         raise AssertionError("submit 不应被执行")
 
     monkeypatch.setattr(tasks_router.platform_catalog, "assert_model_available", fake_gate)
@@ -77,7 +77,7 @@ def test_byok_gateway_not_blocked_nor_logged(monkeypatch):
     spy = _LogSpy(monkeypatch)
     submits = []
 
-    async def fake_submit(uid, kind, params, pat=None):
+    async def fake_submit(uid, kind, params, pat=None, source="web"):
         submits.append(uid)
         return {"id": "r", "status": "processing"}
 

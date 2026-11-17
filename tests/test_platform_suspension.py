@@ -276,7 +276,7 @@ def test_legacy_entry_without_suspended_is_published(store):
 def _submit(body, monkeypatch):
     calls = []
 
-    async def fake_submit(uid, kind, params, pat=None):
+    async def fake_submit(uid, kind, params, pat=None, source="web"):
         calls.append((uid, kind, params))
         return {"id": "req-1", "status": "processing"}
 
@@ -325,12 +325,12 @@ def test_suspended_model_returns_unified_shell_over_http(store):
     from fastapi.testclient import TestClient
 
     from app.main import app
-    from app.security import require_session
+    from app.security import require_identity, require_session
 
     asyncio.run(_put([_svc("s1", "OpenAI", ["gemini-3.1-flash-image"])]))
     asyncio.run(_put([]))  # 管理员删除整条服务
 
-    app.dependency_overrides[require_session] = lambda: {"uid": 7, "username": "tester"}
+    app.dependency_overrides[require_session] = app.dependency_overrides[require_identity] = lambda: {"uid": 7, "username": "tester", "via": "cookie"}
     try:
         with TestClient(app) as c:
             r = c.post("/api/tasks", json={
