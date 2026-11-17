@@ -152,7 +152,14 @@ async def user_model_catalog(session: dict = Depends(require_session)):
         logger.warning("用户态 /v1/models 返回空，回落全站列表 uid=%s", session.get("uid"))
     except Exception as e:  # noqa: BLE001 — 任何失败都不应让模型目录整体 500
         logger.warning("用户态模型目录获取失败，回落全站列表 uid=%s: %s", session.get("uid"), e)
-    models = await platform_catalog.filter_available(await na.admin_enabled_models())
+    try:
+        models = await platform_catalog.filter_available(await na.admin_enabled_models())
+    except na.NewApiError as e:
+        # ⚠️ 上游 401 等错误绝不能透传（2026-11-17 闪退事故）：前端把任何 /api 401
+        # 当会话失效直接登出跳登录页。目录拿不到只是「暂时不可用」——按 503 返回，
+        # 前端报错提示但登录态不受影响；管理员凭证自愈后刷新即恢复。
+        logger.error("全站模型目录获取失败 uid=%s: %s", session.get("uid"), e.message)
+        return fail("模型目录暂时不可用，请稍后刷新重试", 503)
     return ok({"items": models, "total": len(models), "scoped": False})
 
 

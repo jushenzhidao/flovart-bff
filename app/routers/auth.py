@@ -177,5 +177,13 @@ async def user_self(session: dict = Depends(require_session)):
         # 降级到管理员代读：uid 来自加密会话 Cookie（可信），不会越权读他人。
         # 这样刷新页面不再因 PAT 失效而 401 跳登录。
         logger.warning("user PAT 失效，降级 admin_get_user uid=%s", uid)
-        d = await na.admin_get_user(uid)
+        try:
+            d = await na.admin_get_user(uid)
+        except na.NewApiError as e2:
+            # 管理员代读也失败（admin 凭证失效/上游抖动，2026-11-17 闪退事故）：
+            # 绝不能把 401 透传——前端把任何 /api 401 当会话失效直接登出跳登录。
+            # 会话 Cookie 本身有效，降级用空 dict 走 _self_payload 的 session 兜底
+            # （points 等显示 0），上游凭证恢复后刷新即恢复完整数据。
+            logger.error("admin_get_user 也失败 uid=%s: %s", uid, e2.message)
+            d = {}
     return ok(_self_payload(d, session))
