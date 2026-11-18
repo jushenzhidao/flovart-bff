@@ -374,6 +374,10 @@ async def _admin_login() -> None:
     #   实例 401 时重读文件即可自愈）。跨机同步靠读回恢复（见 _self_heal_admin_cred）。
     _save_admin_cred(force=True)
     # 盖轮换时间戳（冷静期熔断用）：冷启无凭证的首次轮换同样会踢对端，一并计入。
+    # 🔴 必须显式 global —— 此前漏写导致赋值进了局部变量，全局时间戳永远不更新，
+    #    轮换冷静期（NEWAPI_ADMIN_ROTATE_COOLDOWN）从未生效（2026-11-18 本地并发
+    #    自愈雪崩的帮凶：每轮风暴都畅通无阻地再次轮换）。
+    global _LAST_ADMIN_ROTATE
     _LAST_ADMIN_ROTATE = time.monotonic()
 
 
