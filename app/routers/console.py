@@ -41,6 +41,17 @@ async def console_overview(_s: dict = Depends(require_admin)):
     })
 
 
+# ---------- 表大小监控（2026-11-23 23GB TOAST 事故防御） ----------
+@router.get("/api/console/db-stats")
+async def console_db_stats(_s: dict = Depends(require_admin)):
+    """请求日志行数/大小 + 整库大小 + 其他大表 top5。清理策略见 config.REQLOG_*。"""
+    stats = await cloudstore.db_stats()
+    stats["retention_days"] = config.REQLOG_RETENTION_DAYS
+    stats["alert_mb"] = config.REQLOG_ALERT_MB
+    stats["over_alert"] = (stats.get("reqlog_size_bytes", 0) >= config.REQLOG_ALERT_MB * 1048576)
+    return ok(stats)
+
+
 # ---------- 用户 ----------
 class ConsoleUserCreate(BaseModel):
     username: str

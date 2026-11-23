@@ -138,6 +138,14 @@ class _Meta:
         """启动兜底：把「submitted 且超过 hours」的行标 failed（进程重启丢在途后台任务）。返回条数。"""
         raise NotImplementedError
 
+    async def reqlog_cleanup(self, days: int, batch: int) -> int:
+        """定期清理：删除 created_at 超过 days 的请求日志行（分批防长事务）。返回删除总数。"""
+        raise NotImplementedError
+
+    async def db_stats(self) -> dict:
+        """表大小监控：请求日志行数/大小 + 整库大小 + 其他大表 top（管理台展示）。"""
+        raise NotImplementedError
+
     # ---- 外部接入 Key（agent/MCP，2026-11-03；只存哈希，明文仅生成时返回）----
     async def api_key_create(self, uid, key_hash, prefix, name) -> dict:
         raise NotImplementedError
@@ -427,6 +435,43 @@ class PgMeta(_Meta):
                WHERE status='submitted' AND created_at < now() - make_interval(hours => $2)""",
             stale, hours)
         return int(tag.split()[-1]) if tag and tag.startswith("UPDATE") else 0
+
+    async def reqlog_cleanup(self, days: int, batch: int) -> int:
+        """分批删过期行：ctid 子查询每次删 batch 条，防长事务/锁表（23GB 事故防御）。"""
+        if days <= 0:
+            return 0
+        pool = await self._c()
+        total = 0
+        while True:
+            tag = await pool.execute(
+                """DELETE FROM cloud_request_log
+                   WHERE ctid IN (SELECT ctid FROM cloud_request_log
+                                  WHERE created_at < now() - make_interval(days => $1)
+                                  LIMIT $2)""",
+                days, batch)
+            n = int(tag.split()[-1]) if tag and tag.startswith("DELETE") else 0
+            total += n
+            if n < batch:
+                return total
+
+    async def db_stats(self) -> dict:
+        pool = await self._c()
+        reqlog = await pool.fetchrow(
+            """SELECT (SELECT count(*) FROM cloud_request_log) AS rows,
+                      pg_total_relation_size('cloud_request_log') AS size_bytes""")
+        db_bytes = await pool.fetchval("SELECT pg_database_size(current_database())")
+        tables = await pool.fetch(
+            """SELECT relname, pg_total_relation_size(relid) AS size_bytes
+               FROM pg_stat_user_tables
+               WHERE relname NOT IN ('cloud_request_log')
+               ORDER BY pg_total_relation_size(relid) DESC LIMIT 5""")
+        return {
+            "backend": "postgres",
+            "reqlog_rows": int(reqlog["rows"]),
+            "reqlog_size_bytes": int(reqlog["size_bytes"]),
+            "db_size_bytes": int(db_bytes or 0),
+            "top_tables": [{"name": r["name"], "size_bytes": int(r["size_bytes"])} for r in tables],
+        }
 
     # ---- 外部接入 Key（agent/MCP，2026-11-03）----
     async def api_key_create(self, uid, key_hash, prefix, name):
@@ -1121,6 +1166,34 @@ class LocalMeta(_Meta):
             return n
         return await asyncio.to_thread(_)
 
+    async def reqlog_cleanup(self, days: int, batch: int) -> int:
+        if days <= 0:
+            return 0
+        def _():
+            conn = self._connect()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+            cur = conn.execute(
+                "DELETE FROM cloud_request_log WHERE created_at < ?", (cutoff,))
+            conn.commit()
+            return cur.rowcount or 0
+        return await asyncio.to_thread(_)
+
+    async def db_stats(self) -> dict:
+        def _():
+            conn = self._connect()
+            rows = conn.execute("SELECT count(*) c FROM cloud_request_log").fetchone()["c"]
+            page = conn.execute("PRAGMA page_count").fetchone()[0]
+            page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+            return {"rows": rows, "db_bytes": page * page_size}
+        s = await asyncio.to_thread(_)
+        return {
+            "backend": "sqlite",
+            "reqlog_rows": s["rows"],
+            "reqlog_size_bytes": s["db_bytes"],  # SQLite 单文件：请求日志≈整库
+            "db_size_bytes": s["db_bytes"],
+            "top_tables": [],
+        }
+
     # ---- 外部接入 Key（LocalMeta 兜底，与 PgMeta 同契约）----
     async def api_key_create(self, uid, key_hash, prefix, name):
         def _():
@@ -1777,6 +1850,16 @@ async def request_log_update(request_id: str, status=None, task_id=None,
 async def request_log_fail_stale(hours: int = 6) -> int:
     """启动兜底：把超时未终态的 submitted 行标 failed（进程重启丢在途后台任务）。返回条数。"""
     return await META.reqlog_fail_stale(hours)
+
+
+async def request_log_cleanup(days: int, batch: int = 5000) -> int:
+    """定期清理：删除 created_at 超过 days 的请求日志行（分批）。返回删除总数。"""
+    return await META.reqlog_cleanup(days, batch)
+
+
+async def db_stats() -> dict:
+    """表大小监控（管理台 /api/console/db-stats）。"""
+    return await META.db_stats()
 
 
 async def request_log_get(request_id: str) -> Optional[dict]:

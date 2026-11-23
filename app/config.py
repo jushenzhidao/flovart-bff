@@ -209,6 +209,15 @@ OSS_RETENTION_DAYS: int = _int("OSS_RETENTION_DAYS", 90)
 OSS_CLEANUP_INTERVAL_HOURS: int = _int("OSS_CLEANUP_INTERVAL_HOURS", 24)   # 后台循环周期
 OSS_CLEANUP_BATCH: int = _int("OSS_CLEANUP_BATCH", 500)                    # 单轮最多删多少条，防长事务
 
+# 请求日志自动清理 + 表大小监控（2026-11-23 23GB TOAST 事故防御）：
+# created_at 超过 REQLOG_RETENTION_DAYS 的 cloud_request_log 行定期删除；
+# 表总大小超过 REQLOG_ALERT_MB 时打 ERROR 告警（管理台 /api/console/db-stats 可查）。
+# 0=关闭清理（不推荐）。单轮分批删防长事务/锁表。
+REQLOG_RETENTION_DAYS: int = _int("REQLOG_RETENTION_DAYS", 90)
+REQLOG_CLEANUP_BATCH: int = _int("REQLOG_CLEANUP_BATCH", 5000)             # 单轮最多删多少行
+REQLOG_ALERT_MB: int = _int("REQLOG_ALERT_MB", 2048)                       # 表大小告警阈值（MB）
+REQLOG_MAINTENANCE_INTERVAL_HOURS: int = _int("REQLOG_MAINTENANCE_INTERVAL_HOURS", 24)
+
 # ---------- PostgreSQL（元数据/索引层）----------
 # 结构化元数据（KV 文档 + 媒体索引 + 配额）落 PostgreSQL，替代本地 SQLite（多副本可共享）。
 # 优先用 POSTGRES_DSN；缺省时由分项拼装。二者皆空 → 回落本地 SQLite（开发用）。

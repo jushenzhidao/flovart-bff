@@ -40,6 +40,35 @@ async def _media_cleanup_loop():
         await asyncio.sleep(max(1, config.OSS_CLEANUP_INTERVAL_HOURS) * 3600)
 
 
+async def _reqlog_maintenance_once():
+    """单轮请求日志维护：过期清理 + 表大小采样告警（23GB TOAST 事故防御）。"""
+    if config.REQLOG_RETENTION_DAYS > 0:
+        deleted = await cloudstore.request_log_cleanup(
+            config.REQLOG_RETENTION_DAYS, config.REQLOG_CLEANUP_BATCH)
+        if deleted:
+            logger.info("请求日志定期清理：%s 行（保留 %s 天）", deleted, config.REQLOG_RETENTION_DAYS)
+    stats = await cloudstore.db_stats()
+    mb = stats.get("reqlog_size_bytes", 0) / 1048576
+    if mb >= config.REQLOG_ALERT_MB:
+        logger.error("⚠️ 请求日志表过大：%.0f MB（阈值 %s MB，行数 %s）——检查是否有巨型行落库",
+                     mb, config.REQLOG_ALERT_MB, stats.get("reqlog_rows"))
+    else:
+        logger.info("请求日志状态：%.1f MB / %s 行（backend=%s）",
+                    mb, stats.get("reqlog_rows"), stats.get("backend"))
+    return stats
+
+
+async def _reqlog_maintenance_loop():
+    """请求日志定期维护循环。首轮延迟 10 分钟（避开启动高峰），此后每 24h。"""
+    await asyncio.sleep(600)
+    while True:
+        try:
+            await _reqlog_maintenance_once()
+        except Exception:  # noqa: BLE001 —— 维护失败绝不影响业务
+            logger.exception("请求日志定期维护失败")
+        await asyncio.sleep(max(1, config.REQLOG_MAINTENANCE_INTERVAL_HOURS) * 3600)
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # 启动：数据目录就绪 + PG 连接池 + 管理员凭证预检（只读日志，不阻塞启动）
@@ -70,6 +99,10 @@ async def _lifespan(_app: FastAPI):
     cleanup_task = None
     if config.OSS_RETENTION_DAYS > 0:
         cleanup_task = asyncio.create_task(_media_cleanup_loop())
+    # 请求日志维护循环（2026-11-23 23GB TOAST 事故防御）：每 24h 清理过期行
+    # （REQLOG_RETENTION_DAYS，默认 90 天）+ 表大小采样，超 REQLOG_ALERT_MB 打 ERROR。
+    # 管理台 /api/console/db-stats 随时可看当前大小。
+    reqlog_task = asyncio.create_task(_reqlog_maintenance_loop())
     # 图片任务（同步/异步双模式）：BFF 不跑 worker；异步透传网关、同步阻塞直出后落盘，
     # 每次提交写一条请求日志（落 PG，见 app/tasks.py）。只需归还 httpx 连接池。
     # 远程 MCP（2026-11-03）：session manager 需要 lifespan 启动 —— 在主 lifespan 内嵌套
@@ -80,6 +113,9 @@ async def _lifespan(_app: FastAPI):
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup_task
+    reqlog_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reqlog_task
     await tasks.close()  # 归还网关代理 httpx 连接池
     await chat.close()  # 归还聊天代理 httpx 连接池
     await na.close()  # 归还 httpx 连接池
