@@ -20,6 +20,7 @@ import os
 import sqlite3
 import threading
 import uuid
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -38,6 +39,30 @@ MAX_MEDIA_BYTES = 50 * 1024 * 1024
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_MAX_LOG_STR = 65536  # 请求日志单字符串上限（与 PgMeta._MAX_LOG_STR 同值，Local 实现引用）
+_B64_RE = re.compile(r"^[A-Za-z0-9+/\-_]{4096,}={0,2}$")
+
+
+def _strip_giant_strings(value, limit: int = _MAX_LOG_STR, depth: int = 0):
+    """递归剥离 JSON 中的巨型字符串（生图 b64 / data URI）。
+
+    2026-11-23 事故：image-gen 的 result_json 把整张 base64 图写进 PG TOAST，
+    62 行撑到 23GB，历史页 SELECT * 每次拖出几百 MB → event loop 卡死全站超时。
+    库内只保留 URL/元数据；b64 原图由对象存储（OSS/LocalBlob）承载，此处只留占位标注。
+    """
+    if depth > 8:
+        return value
+    if isinstance(value, str):
+        if len(value) > limit or (len(value) >= 4096 and (_B64_RE.match(value) or value.startswith("data:"))):
+            return f"[stripped {len(value)} bytes]"
+        return value
+    if isinstance(value, dict):
+        return {k: _strip_giant_strings(v, limit, depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strip_giant_strings(v, limit, depth + 1) for v in value]
+    return value
 
 
 def _iso(dt) -> str:
@@ -297,9 +322,11 @@ class PgMeta(_Meta):
         return {"doc_count": doc_count, "media_count": m["n"], "bytes_used": m["t"],
                 "quota_bytes": config.OSS_QUOTA_BYTES, "media_limit_bytes": MAX_MEDIA_BYTES}
 
+    _MAX_LOG_STR = 65536  # 请求日志单字符串上限 64KB；b64 巨串必须剥离（2026-11-23 23GB TOAST 卡死事故）
+
     async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode, source="web"):
         pool = await self._c()
-        raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        raw = json.dumps(_strip_giant_strings(payload, self._MAX_LOG_STR), ensure_ascii=False, separators=(",", ":"))
         await pool.execute(
             """INSERT INTO cloud_request_log
                (request_id, uid, kind, provider, model, payload_json, status, mode, source, created_at, updated_at)
@@ -321,7 +348,7 @@ class PgMeta(_Meta):
             args.append(gateway_request_id)
         if result is not None:
             sets.append("result_json=$" + str(len(args) + 1))
-            args.append(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            args.append(json.dumps(_strip_giant_strings(result, self._MAX_LOG_STR), ensure_ascii=False, separators=(",", ":")))
         if not sets:
             return
         sets.append("updated_at=now()")
@@ -970,7 +997,7 @@ class LocalMeta(_Meta):
 
     async def reqlog_put(self, uid, request_id, kind, provider, model, payload, status, mode, source="web"):
         def _():
-            raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            raw = json.dumps(_strip_giant_strings(payload, _MAX_LOG_STR), ensure_ascii=False, separators=(",", ":"))
             now = _utcnow()
             conn = self._connect()
             conn.execute(
@@ -993,7 +1020,7 @@ class LocalMeta(_Meta):
             if gateway_request_id is not None:
                 sets.append("gateway_request_id=?"); args.append(gateway_request_id)
             if result is not None:
-                sets.append("result=?"); args.append(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+                sets.append("result=?"); args.append(json.dumps(_strip_giant_strings(result, _MAX_LOG_STR), ensure_ascii=False, separators=(",", ":")))
             if not sets:
                 return
             sets.append("updated_at=?")
