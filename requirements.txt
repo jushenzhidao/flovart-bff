@@ -1,6 +1,6 @@
 fastapi==0.141.1
 starlette==1.6.0
-uvicorn[standard]==0.30.*
+uvicorn[standard]>=0.35,<0.37
 httpx==0.27.*
 cryptography==50.0.1
 python-dotenv==1.2.3
@@ -26,4 +26,4 @@ asyncpg>=0.29
 # 表现为「配好了却什么都看不到」。
 # extras 带入 FastAPI / httpx 的 OTel instrumentation，缺了会导致对应埋点静默失效。
 logfire[fastapi,httpx]==4.41.0
-fastmcp>=4.1,<5
+fastmcp>=4.1,<4.2
