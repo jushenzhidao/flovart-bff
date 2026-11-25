@@ -609,6 +609,11 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None,
     #    同步/异步随 params.mode 带来，调用该模型时完全按此配置来。
     # 2) 否则按模型名查 BFF 全局 image_model_modes（管理台兜底，兼容旧配置）
     # 3) 否则回退 TASK_TYPES 里的全局默认。
+    model_name = params.get("model") or params.get("model_name") or ""
+    # 2026-11-25 撤销此前的 nano-banana 强制同步补丁：实测定论是网关侧
+    # 「advanced custom async」渠道 distributor 不可达（async 端点提交 202 后查询
+    # 即 503「无可用渠道」，同步端点亦 503；同类型 nano-banana-pro 同症状，
+    # 而普通模型 gpt-image-1 正常）。非 BFF 端点/载荷问题，强制改 sync 只会掩盖真因。
     if params.get("mode") in ("sync", "async"):
         mode = params["mode"]
     else:
@@ -620,8 +625,9 @@ async def submit(uid: int, kind: str, params: dict, pat: "str | None" = None,
     # 诊断日志：先看清 mode 到底是怎么定的
     logger.info("tasks.submit kind=%s model=%s params.mode=%s resolved_mode=%s", kind, params.get("model"), params.get("mode"), mode)
     # 外部 OpenAI 兼容网关（按服务路由）：前端带 _gateway，BFF 直连该服务、用其自有 key。
+    # mode 需透传：BYOK 也可能指向「高级异步渠道」（如 jieapi 8001），必须走异步提交+轮询。
     if params.get("_gateway"):
-        return await _run_external(uid, request_id, kind, spec, params)
+        return await _run_external(uid, request_id, kind, spec, params, mode=mode)
     if mode == "async":
         # Chatfire 风格真异步生图（doubao-seedream 等）：独立分支，路径/载荷/终态判定都不同。
         if kind == "image-gen" and _is_chatfire_async_image_model(
@@ -1150,7 +1156,8 @@ def _error_record(exc: BaseException, err_type: str, stage: str,
     return err
 
 
-async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params: dict) -> dict:
+async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params: dict,
+                        mode: "str | None" = None) -> dict:
     """外部 OpenAI 兼容网关直连（如 chatfire）：用服务自带 sk- key，按 baseUrl 拼端点。
 
     前端在 params._gateway 里带 {base_url, api_key}；BFF 直连该服务、不走 new-api admin PAT。
@@ -1175,6 +1182,16 @@ async def _run_external(uid: int, request_id: str, kind: str, spec: dict, params
     #    → 返回网关前端 HTML → 502，飞哥实测 minimax 视频必失败的真根因）。
     if kind == "video-gen":
         return await _run_external_video(uid, request_id, params)
+    # ⭐ 图片异步（2026-11-25 接入）：BYOK 服务若指向「高级自定义异步」渠道
+    #    （new-api type 8001，如 jieapi.com异步/674），同步端点会被渠道类型**永久拒绝**
+    #    （400 request_path，源码 IsAdvancedAsyncReservedSyncPath 硬保留
+    #    /v1/images/generations 与 /v1/images/edits），只能 submit 到
+    #    /async/v1/images/generations 再轮询取图。
+    #    🔒 判定只认前端「AI 服务」里勾的「请求方式」（params.mode，2026-11-25 飞哥拍板）：
+    #    勾同步就走同步、勾异步就走异步，**不再按模型名前缀隐式改道** —— 否则用户在界面上
+    #    选同步、实际却走了异步，请求方式与配置不符，排障时无从对应。
+    if kind == "image-gen" and mode == "async":
+        return await _run_external_async_image(uid, request_id, params)
     # ⚠️ 兜底值必须带 `v1/` 前缀（2026-09-15 修复）：external 网关同样是
     #    new-api 兼容层，OpenAI 端点全挂在 `/v1/*`；漏掉前缀会打到不存在的
     #    `{base}/images/generations` → nginx 兜底返回前端 SPA 的 HTML → 502。
@@ -1256,6 +1273,201 @@ async def _external_call_and_record(uid: int, request_id: str, kind: str,
         request_id, status="succeeded", task_id=request_id,
         gateway_request_id=gw_req_id, result=task.get("result"))
     logger.info("外部网关调用成功 uid=%s req=%s url=%s", uid, request_id, url)
+
+
+# ---------------------------------------------------------------------------
+# 外部网关图片异步分支（2026-11-25）：BYOK 指向「高级异步渠道」（new-api type 8001）
+# ---------------------------------------------------------------------------
+# 背景（2026-11-25 渠道 674 血案定论）：8001 渠道对同步端点 /v1/images/generations、
+# /v1/images/edits 是**架构级永久拒绝**（源码 IsAdvancedAsyncReservedSyncPath 保留，
+# 路径过滤 channelMatchesFilter 直接判 request_path 400），唯一可用入口是
+# POST /async/v1/images/generations（提交拿 task_id）+ GET 同路径/{task_id}（轮询）。
+# 因此 BYOK 若把 AI 服务配到这类渠道（如「jieapi.com异步」+ key 带 -674 pin），
+# 走 _run_external 的一次性同步 POST 必死 —— 需要这条异步分支。
+# 实测（674 / gpt-image-2.5-flare）：202 task_xxx（2.2s）→ queued 28s →
+# in_progress 27s → 200 data[0].url（共 62s，上游即梦 CDN）。
+_EXTERNAL_IMAGE_ASYNC_SUBMIT_PATH = "async/v1/images/generations"
+# 实测 62~79s；上游排队偶发更久，给 7 分钟（前端本来就走轮询，不占连接）。
+_EXTERNAL_IMAGE_ASYNC_POLL_TIMEOUT = 420
+_EXTERNAL_IMAGE_ASYNC_POLL_MAX_ERRORS = 6  # 连续网络错误容忍上限（网关抖动）
+
+
+def _external_async_image_body(params: dict) -> dict:
+    """异步图片请求体：只发 model/prompt/image[]（mask 并入 image[]）。
+
+    与 _submit_chatfire_async_image 同口径：doc 三字段之外（size/n/quality…）
+    上游未必认，留在 request_log.params 里可查、不外发，避免 400 拒收。
+    """
+    prompt = _tool_semantic_prompt(params, str(params.get("prompt") or "").strip()) \
+        or "Edit this image as intended, keep original content unchanged"
+    body = {
+        "model": params.get("model") or params.get("model_name") or "",
+        "prompt": prompt,
+        "image": params.get("image") if isinstance(params.get("image"), list) else [],
+    }
+    mask = params.get("mask")
+    if isinstance(mask, str) and mask.strip():
+        body["image"] = [*body["image"], mask]
+        if "蒙版" not in prompt and "遮罩" not in prompt and "mask" not in prompt.lower():
+            body["prompt"] = prompt.rstrip() + \
+                "\n第二张图是编辑蒙版：涂色区域为需要编辑的区域，其余区域保持原样。"
+    return body
+
+
+async def _run_external_async_image(uid: int, request_id: str, params: dict) -> dict:
+    """外部网关图片异步提交（BYOK → 8001 异步渠道）：毫秒返回 processing。
+
+    与 _run_external 同款非阻塞契约：POST 立即返回，提交/轮询在后台协程完成并
+    回写请求日志（mode 记 sync，前端 GET /api/tasks/{id} 走既有 sync 分支直读结果）。
+    api_key 只存活于后台协程内存，不落库（_gateway 仍按既有口径剥离）。
+    """
+    gw = params.get("_gateway") or {}
+    base_url = (gw.get("base_url") or "").strip().rstrip("/")
+    api_key = gw.get("api_key") or ""
+    if not base_url or not api_key:
+        raise ValueError("external gateway 需要 base_url 与 api_key")
+    # 平台网关两种填法都有人用（根地址 / 带 /v1）；异步入口自带 v1 段，须先剥掉，
+    # 否则拼出 /v1/async/v1/images/generations → 404（同 _run_external 的去重口径）。
+    if base_url.endswith("/v1"):
+        base_url = base_url[: -len("/v1")]
+    submit_url = f"{base_url}/{_EXTERNAL_IMAGE_ASYNC_SUBMIT_PATH}"
+    model = params.get("model") or params.get("model_name") or ""
+    log_params = {k: v for k, v in params.items() if k != "_gateway"}
+    log_params["upstream_base_url"] = base_url
+    await cloudstore.request_log_put(
+        uid, request_id, "image-gen", "external-async", model, log_params,
+        status="submitted", mode="sync")
+    body = _external_async_image_body(params)
+    logger.info("外部网关图片异步提交 uid=%s req=%s url=%s model=%s",
+                uid, request_id, submit_url, model)
+    task = asyncio.create_task(_external_async_image_and_record(
+        uid, request_id, submit_url, api_key, body))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return _task_view(request_id, request_id, "image-gen", "sync", "processing", {})
+
+
+async def _external_async_image_and_record(uid: int, request_id: str, submit_url: str,
+                                           api_key: str, body: dict) -> None:
+    """后台：提交 → 取 task_id → 轮询到 data[] 出现 → 归一化落盘 → 回写日志。
+
+    终态口径与 _poll_chatfire_async_image 一致：响应出现非空 data[] 即完成
+    （渠道完成响应不带 status 字段）；error 体或 FAILED 系状态为失败。
+    """
+    try:
+        raw = await na.request_external("POST", submit_url, api_key=api_key, json=body)
+    except Exception as e:  # noqa: BLE001 —— 必须吞掉一切并留痛，否则失败原因丢失
+        err = _error_record(e, "external_gateway_error", "submit", url=submit_url, uid=uid)
+        logger.warning("外部网关图片异步提交失败 uid=%s req=%s url=%s err=%s",
+                       uid, request_id, submit_url, err["error"]["message"])
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return
+    inner = _unwrap(raw)
+    inner = _normalize_task(inner) if isinstance(inner, dict) else {}
+    upstream_error = inner.get("error") if isinstance(inner.get("error"), dict) else None
+    if upstream_error:
+        logger.warning("外部网关图片异步被拒 uid=%s req=%s err=%s",
+                       uid, request_id, str(upstream_error)[:200])
+        await cloudstore.request_log_update(
+            request_id, status="failed", result={"error": upstream_error})
+        return
+    task_id = inner.get("task_id") or inner.get("id")
+    if not task_id:
+        # 少数网关可能同步直出（异步入口直接回图）：能归一化出产物就按成功处理。
+        result = _normalize_sync_result(raw)
+        if isinstance(result, dict) and _iter_outputs(result):
+            task = {"result": result}
+            try:
+                task = await _persist_outputs(task, request_id, uid, "image-gen",
+                                              request_id=request_id)
+            except Exception:  # noqa: BLE001 —— 落盘失败不算生成失败，保留上游 URL
+                logger.exception("外部网关图片异步落盘失败 uid=%s req=%s", uid, request_id)
+            await cloudstore.request_log_update(
+                request_id, status="succeeded", task_id=request_id, result=task.get("result"))
+            return
+        try:
+            snippet = json.dumps(raw, ensure_ascii=False)[:400]
+        except Exception:
+            snippet = str(raw)[:400]
+        err = {"error": {
+            "message": "上游已受理生图任务但未返回任务号（task_id），无法跟踪进度，请重试",
+            "type": "external_async_image_no_task_id",
+            "stage": "submit",
+            "detail": snippet,
+        }}
+        logger.warning("外部网关图片异步无任务号 uid=%s req=%s url=%s", uid, request_id, submit_url)
+        await cloudstore.request_log_update(request_id, status="failed", result=err)
+        return
+
+    await cloudstore.request_log_update(request_id, status="processing", task_id=task_id)
+    poll_url = f"{submit_url}/{task_id}"
+    logger.info("外部网关图片任务已受理 uid=%s req=%s task=%s poll=%s",
+                uid, request_id, task_id, poll_url)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _EXTERNAL_IMAGE_ASYNC_POLL_TIMEOUT
+    delay, err_streak = 6.0, 0
+    while loop.time() < deadline:
+        await asyncio.sleep(delay)
+        delay = min(delay + 1.0, 10.0)
+        try:
+            poll_raw = await na.request_external("GET", poll_url, api_key=api_key)
+        except Exception as e:  # noqa: BLE001 —— 网络抖动容忍，连续超限才判失败
+            err_streak += 1
+            logger.warning("外部网关图片轮询失败(%s/%s) uid=%s req=%s err=%s",
+                           err_streak, _EXTERNAL_IMAGE_ASYNC_POLL_MAX_ERRORS, uid, request_id, e)
+            if err_streak >= _EXTERNAL_IMAGE_ASYNC_POLL_MAX_ERRORS:
+                err = _error_record(e, "external_poll_error", "poll", url=poll_url, uid=uid)
+                await cloudstore.request_log_update(
+                    request_id, status="failed", task_id=task_id, result=err)
+                return
+            continue
+        err_streak = 0
+        body_json = poll_raw if isinstance(poll_raw, dict) else {}
+        data = body_json.get("data")
+        # data 键出现即终态（处理中响应不带 data）：非空=出图，空=无产物失败
+        if isinstance(data, list):
+            result = _normalize_sync_result(body_json) if data else None
+            gw_req_id = _extract_gw_request_id(body_json)
+            if isinstance(result, dict) and _iter_outputs(result):
+                task = {"result": result}
+                try:
+                    task = await _persist_outputs(task, task_id, uid, "image-gen",
+                                                  request_id=request_id)
+                except Exception:  # noqa: BLE001 —— 落盘失败保留上游原始 URL
+                    logger.exception("外部网关图片落盘失败 uid=%s req=%s task=%s",
+                                     uid, request_id, task_id)
+                await cloudstore.request_log_update(
+                    request_id, status="succeeded", task_id=task_id,
+                    gateway_request_id=gw_req_id, result=task.get("result"))
+                logger.info("外部网关图片异步生成成功 uid=%s req=%s task=%s",
+                            uid, request_id, task_id)
+                return
+            err = _no_media_error(body_json)
+            err["error"]["type"] = "external_async_image_no_media"
+            logger.warning("外部网关图片异步成功但无产物 uid=%s req=%s task=%s",
+                           uid, request_id, task_id)
+            await cloudstore.request_log_update(
+                request_id, status="failed", task_id=task_id, result=err)
+            return
+        inner_poll = _unwrap(body_json)
+        gstatus = str((inner_poll or {}).get("status") or "").upper() \
+            if isinstance(inner_poll, dict) else ""
+        if isinstance(body_json.get("error"), dict) or gstatus in _CHATFIRE_ASYNC_FAILED:
+            inner_err = body_json["error"] if isinstance(body_json.get("error"), dict) else {
+                "message": f"upstream task status: {gstatus or 'unknown'}",
+                "type": "external_async_image_error"}
+            logger.warning("外部网关图片任务失败 uid=%s req=%s task=%s status=%s",
+                           uid, request_id, task_id, gstatus)
+            await cloudstore.request_log_update(
+                request_id, status="failed", task_id=task_id, result={"error": inner_err})
+            return
+    err = {"error": {
+        "message": "生图超时（超过 7 分钟未出结果），上游可能仍在处理，请稍后重试",
+        "type": "external_async_image_timeout",
+        "stage": "poll",
+        "task_id": task_id,
+    }}
+    await cloudstore.request_log_update(request_id, status="failed", task_id=task_id, result=err)
 
 
 # ---------------------------------------------------------------------------
